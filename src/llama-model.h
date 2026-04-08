@@ -675,7 +675,11 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
-    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
+    // backend_gpu/backend_cpu are needed only by the paged KV cache, whose block
+    // manager allocates its GPU and CPU block pools up front. Callers that do not
+    // use --kv-paged may pass nullptr for both.
+    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams,
+                                   ggml_backend_t backend_gpu, ggml_backend_t backend_cpu) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
