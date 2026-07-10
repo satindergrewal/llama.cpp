@@ -4237,6 +4237,131 @@ void ggml_compute_forward_l2_norm(
     }
 }
 
+// ggml_compute_forward_sinkhorn_norm
+
+#define GGML_SINKHORN_NORM_MAX_N 32
+
+static void ggml_compute_forward_sinkhorn_norm_f32(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int32_t n_iters = ggml_get_op_params_i32(dst, 0);
+    const float   eps     = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n = ne00; // square [n, n] slices, ne00 == ne01
+    GGML_ASSERT(ne01 == n);
+    GGML_ASSERT(n <= GGML_SINKHORN_NORM_MAX_N);
+    GGML_ASSERT(n_iters >= 1);
+
+    const int64_t n_slices = ne02 * ne03;
+
+    float m[GGML_SINKHORN_NORM_MAX_N * GGML_SINKHORN_NORM_MAX_N];
+
+    // one square slice (spanning ne0 x ne1) per token; parallelize across slices
+    for (int64_t s = ith; s < n_slices; s += nth) {
+        const int64_t i02 = s % ne02;
+        const int64_t i03 = s / ne02;
+
+        const float * x = (const float *) ((const char *) src0->data + i02*nb02 + i03*nb03);
+        float *       y = (float *)       ((      char *) dst->data  + i02*nb2  + i03*nb3);
+
+        // load slice: m[b*n + a], a is ne0 (fastest, contiguous)
+        for (int64_t b = 0; b < n; ++b) {
+            for (int64_t a = 0; a < n; ++a) {
+                m[b*n + a] = x[b*n + a];
+            }
+        }
+
+        // softmax over ne0 (a) for each b (matches ggml_soft_max, with max subtraction)
+        for (int64_t b = 0; b < n; ++b) {
+            float mx = -INFINITY;
+            for (int64_t a = 0; a < n; ++a) {
+                mx = fmaxf(mx, m[b*n + a]);
+            }
+            float sum = 0.0f;
+            for (int64_t a = 0; a < n; ++a) {
+                const float e = expf(m[b*n + a] - mx);
+                m[b*n + a] = e;
+                sum += e;
+            }
+            for (int64_t a = 0; a < n; ++a) {
+                m[b*n + a] /= sum;
+            }
+        }
+
+        // add eps
+        for (int64_t i = 0; i < n*n; ++i) {
+            m[i] += eps;
+        }
+
+        // norm_cols: divide each element by (sum over b of its row a) + eps
+        auto norm_cols = [&]() {
+            for (int64_t a = 0; a < n; ++a) {
+                float r = 0.0f;
+                for (int64_t b = 0; b < n; ++b) {
+                    r += m[b*n + a];
+                }
+                r += eps;
+                for (int64_t b = 0; b < n; ++b) {
+                    m[b*n + a] /= r;
+                }
+            }
+        };
+
+        // norm_rows: divide each element by (sum over a of its column b) + eps
+        auto norm_rows = [&]() {
+            for (int64_t b = 0; b < n; ++b) {
+                float c = 0.0f;
+                for (int64_t a = 0; a < n; ++a) {
+                    c += m[b*n + a];
+                }
+                c += eps;
+                for (int64_t a = 0; a < n; ++a) {
+                    m[b*n + a] /= c;
+                }
+            }
+        };
+
+        norm_cols();
+        for (int32_t it = 1; it < n_iters; ++it) {
+            norm_rows();
+            norm_cols();
+        }
+
+        for (int64_t i = 0; i < n*n; ++i) {
+            y[i] = m[i];
+        }
+    }
+}
+
+void ggml_compute_forward_sinkhorn_norm(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_sinkhorn_norm_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_out_prod
 
 static void ggml_compute_forward_out_prod_f32(

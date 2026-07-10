@@ -509,6 +509,7 @@ extern "C" {
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
+        GGML_OP_SINKHORN_NORM,
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
@@ -1404,6 +1405,17 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_l2_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            float                 eps);
+
+    // fused Sinkhorn-Knopp normalization for DeepSeek-V4 mHC hyper-connections.
+    // operates independently on each [n, n] slice (ne0 == ne1 == n) of the input:
+    //   softmax over ne0, add eps, then a row normalization followed by
+    //   (n_iters - 1) alternating {column, row} normalizations (each + eps).
+    // replaces the ~137-op decomposed graph with a single kernel per call.
+    GGML_API struct ggml_tensor * ggml_sinkhorn_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_iters,
             float                 eps);
 
     // a - x
