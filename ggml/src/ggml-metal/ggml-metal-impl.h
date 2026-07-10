@@ -1163,6 +1163,38 @@ typedef struct {
 } ggml_metal_kargs_sinkhorn_norm;
 
 typedef struct {
+    int32_t  n_embd;
+    int32_t  n_hc;
+    int32_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_w0;
+    uint64_t nb_w1;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv4_hc_weighted_sum;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_hc;
+    int32_t  n_tokens;
+    uint64_t nb_b0;
+    uint64_t nb_b1;
+    uint64_t nb_r0;
+    uint64_t nb_r1;
+    uint64_t nb_r2;
+    uint64_t nb_p0;
+    uint64_t nb_p1;
+    uint64_t nb_c0;
+    uint64_t nb_c1;
+    uint64_t nb_c2;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+} ggml_metal_kargs_dsv4_hc_expand;
+
+typedef struct {
     int64_t val;
 } ggml_metal_kargs_memset;
 

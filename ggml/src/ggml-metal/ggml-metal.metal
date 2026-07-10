@@ -5774,6 +5774,66 @@ kernel void kernel_sinkhorn_norm_f32(
     }
 }
 
+// out[d,t] = sum_h x[d,h,t] * w[h,t]; mirrors ggml_compute_forward_dsv4_hc_weighted_sum
+kernel void kernel_dsv4_hc_weighted_sum_f32(
+    constant ggml_metal_kargs_dsv4_hc_weighted_sum & args,
+    device const char * x,
+    device const char * w,
+    device       char * dst,
+    uint gid [[thread_position_in_grid]]) {
+
+    const int64_t n_elem = (int64_t) args.n_embd * args.n_tokens;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d = (int64_t) gid % args.n_embd;
+    const int64_t t = (int64_t) gid / args.n_embd;
+
+    float acc = 0.0f;
+    for (int32_t h = 0; h < args.n_hc; ++h) {
+        const float xv = *(device const float *) (x + d*args.nb_x0 + h*args.nb_x1 + t*args.nb_x2);
+        const float wv = *(device const float *) (w + h*args.nb_w0 + t*args.nb_w1);
+        acc += xv * wv;
+    }
+
+    *(device float *) (dst + d*args.nb_d0 + t*args.nb_d1) = acc;
+}
+
+// out[d,dst_hc,t] = block[d,t]*post[dst_hc,t] + sum_src res[d,src,t]*comb[dst_hc,src,t]
+// comb is read transposed (ne0 as dst_hc), matching the CPU reference
+kernel void kernel_dsv4_hc_expand_f32(
+    constant ggml_metal_kargs_dsv4_hc_expand & args,
+    device const char * blk,
+    device const char * res,
+    device const char * post,
+    device const char * comb,
+    device       char * dst,
+    uint gid [[thread_position_in_grid]]) {
+
+    const int64_t n_elem = (int64_t) args.n_embd * args.n_hc * args.n_tokens;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d      = (int64_t) gid % args.n_embd;
+    const int64_t tmp    = (int64_t) gid / args.n_embd;
+    const int64_t dst_hc = tmp % args.n_hc;
+    const int64_t t      = tmp / args.n_hc;
+
+    const float bv = *(device const float *) (blk  + d*args.nb_b0 + t*args.nb_b1);
+    const float pv = *(device const float *) (post + dst_hc*args.nb_p0 + t*args.nb_p1);
+
+    float acc = bv * pv;
+    for (int32_t src = 0; src < args.n_hc; ++src) {
+        const float cv = *(device const float *) (comb + dst_hc*args.nb_c0 + src*args.nb_c1 + t*args.nb_c2);
+        const float rv = *(device const float *) (res  + d*args.nb_r0 + src*args.nb_r1 + t*args.nb_r2);
+        acc += cv * rv;
+    }
+
+    *(device float *) (dst + d*args.nb_d0 + dst_hc*args.nb_d1 + t*args.nb_d2) = acc;
+}
+
 kernel void kernel_timestep_embedding_f32(
     constant  ggml_metal_kargs_timestep_embedding & args,
     device  const char * src0,

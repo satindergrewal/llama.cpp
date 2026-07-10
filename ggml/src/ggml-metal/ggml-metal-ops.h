@@ -90,6 +90,8 @@ int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_argsort           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_top_k             (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_sinkhorn_norm     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_hc_weighted_sum(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsv4_hc_expand    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_tri               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_adamw    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_sgd      (ggml_metal_op_t ctx, int idx);

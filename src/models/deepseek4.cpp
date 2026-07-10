@@ -200,19 +200,9 @@ static ggml_tensor * dsv4_hc_affine(
 ggml_tensor * llama_model_deepseek4::graph::build_hc_weighted_sum(
         ggml_tensor * x,
         ggml_tensor * weights) const {
-    const int64_t hc = hparams.dsv4_hc_mult;
-    const int64_t nt = x->ne[2];
-
-    ggml_tensor * acc = nullptr;
-    for (int64_t ih = 0; ih < hc; ++ih) {
-        ggml_tensor * xh = ggml_view_2d(ctx0, x, n_embd, nt, x->nb[2], ih*x->nb[1]);
-        ggml_tensor * wh = ggml_view_2d(ctx0, weights, 1, nt, weights->nb[1], ih*weights->nb[0]);
-
-        ggml_tensor * cur = ggml_mul(ctx0, xh, wh);
-        acc = acc ? ggml_add(ctx0, acc, cur) : cur;
-    }
-
-    return acc;
+    // fused kernel: out[d,t] = sum_h x[d,h,t] * w[h,t] (one op instead of
+    // 2*hc - 1 full-tensor mul/add nodes per call)
+    return ggml_dsv4_hc_weighted_sum(ctx0, x, weights);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
@@ -292,25 +282,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
         int il) const {
     GGML_UNUSED(il);
 
-    const int64_t hc = hparams.dsv4_hc_mult;
-    const int64_t nt = x->ne[1];
-
-    ggml_tensor * out = nullptr;
-    for (int64_t dst = 0; dst < hc; ++dst) {
-        ggml_tensor * post_dst = ggml_view_2d(ctx0, post, 1, nt, post->nb[1], dst*post->nb[0]);
-        ggml_tensor * cur = ggml_mul(ctx0, x, post_dst);
-
-        for (int64_t src = 0; src < hc; ++src) {
-            ggml_tensor * res_src = ggml_view_2d(ctx0, residual, n_embd, nt, residual->nb[2], src*residual->nb[1]);
-            ggml_tensor * comb_src_dst = ggml_view_2d(ctx0, comb, 1, nt, comb->nb[2], dst*comb->nb[0] + src*comb->nb[1]);
-            cur = ggml_add(ctx0, cur, ggml_mul(ctx0, res_src, comb_src_dst));
-        }
-
-        cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, nt);
-        out = out ? ggml_concat(ctx0, out, cur, 1) : cur;
-    }
-
-    return out;
+    // fused kernel: out[d,dst,t] = x[d,t]*post[dst,t] + sum_src residual[d,src,t]*comb[dst,src,t]
+    // (one op instead of ~hc*(2*hc + 2) full-tensor mul/add/concat nodes per call)
+    return ggml_dsv4_hc_expand(ctx0, x, residual, post, comb);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_hc_head(
