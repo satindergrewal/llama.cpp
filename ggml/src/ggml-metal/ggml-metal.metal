@@ -5699,6 +5699,81 @@ kernel void kernel_arange_f32(
     }
 }
 
+// fused Sinkhorn-Knopp normalization; mirrors ggml_compute_forward_sinkhorn_norm_f32
+// one thread handles one [n, n] slice (n <= 8, DeepSeek-V4 uses n = 4)
+kernel void kernel_sinkhorn_norm_f32(
+    constant ggml_metal_kargs_sinkhorn_norm & args,
+    device const char * src0,
+    device       char * dst,
+    uint gid [[thread_position_in_grid]]) {
+
+    if ((int32_t) gid >= args.n_slices) {
+        return;
+    }
+
+    const int n = args.n;
+
+    device const float * x = (device const float *) src0 + (int64_t) gid * n * n;
+    device       float * y = (device       float *) dst  + (int64_t) gid * n * n;
+
+    float m[64]; // n <= 8
+
+    for (int i = 0; i < n*n; ++i) {
+        m[i] = x[i];
+    }
+
+    // softmax over ne0 (a) within each row b, with max subtraction
+    for (int b = 0; b < n; ++b) {
+        float mx = -INFINITY;
+        for (int a = 0; a < n; ++a) {
+            mx = max(mx, m[b*n + a]);
+        }
+        float sum = 0.0f;
+        for (int a = 0; a < n; ++a) {
+            const float e = exp(m[b*n + a] - mx);
+            m[b*n + a] = e;
+            sum += e;
+        }
+        for (int a = 0; a < n; ++a) {
+            m[b*n + a] /= sum;
+        }
+    }
+
+    for (int i = 0; i < n*n; ++i) {
+        m[i] += args.eps;
+    }
+
+    // C: for each a, divide by (sum over b) + eps; R: for each b, divide by (sum over a) + eps
+    for (int32_t it = 0; it < args.n_iters; ++it) {
+        if (it > 0) {
+            for (int b = 0; b < n; ++b) {
+                float c = 0.0f;
+                for (int a = 0; a < n; ++a) {
+                    c += m[b*n + a];
+                }
+                c += args.eps;
+                for (int a = 0; a < n; ++a) {
+                    m[b*n + a] /= c;
+                }
+            }
+        }
+        for (int a = 0; a < n; ++a) {
+            float r = 0.0f;
+            for (int b = 0; b < n; ++b) {
+                r += m[b*n + a];
+            }
+            r += args.eps;
+            for (int b = 0; b < n; ++b) {
+                m[b*n + a] /= r;
+            }
+        }
+    }
+
+    for (int i = 0; i < n*n; ++i) {
+        y[i] = m[i];
+    }
+}
+
 kernel void kernel_timestep_embedding_f32(
     constant  ggml_metal_kargs_timestep_embedding & args,
     device  const char * src0,

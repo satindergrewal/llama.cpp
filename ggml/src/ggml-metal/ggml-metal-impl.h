@@ -1156,6 +1156,13 @@ typedef struct {
 } ggml_metal_kargs_arange;
 
 typedef struct {
+    int32_t n;
+    int32_t n_iters;
+    float   eps;
+    int32_t n_slices;
+} ggml_metal_kargs_sinkhorn_norm;
+
+typedef struct {
     int64_t val;
 } ggml_metal_kargs_memset;
 

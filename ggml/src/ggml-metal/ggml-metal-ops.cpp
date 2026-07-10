@@ -435,6 +435,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_argsort(ctx, idx);
             } break;
+        case GGML_OP_SINKHORN_NORM:
+            {
+                n_fuse = ggml_metal_op_sinkhorn_norm(ctx, idx);
+            } break;
         case GGML_OP_TOP_K:
             {
                 n_fuse = ggml_metal_op_top_k(ctx, idx);
@@ -4249,6 +4253,47 @@ int ggml_metal_op_pad_reflect_1d(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_sinkhorn_norm(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(op->src[0]));
+    GGML_ASSERT(op->ne[0] == op->ne[1]);
+    GGML_ASSERT(op->ne[0] <= 8);
+
+    const int32_t n_iters = ggml_get_op_params_i32(op, 0);
+
+    float eps;
+    memcpy(&eps, ((const int32_t *) op->op_params) + 1, sizeof(float));
+
+    const int32_t n_slices = (int32_t) (op->ne[2]*op->ne[3]);
+
+    ggml_metal_kargs_sinkhorn_norm args = {
+        /*.n        =*/ (int32_t) op->ne[0],
+        /*.n_iters  =*/ n_iters,
+        /*.eps      =*/ eps,
+        /*.n_slices =*/ n_slices,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_sinkhorn_norm(lib, op);
+
+    const int nth  = std::min(256, std::max(1, n_slices));
+    const int n_tg = (n_slices + nth - 1) / nth;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_tg, 1, 1, nth, 1, 1);
 
     return 1;
 }
