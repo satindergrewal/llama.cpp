@@ -611,11 +611,45 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
     cb(csa_k, "csa_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
-    cb(k_all, "csa_k_all", il);
-
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
-    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+
+    ggml_tensor * k_all;
+    ggml_tensor * csa_mask;
+
+    const int64_t n_top_k = top_k->ne[0];
+
+    if (n_tokens == 1 && n_top_k < n_csa) {
+        // single-token decode: gather the n_top_k selected compressed keys and
+        // attend over only those, instead of dense attention over all n_csa
+        // keys hidden behind a scattered -inf mask. The softmax result is
+        // identical (permutation-invariant over keys; the indexer scores had
+        // the causal mask added before top-k, so every selected key is valid),
+        // but attention cost becomes O(n_top_k) fixed instead of O(n_csa)
+        // growing with context, and the per-layer mask scatter (which lands on
+        // the CPU backend and splits the graph) disappears.
+        ggml_tensor * idx = ggml_reshape_1d(ctx0, top_k, n_top_k);
+
+        // csa_k is [hd, 1, n_csa, 1]; get_rows gathers along ne1
+        ggml_tensor * csa_rows = ggml_permute(ctx0, csa_k, 0, 2, 1, 3); // view [hd, n_csa, 1, 1]
+        ggml_tensor * gathered = ggml_get_rows(ctx0, csa_rows, idx);   // [hd, n_top_k, 1] f32
+        if (gathered->type != raw_k->type) {
+            gathered = ggml_cast(ctx0, gathered, raw_k->type);
+        }
+        gathered = ggml_reshape_4d(ctx0, gathered, csa_k->ne[0], csa_k->ne[1], n_top_k, csa_k->ne[3]);
+        cb(gathered, "csa_gathered_k", il);
+
+        k_all = ggml_concat(ctx0, raw_k, gathered, 2);
+        cb(k_all, "csa_k_all", il);
+
+        // every gathered key is causally visible at decode: zero mask block
+        csa_mask = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, raw_mask->type, n_top_k, raw_mask->ne[1]), 0.0f);
+        cb(csa_mask, "csa_top_k_mask", il);
+    } else {
+        k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
+        cb(k_all, "csa_k_all", il);
+
+        csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+    }
 
     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
     cb(kq_mask, "csa_lid_kq_mask", il);
