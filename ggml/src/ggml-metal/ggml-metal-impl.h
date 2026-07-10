@@ -1195,6 +1195,26 @@ typedef struct {
 } ggml_metal_kargs_dsv4_hc_expand;
 
 typedef struct {
+    int32_t  n_kv;
+    int32_t  n_head;
+    int32_t  head_dim;
+    int32_t  n_batch;
+    int32_t  n_stream;
+    int32_t  n_mask3;
+    uint64_t nb_q1;
+    uint64_t nb_q2;
+    uint64_t nb_q3;
+    uint64_t nb_k2;
+    uint64_t nb_k3;
+    uint64_t nb_w1;
+    uint64_t nb_w3;
+    uint64_t nb_m1;
+    uint64_t nb_m3;
+    uint64_t nb_d1;
+    uint64_t nb_d3;
+} ggml_metal_kargs_lightning_indexer;
+
+typedef struct {
     int64_t val;
 } ggml_metal_kargs_memset;
 

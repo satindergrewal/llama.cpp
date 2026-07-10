@@ -439,6 +439,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_sinkhorn_norm(ctx, idx);
             } break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
+            } break;
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
             {
                 n_fuse = ggml_metal_op_dsv4_hc_weighted_sum(ctx, idx);
@@ -4261,6 +4265,60 @@ int ggml_metal_op_pad_reflect_1d(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_tensor * q = op->src[0];
+    ggml_tensor * k = op->src[1];
+    ggml_tensor * w = op->src[2];
+    ggml_tensor * m = op->src[3];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(m->type == GGML_TYPE_F16);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+
+    ggml_metal_kargs_lightning_indexer args = {
+        /*.n_kv     =*/ (int32_t) op->ne[0],
+        /*.n_head   =*/ (int32_t) q->ne[1],
+        /*.head_dim =*/ (int32_t) q->ne[0],
+        /*.n_batch  =*/ (int32_t) op->ne[1],
+        /*.n_stream =*/ (int32_t) op->ne[3],
+        /*.n_mask3  =*/ (int32_t) m->ne[3],
+        /*.nb_q1    =*/ q->nb[1],
+        /*.nb_q2    =*/ q->nb[2],
+        /*.nb_q3    =*/ q->nb[3],
+        /*.nb_k2    =*/ k->nb[2],
+        /*.nb_k3    =*/ k->nb[3],
+        /*.nb_w1    =*/ w->nb[1],
+        /*.nb_w3    =*/ w->nb[3],
+        /*.nb_m1    =*/ m->nb[1],
+        /*.nb_m3    =*/ m->nb[3],
+        /*.nb_d1    =*/ op->nb[1],
+        /*.nb_d3    =*/ op->nb[3],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_lightning_indexer(lib, op);
+
+    const int64_t n_elem = (int64_t) op->ne[0]*op->ne[1]*op->ne[3];
+    const int nth  = std::min<int64_t>(256, std::max<int64_t>(1, n_elem));
+    const int n_tg = (int) ((n_elem + nth - 1) / nth);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(k),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(m),  4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 5);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_tg, 1, 1, nth, 1, 1);
 
     return 1;
 }

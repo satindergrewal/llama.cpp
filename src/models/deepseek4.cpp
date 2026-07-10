@@ -512,25 +512,46 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
             indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2], n_stream,
             indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
 
-    indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
-    cb(indexer_q, "lid_q", il);
-    indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
-    cb(indexer_k, "lid_k", il);
+    ggml_tensor * indexer_score;
 
-    ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
-    cb(indexer_kq, "lid_kq", il);
+    if (nt == 1) {
+        // single-token decode: fused scorer (GGML_OP_LIGHTNING_INDEXER, from PR
+        // ggml-org/llama.cpp#24231) computes relu(q.k) weighted-summed over
+        // heads plus mask in one op, avoiding the kq materialization and the
+        // two cont(permute) passes below. The op requires an f16 mask; slice
+        // the (possibly padded) input mask to the live token first.
+        ggml_tensor * mask = inp_lid.kq_mask;
+        if (mask->ne[1] != indexer_q->ne[2]) {
+            mask = ggml_view_4d(ctx0, mask, mask->ne[0], indexer_q->ne[2], mask->ne[2], mask->ne[3],
+                    mask->nb[1], mask->nb[2], mask->nb[3], 0);
+        }
+        if (mask->type != GGML_TYPE_F16) {
+            mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
+        }
 
-    indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
-    cb(indexer_kq, "lid_kq", il);
+        indexer_score = ggml_lightning_indexer(ctx0, indexer_q, indexer_k, indexer_weights, mask);
+        cb(indexer_score, "lid_score_masked", il);
+    } else {
+        indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
+        cb(indexer_q, "lid_q", il);
+        indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
+        cb(indexer_k, "lid_k", il);
 
-    ggml_tensor * indexer_score = ggml_relu(ctx0, indexer_kq);
-    indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
-    indexer_score = ggml_sum_rows(ctx0, indexer_score);
-    indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
-    cb(indexer_score, "lid_score", il);
+        ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
+        cb(indexer_kq, "lid_kq", il);
 
-    indexer_score = ggml_add(ctx0, indexer_score, inp_lid.kq_mask);
-    cb(indexer_score, "lid_score_masked", il);
+        indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
+        cb(indexer_kq, "lid_kq", il);
+
+        indexer_score = ggml_relu(ctx0, indexer_kq);
+        indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
+        indexer_score = ggml_sum_rows(ctx0, indexer_score);
+        indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
+        cb(indexer_score, "lid_score", il);
+
+        indexer_score = ggml_add(ctx0, indexer_score, inp_lid.kq_mask);
+        cb(indexer_score, "lid_score_masked", il);
+    }
 
     const uint32_t n_top_k = indexer_score->ne[0] < hparams.indexer_top_k ? indexer_score->ne[0] : hparams.indexer_top_k;
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));

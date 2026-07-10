@@ -5834,6 +5834,50 @@ kernel void kernel_dsv4_hc_expand_f32(
     *(device float *) (dst + d*args.nb_d0 + dst_hc*args.nb_d1 + t*args.nb_d2) = acc;
 }
 
+// res[kv, b, 0, s] = mask[kv, b, 0, s%nm] + sum_h w[h,b,0,s] * relu(sum_d q[d,h,b,s] * k[d,0,kv,s])
+// mirrors ggml_compute_forward_lightning_indexer; intended for small n_batch (decode)
+template<typename TK>
+kernel void kernel_lightning_indexer(
+    constant ggml_metal_kargs_lightning_indexer & args,
+    device const char * q,
+    device const char * k,
+    device const char * w,
+    device const char * m,
+    device       char * dst,
+    uint gid [[thread_position_in_grid]]) {
+
+    const int64_t n_elem = (int64_t) args.n_kv * args.n_batch * args.n_stream;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t kv  = (int64_t) gid % args.n_kv;
+    const int64_t tmp = (int64_t) gid / args.n_kv;
+    const int64_t b   = tmp % args.n_batch;
+    const int64_t sIx = tmp / args.n_batch;
+
+    device const float * qb = (device const float *) (q + b*args.nb_q2 + sIx*args.nb_q3);
+    device const TK    * kk = (device const TK    *) (k + kv*args.nb_k2 + sIx*args.nb_k3);
+    device const float * wb = (device const float *) (w + b*args.nb_w1 + sIx*args.nb_w3);
+    device const half  * mb = (device const half  *) (m + b*args.nb_m1 + (sIx % args.n_mask3)*args.nb_m3);
+
+    float acc = 0.0f;
+    for (int32_t h = 0; h < args.n_head; ++h) {
+        device const float * qh = (device const float *) ((device const char *) qb + h*args.nb_q1);
+        float dot = 0.0f;
+        for (int32_t d = 0; d < args.head_dim; ++d) {
+            dot += qh[d] * (float) kk[d];
+        }
+        acc += wb[h] * max(dot, 0.0f);
+    }
+
+    *(device float *) (dst + b*args.nb_d1 + sIx*args.nb_d3 + kv*sizeof(float)) = acc + (float) mb[kv];
+}
+
+typedef decltype(kernel_lightning_indexer<half>) kernel_lightning_indexer_t;
+template [[host_name("kernel_lightning_indexer_f16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<half>;
+template [[host_name("kernel_lightning_indexer_f32")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<float>;
+
 kernel void kernel_timestep_embedding_f32(
     constant  ggml_metal_kargs_timestep_embedding & args,
     device  const char * src0,
