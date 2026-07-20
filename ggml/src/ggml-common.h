@@ -166,6 +166,13 @@ typedef sycl::half2 ggml_half2;
 #define QI4_XS (QK_K / (4*QR4_XS))
 #define QR4_XS 2
 
+// IQK quant types ported from ik_llama.cpp (P1)
+#define QI5_XS (QK_K / (4*QR5_XS))
+#define QR5_XS 2
+
+#define QI6_XS (QK_K / (4*QR6_XS))
+#define QR6_XS 2
+
 #define QI3_S (QK_K / (4*QR3_S))
 #define QR3_S 4
 
