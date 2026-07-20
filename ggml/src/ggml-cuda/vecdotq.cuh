@@ -1320,3 +1320,102 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;
 }
+
+// ============================================================================
+// IQK quant types ported from ik_llama.cpp (P1 item 3): MMVQ vec_dot kernels.
+// Only the block-scale types IQ4_K and IQ6_K are ported here -- they carry a
+// per-block scale, so mainline's mmvq kernel (vbq = tensor base, kbx = absolute
+// block index) drives them directly, exactly like IQ4_XS above.
+//
+// The row-meta types (IQ1_KT..IQ4_KT, IQ5_KS) keep a per-row f32 scale header and
+// a byte row-stride that is not a whole number of blocks, which mainline's mmvq
+// kernel (whole-block kbx stride, no per-row header) cannot express. Their MMVQ
+// vec_dot is a TODO: it needs the mmvq kernel to plumb n_per_row + a byte-accurate
+// row base. Until then those types stay on the cuBLAS dequant path (see
+// ggml_cuda_iqk_mmvq_blocked). Helpers below are byte-for-byte ports of
+// ik_llama.cpp/ggml/src/ggml-cuda/iqk_mmvq_templates.cuh.
+// ============================================================================
+
+static __device__ __forceinline__ void get_int_from_table_16_shift(const uint32_t & q4, uint16_t shift, const uint8_t * all_values,
+        int & val1, int & val2) {
+
+    uint32_t aux32; const uint8_t * q8 = (const uint8_t *)&aux32;
+    aux32 = q4 & 0x0f0f0f0f;
+    const uint8_t * values = all_values + 16*(shift & 1);
+    uint16_t v1 = values[q8[0]] | (values[q8[1]] << 8);
+    uint16_t v2 = values[q8[2]] | (values[q8[3]] << 8);
+    val1 = v1 | (v2 << 16);
+    aux32 = (q4 >> 4) & 0x0f0f0f0f;
+    values = all_values + 8*(shift & 2);
+    v1 = values[q8[0]] | (values[q8[1]] << 8);
+    v2 = values[q8[2]] | (values[q8[3]] << 8);
+    val2 = v1 | (v2 << 16);
+}
+
+static __device__ __forceinline__ int int_from_table(const uint8_t * a8, const uint8_t * values) {
+    uint16_t v1 = values[a8[0]] | (values[a8[1]] << 8);
+    uint16_t v2 = values[a8[2]] | (values[a8[3]] << 8);
+    return v1 | (v2 << 16);
+}
+
+#define VDR_IQ4_K_Q8_1_MMVQ 4
+#define VDR_IQ6_K_Q8_1_MMVQ 4
+
+static __device__ __forceinline__ float vec_dot_iq4_k_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_iq4_k * bq4 = (const block_iq4_k *) vbq + kbx;
+    const uint8_t * all_values = (const uint8_t *)iq4k_values;
+
+    // iqs is 0...28
+    const int ib32 = iqs/4;
+    const int32_t  * q8 = (const int *)bq8_1[ib32].qs;
+    const uint16_t * q4 = (const uint16_t *)bq4->qs + 8*ib32;
+    const uint16_t extra = bq4->extra >> 2*ib32;
+    int v1, v2;
+    int sumi1 = 0, sumi2 = 0;
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t aux32 = q4[2*j+0] | (q4[2*j+1] << 16);
+        get_int_from_table_16_shift(aux32, extra, all_values, v1, v2);
+        sumi1 = ggml_cuda_dp4a(v1, q8[j+0], sumi1);
+        sumi2 = ggml_cuda_dp4a(v2, q8[j+4], sumi2);
+    }
+    const float d = __half2float(bq4->d) * __low2float(bq8_1[ib32].ds);
+    const uint8_t sh = bq4->scales_h[ib32/2] >> 4*(ib32%2);
+    const int ls1 = ((bq4->scales_l[ib32] & 0xf) | ((sh << 4) & 0x30)) - 32;
+    const int ls2 = ((bq4->scales_l[ib32] >>  4) | ((sh << 2) & 0x30)) - 32;
+    return d * (sumi1 * ls1 + sumi2 * ls2);
+}
+
+static __device__ __forceinline__ float vec_dot_iq6_k_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_iq6_k * bq6 = (const block_iq6_k *) vbq + kbx;
+    const uint8_t * all_values = (const uint8_t *)iq6nl_values;
+
+    int i4 = iqs/4;  // 0...7.  Blocks of 16 index is 4*(i4/2) + (i4%2) + (0 and 2)
+                     //         Blocks of 32 index is 2*(i4/2) + 0 or 1
+
+    const int32_t  * q8_1 = (const int *)bq8_1[2*(i4/2)+0].qs + 4*(i4%2);
+    const int32_t  * q8_2 = (const int *)bq8_1[2*(i4/2)+1].qs + 4*(i4%2);
+    const uint32_t * q4 = (const uint32_t *)bq6->qs + 8*(i4/2) + 4*(i4%2);
+    const uint32_t * qh = (const uint32_t *)bq6->qh + 8*(i4/4) + 4*(i4%2);
+    const uint16_t extra = bq6->extra >> (4*(i4/2) + (i4%2));
+    const uint8_t * values1 = all_values + 64*(extra & 1);
+    const uint8_t * values2 = all_values + 16*(extra & 4);
+    uint32_t aux32[2];
+    const uint8_t * a8 = (const uint8_t *)aux32;
+    int v1, v2;
+    int sumi1 = 0, sumi2 = 0;
+    for (int j = 0; j < 4; ++j) {
+        uint32_t h = qh[j] >> 4*((i4/2)%2);
+        aux32[0] = ((q4[j] >> 0) & 0x0f0f0f0f) | ((h << 4) & 0x30303030);
+        aux32[1] = ((q4[j] >> 4) & 0x0f0f0f0f) | ((h << 2) & 0x30303030);
+        v1 = int_from_table(a8+0, values1);
+        v2 = int_from_table(a8+4, values2);
+        sumi1 = ggml_cuda_dp4a(v1, q8_1[j], sumi1);
+        sumi2 = ggml_cuda_dp4a(v2, q8_2[j], sumi2);
+    }
+    const float d6 = __half2float(bq6->d);
+    return d6 * (__low2float(bq8_1[2*(i4/2)+0].ds) * sumi1 * bq6->scales[4*(i4/2)+(i4%2)] + __low2float(bq8_1[2*(i4/2)+1].ds) * sumi2 * bq6->scales[4*(i4/2)+(i4%2)+2]);
+}
