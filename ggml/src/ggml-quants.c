@@ -5412,6 +5412,19 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         return false;
     }
 
+    if (ggml_blck_size(type) == 0) {
+        fprintf(stderr, "%s: invalid (unused) type %d\n", __func__, type);
+        return false;
+    }
+
+    // row_meta types (IQK quants): the buffer interleaves per-row headers with
+    // block data and the row length is not known here, so the per-block scale
+    // checks below do not apply. The row scale itself is validated at load
+    // time via the row size math; accept the data as-is.
+    if (ggml_row_meta_size(type) != 0) {
+        return true;
+    }
+
     if (nbytes % ggml_type_size(type) != 0) {
         fprintf(stderr, "%s: invalid size %zu for type %s (type size = %zu)\n", __func__, nbytes, ggml_type_name(type), ggml_type_size(type));
         return false;
@@ -5586,6 +5599,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q6_K:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q6_K, data, nb);
+            } break;
+        case GGML_TYPE_IQ4_K:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_k, data, nb);
+            } break;
+        case GGML_TYPE_IQ6_K:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_iq6_k, data, nb);
             } break;
         case GGML_TYPE_Q8_K:
             {

@@ -297,7 +297,7 @@ static void ggml_compute_forward_dup_to_q(
         float * src0_f32 = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
         size_t id = 0;
-        size_t rs = nb0 * (ne00 / ggml_blck_size(dst->type));
+        size_t rs = ggml_row_size(dst->type, ne00);
         char * dst_ptr = (char *) dst->data;
 
         for (int i03 = 0; i03 < ne03; i03++) {
@@ -368,6 +368,10 @@ static void ggml_compute_forward_dup_bytes(
         }
         return;
     }
+
+    // row_meta types store a per-row header in front of the block data; only
+    // the whole-row copy above preserves it
+    GGML_ASSERT(ggml_row_meta_size(src0->type) == 0);
 
     if (ggml_is_contiguous(dst)) {
         size_t id = 0;
@@ -484,7 +488,9 @@ static void ggml_compute_forward_dup_from_q(
     const ggml_type type = src0->type;
     ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
 
-    size_t qk = ggml_blck_size(type);
+    // row_meta types store a per-row header, so they can only be dequantized
+    // in whole-row chunks; other types can be chunked per block
+    size_t qk = ggml_row_meta_size(type) != 0 ? ne00 : ggml_blck_size(type);
     const int64_t nr = ggml_nelements(src1) / qk;
 
     // destination must be contiguous in the first dimension
@@ -1905,6 +1911,9 @@ static void ggml_compute_forward_concat_any(
     const ggml_tensor * src1 = dst->src[1];
 
     const size_t len = ggml_type_size(src0->type);
+
+    // block-level copies do not preserve the per-row header of row_meta types
+    GGML_ASSERT(ggml_row_meta_size(src0->type) == 0);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -5804,6 +5813,13 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ4_K:
+        case GGML_TYPE_IQ5_KS:
+        case GGML_TYPE_IQ6_K:
+        case GGML_TYPE_IQ1_KT:
+        case GGML_TYPE_IQ2_KT:
+        case GGML_TYPE_IQ3_KT:
+        case GGML_TYPE_IQ4_KT:
         case GGML_TYPE_Q8_K:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
@@ -5811,6 +5827,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_I64:
         case GGML_TYPE_F64:
         case GGML_TYPE_COUNT:
+        default:
             {
                 GGML_ABORT("fatal error");
             }
