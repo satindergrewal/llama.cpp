@@ -23,6 +23,7 @@ if __name__ == "__main__":
 
 from gguf.constants import (
     GGML_QUANT_SIZES,
+    GGML_ROW_META_SIZES,
     GGUF_DEFAULT_ALIGNMENT,
     GGUF_MAGIC,
     GGUF_VERSION,
@@ -330,6 +331,10 @@ class GGUFReader:
             np_dims = tuple(reversed(dims.tolist()))
             block_size, type_size = GGML_QUANT_SIZES[ggml_type]
             n_bytes = n_elems * type_size // block_size
+            row_meta_size = GGML_ROW_META_SIZES.get(ggml_type, 0)
+            if row_meta_size != 0:
+                # these types store a per-row header in front of the block data
+                n_bytes += row_meta_size * (n_elems // int(dims[0]))
             data_offs = int(start_offs + offset_tensor[0])
             item_type: npt.DTypeLike
             if ggml_type == GGMLQuantizationType.F16:
