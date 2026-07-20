@@ -1180,11 +1180,10 @@ static __host__ __device__ __forceinline__ bool ggml_cuda_is_iqk_row_meta(ggml_t
 
 // True for IQK P1 types that do NOT yet have an MMVQ vec_dot kernel. mul_mat must
 // route these to the cuBLAS dequant path instead of dispatching to a missing kernel.
-// As MMVQ kernels are added (P1 item 3), remove the corresponding case here.
+// IQ4_K/IQ6_K (block-scale) have MMVQ vec_dot kernels; the row-meta types do not yet
+// (their per-row f32 header does not fit mainline's whole-block mmvq stride) -- P1 item 3 TODO.
 static __host__ __device__ __forceinline__ bool ggml_cuda_iqk_mmvq_blocked(ggml_type type) {
     switch (type) {
-        case GGML_TYPE_IQ4_K:
-        case GGML_TYPE_IQ6_K:
         case GGML_TYPE_IQ5_KS:
         case GGML_TYPE_IQ2_KT:
         case GGML_TYPE_IQ3_KT:
