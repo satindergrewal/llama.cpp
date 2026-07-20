@@ -69,6 +69,13 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:    name = LLAMA_FTYPE_PREFIX "IQ4_XS - 4.25 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:     name = LLAMA_FTYPE_PREFIX "IQ3_S - 3.4375 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ3_M:     name = LLAMA_FTYPE_PREFIX "IQ3_S mix - 3.66 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ4_K:     name = LLAMA_FTYPE_PREFIX "IQ4_K - 4.5 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ5_KS:    name = LLAMA_FTYPE_PREFIX "IQ5_KS - 5.25 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ6_K:     name = LLAMA_FTYPE_PREFIX "IQ6_K - 6.6 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ1_KT:    name = LLAMA_FTYPE_PREFIX "IQ1_KT - 1.75 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ2_KT:    name = LLAMA_FTYPE_PREFIX "IQ2_KT - 2.125 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ3_KT:    name = LLAMA_FTYPE_PREFIX "IQ3_KT - 3.125 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_IQ4_KT:    name = LLAMA_FTYPE_PREFIX "IQ4_KT - 4.0 bpw"; break;
         default:                           name = LLAMA_FTYPE_PREFIX "unknown, may not work"; break;
     }
     return (ftype & LLAMA_FTYPE_GUESSED) ? name : name + guessed_prefix_len;

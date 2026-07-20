@@ -156,6 +156,15 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        // IQK quant types, ported from ik_llama.cpp (author: Iwan Kawrakow);
+        // the ftype numbers match ik_llama.cpp, values in between are unused
+        LLAMA_FTYPE_MOSTLY_IQ4_K         = 140, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ6_K         = 142, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ5_KS        = 150, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ2_KT        = 151, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ3_KT        = 152, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ4_KT        = 153, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_IQ1_KT        = 156, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
