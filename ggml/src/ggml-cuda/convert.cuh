@@ -16,6 +16,14 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
+// Contiguous dequant for the row-meta IQK types (IQ1_KT..IQ4_KT, IQ5_KS). These carry a
+// per-row f32 scale header, so the launcher needs n_per_row (= ne00) and nrows, which the
+// generic (vx, y, k, stream) converters do not provide. Reached from the cuBLAS mul_mat
+// path (ggml_cuda_mul_mat_cublas_impl). Defined + instantiated (float/half/nv_bfloat16)
+// in convert.cu. Guard callers with ggml_cuda_is_iqk_row_meta(type).
+template<typename dst_t>
+void dequantize_iqk_row_meta_cuda(ggml_type type, const void * vx, dst_t * y, int64_t nrows, int64_t n_per_row, cudaStream_t stream);
+
 // TODO more general support for non-contiguous inputs
 
 template<typename T>

@@ -281,6 +281,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    // IQK P1 types without an MMVQ vec_dot kernel route to the cuBLAS dequant path instead.
+    if (ggml_cuda_iqk_mmvq_blocked(type)) {
+        return false;
+    }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {

@@ -1112,6 +1112,90 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qi = QI3_S;
 };
 
+// IQK quant types ported from ik_llama.cpp (P1).
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ1_KT> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR4_XS;
+    static constexpr int qi = QI4_XS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ2_KT> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR4_XS;
+    static constexpr int qi = QI4_XS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ3_KT> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR4_XS;
+    static constexpr int qi = QI4_XS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ4_KT> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR4_XS;
+    static constexpr int qi = QI4_XS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ4_K> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR4_XS;
+    static constexpr int qi = QI4_XS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ5_KS> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR5_XS;
+    static constexpr int qi = QI5_XS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ6_K> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR6_XS;
+    static constexpr int qi = QI6_XS;
+};
+
+// True for the row-meta IQK types (per-row f32 scale header): IQ1_KT..IQ4_KT and
+// IQ5_KS. These need n_per_row for the contiguous dequant path (dispatched through
+// dequantize_iqk_row_meta_cuda). IQ4_K/IQ6_K carry a per-block scale and are not here.
+static __host__ __device__ __forceinline__ bool ggml_cuda_is_iqk_row_meta(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ1_KT:
+        case GGML_TYPE_IQ2_KT:
+        case GGML_TYPE_IQ3_KT:
+        case GGML_TYPE_IQ4_KT:
+        case GGML_TYPE_IQ5_KS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// True for IQK P1 types that do NOT yet have an MMVQ vec_dot kernel. mul_mat must
+// route these to the cuBLAS dequant path instead of dispatching to a missing kernel.
+// As MMVQ kernels are added (P1 item 3), remove the corresponding case here.
+static __host__ __device__ __forceinline__ bool ggml_cuda_iqk_mmvq_blocked(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ4_K:
+        case GGML_TYPE_IQ6_K:
+        case GGML_TYPE_IQ5_KS:
+        case GGML_TYPE_IQ2_KT:
+        case GGML_TYPE_IQ3_KT:
+        case GGML_TYPE_IQ4_KT:
+        case GGML_TYPE_IQ1_KT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 //////////////////////
 
 struct ggml_cuda_device_info {

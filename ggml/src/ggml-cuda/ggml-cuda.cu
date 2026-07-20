@@ -1447,13 +1447,24 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_alloc.alloc(ggml_nelements(src0));
 
         if (ggml_is_contiguously_allocated(src0)) {
-            const auto convert_func = traits::convert(src0->type);
-            GGML_ASSERT(convert_func != nullptr);
-            convert_func(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
-            const size_t src0_bs = ggml_blck_size(src0->type);
-            s01 *= src0_bs;
-            s02 *= src0_bs;
-            s03 *= src0_bs;
+            if (ggml_cuda_is_iqk_row_meta(src0->type)) {
+                // Row-meta IQK types keep a per-row f32 scale header, so the generic
+                // (vx, y, k, stream) converters cannot locate it. Dispatch to the
+                // n_per_row-aware kernels and set contiguous strides explicitly.
+                dequantize_iqk_row_meta_cuda<cuda_t>(src0->type, src0->data, src0_alloc.get(),
+                    ggml_nrows(src0), ne00, main_stream);
+                s01 = ne00;
+                s02 = ne01*s01;
+                s03 = ne02*s02;
+            } else {
+                const auto convert_func = traits::convert(src0->type);
+                GGML_ASSERT(convert_func != nullptr);
+                convert_func(src0->data, src0_alloc.get(), ggml_nelements(src0), main_stream);
+                const size_t src0_bs = ggml_blck_size(src0->type);
+                s01 *= src0_bs;
+                s02 *= src0_bs;
+                s03 *= src0_bs;
+            }
         } else {
             const auto convert_func = traits::convert_nc(src0->type);
             GGML_ASSERT(convert_func != nullptr);
@@ -1791,6 +1802,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+
+    // IQK P1 types without an MMVQ vec_dot kernel must not be fused into the MMVQ path.
+    if (ggml_cuda_iqk_mmvq_blocked(src0->type)) {
+        return false;
+    }
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -4810,6 +4826,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ3_XXS:
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
+                    // IQK quant types ported from ik_llama.cpp (P1): CUDA dequant kernels
+                    // exist, so mul_mat is supported (routes to MMVQ where a vec_dot kernel
+                    // exists, otherwise to the cuBLAS dequant path).
+                    case GGML_TYPE_IQ4_K:
+                    case GGML_TYPE_IQ6_K:
+                    case GGML_TYPE_IQ5_KS:
+                    case GGML_TYPE_IQ2_KT:
+                    case GGML_TYPE_IQ3_KT:
+                    case GGML_TYPE_IQ4_KT:
+                    case GGML_TYPE_IQ1_KT:
                     case GGML_TYPE_BF16:
                         return true;
                     default:
