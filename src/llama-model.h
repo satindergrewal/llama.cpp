@@ -605,6 +605,9 @@ struct llama_model {
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
 
+    // Qwen3.5-style DSpark backbone: q projection fuses a sigmoid output gate ([q; gate] per head)
+    bool dspark_gated_q = false;
+
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 

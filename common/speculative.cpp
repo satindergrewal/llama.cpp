@@ -910,6 +910,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     llama_batch batch;        // noise tokens
     llama_batch batch_inject; // target features for KV cache injection
 
+    // Qwen3.5-style (interleaved-MRoPE) drafter: 4-stream position layout for embd batches
+    bool dft_mrope = false;
+    std::vector<llama_pos> pos_mrope;
+
     std::vector<common_sampler_ptr> smpls;
 
     int32_t n_embd_dec = 0;  // draft hidden size
@@ -958,6 +962,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+
+        // an interleaved-MRoPE drafter backbone (Qwen3.5-style) consumes 4 position streams per
+        // token; embedding batches are not auto-broadcast (see llama_batch_allocr), so the
+        // inject path must lay the streams out itself, mtmd-style: [t|h|w|e]
+        const llama_rope_type rt_dft = llama_model_rope_type(model_dft);
+        dft_mrope = rt_dft == LLAMA_ROPE_TYPE_MROPE || rt_dft == LLAMA_ROPE_TYPE_IMROPE;
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min);
@@ -1102,7 +1112,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                llama_pos * pos_inject_orig = batch_inject.pos;
+                if (dft_mrope) {
+                    const int32_t n = batch_inject.n_tokens;
+                    pos_mrope.resize((size_t) 4 * n);
+                    for (int32_t i = 0; i < n; ++i) {
+                        const llama_pos p = batch_inject.pos[i];
+                        pos_mrope[            i] = p;
+                        pos_mrope[    (size_t) n + i] = p;
+                        pos_mrope[2 * (size_t) n + i] = p;
+                        pos_mrope[3 * (size_t) n + i] = 0;
+                    }
+                    batch_inject.pos = pos_mrope.data();
+                }
                 rc = llama_decode(ctx_dft, batch_inject);
+                batch_inject.pos = pos_inject_orig;
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);

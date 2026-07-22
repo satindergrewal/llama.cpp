@@ -708,3 +708,53 @@ class DSparkModel(DFlashModel):
         if name.endswith(("embed_tokens.weight", "lm_head.weight")):
             return None
         return super().filter_tensors((name, gen))
+
+
+@ModelBase.register("Qwen35DSparkModel")
+class Qwen35DSparkModel(DSparkModel):
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    # DSpark drafter with a Qwen3.5-style backbone: fused [q; gate] q_proj (stored as-is and
+    # detected C++-side by its doubled width), partial rotary, interleaved MRoPE sections.
+    _QWEN35_DEFAULT_MROPE_SECTION = [11, 11, 10, 0]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # DeepSpec qwen3.5 exports nest a stale copy of the target config under text_config,
+        # which the generic text_config flattening merges over the drafter geometry (e.g.
+        # 32 target layers over the drafter 5). Restore the drafter own top-level values.
+        own = ModelBase.load_hparams(self.dir_model, False)
+        own.pop("text_config", None)
+        self.hparams.update(own)
+        self.block_count = self.hparams["num_hidden_layers"]
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        self.rope_parameters = self.hparams.get("rope_parameters") or {}
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # qwen3.5-style backbones use zero-centered RMSNorm weights ((1 + w) semantics),
+        # same as the qwen35 target conversion (see Qwen3NextModel.modify_tensors)
+        if name.endswith("norm.weight"):
+            data_torch = data_torch + 1
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        head_dim = self.hparams.get("head_dim") or self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
+        partial = self.hparams.get("partial_rotary_factor") or self.rope_parameters.get("partial_rotary_factor")
+        if partial:
+            self.gguf_writer.add_rope_dimension_count(int(head_dim * partial))
+
+        self.gguf_writer.add_rope_dimension_sections(
+            self.rope_parameters.get("mrope_section", self._QWEN35_DEFAULT_MROPE_SECTION))
+
+        # the drafter is trained with the target rotary; prefer its own rope_theta and fall
+        # back to the target one (overwrites any stale value the merged config produced)
+        theta = self.rope_parameters.get("rope_theta") or self.hparams.get("rope_theta")
+        if not theta and self.target_model_dir is not None:
+            with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
+                tcfg = json.load(f)
+            tcfg = tcfg.get("text_config", tcfg)
+            theta = (tcfg.get("rope_parameters") or {}).get("rope_theta") or tcfg.get("rope_theta")
+        if theta:
+            self.gguf_writer.add_rope_freq_base(theta)
