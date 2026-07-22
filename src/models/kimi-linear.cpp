@@ -277,6 +277,8 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // Attention Norm
