@@ -1419,3 +1419,54 @@ static __device__ __forceinline__ float vec_dot_iq6_k_q8_1(
     const float d6 = __half2float(bq6->d);
     return d6 * (__low2float(bq8_1[2*(i4/2)+0].ds) * sumi1 * bq6->scales[4*(i4/2)+(i4%2)] + __low2float(bq8_1[2*(i4/2)+1].ds) * sumi2 * bq6->scales[4*(i4/2)+(i4%2)+2]);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Row-meta (trellis) MMVQ. Ported from ik_llama.cpp
+// (ggml/src/ggml-cuda/template-instances/mmvq-instance-iq4_kt.cu, MIT, ikawrakow) with the
+// calling convention adapted to mainline: mainline's vec_dot RETURNS the partial sum instead of
+// accumulating through a float* out-param.
+//
+// IMPORTANT: vbq here is the ROW BASE, not the tensor base. Row-meta types store a leading f32
+// row scale in front of each row's blocks, so mmvq passes row base + a WITHIN-ROW block index
+// (see the ggml_cuda_iqk_row_meta_size() branch in mmvq.cu). Reading that header is this
+// kernel's job.
+//
+// iqs stepping: qi = QI4_XS = 32, vdr = 4  =>  kqs = 4*(tid % 8)  =>  iqs in {0,4,...,28}
+// => ib32 = iqs/4 in {0..7}, i.e. all eight 32-element sub-blocks. Matches ik exactly.
+#define VDR_IQ4_KT_Q8_1_MMVQ 4
+
+static __device__ __forceinline__ float vec_dot_iq4_kt_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    constexpr uint32_t ka = 0xCBAC1FED;   // QTIP-style integer LCG multiplier (must match the CPU ref)
+    constexpr uint32_t km = 0x3f3f3f3f;
+
+    const float scale = *(const float *) vbq;                                   // per-row f32 header
+    const block_iq4_kt * bq4 = (const block_iq4_kt *)((const char *) vbq + sizeof(float)) + kbx;
+
+    const int ib32 = iqs/4;
+    const int32_t * q8 = (const int *) bq8_1[ib32].qs;
+
+    const int ls = (bq4->qs[ib32] & 0xff) >> 1;
+    const float dl = scale * (ls - 64);
+    const uint32_t idx0 = ((bq4->qs[ib32] & 1) << 15) + 4096;
+
+    const uint8_t * ql = (const uint8_t *)(bq4->qs + 8);
+    const uint8_t * qh = ql + 64;
+    ql += 8*ib32;
+    qh += 8*(ib32%4);
+    const int shift1 = 8 - 4*(ib32/4);
+
+    int sumi = 0;
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t sh = bq4->qs[ib32] >> (8 + 3*j);
+        uint32_t val = ql[j] + ((qh[j] << shift1) & 0xf00) + ((sh & 7) << 12) + idx0;
+        int v4 = 0;
+        for (int k = 0; k < 4; ++k) {
+            val *= ka;
+            v4 |= (ggml_cuda_dp4a(val & km, 0x01010101, -126) & 0xff) << 8*k;
+        }
+        sumi = ggml_cuda_dp4a(v4, q8[j], sumi);
+    }
+    return dl * __low2float(bq8_1[ib32].ds) * sumi;
+}

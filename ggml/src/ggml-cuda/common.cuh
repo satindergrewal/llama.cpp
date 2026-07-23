@@ -1187,9 +1187,9 @@ static __host__ __device__ __forceinline__ bool ggml_cuda_iqk_mmvq_blocked(ggml_
         case GGML_TYPE_IQ5_KS:
         case GGML_TYPE_IQ2_KT:
         case GGML_TYPE_IQ3_KT:
-        case GGML_TYPE_IQ4_KT:
         case GGML_TYPE_IQ1_KT:
             return true;
+        // IQ4_KT: row-meta MMVQ kernel landed (vec_dot_iq4_kt_q8_1) -> no longer blocked.
         default:
             return false;
     }
