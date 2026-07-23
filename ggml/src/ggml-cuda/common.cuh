@@ -1195,6 +1195,26 @@ static __host__ __device__ __forceinline__ bool ggml_cuda_iqk_mmvq_blocked(ggml_
     }
 }
 
+// Device-side twin of ggml_row_meta_size() (host-only): bytes of the per-row f32 header that
+// sits in front of a row's block data. 0 for every mainline type, so every existing type keeps
+// today's exact addressing.
+// mmvq normally passes vbq = TENSOR base and encodes the row inside an ABSOLUTE block index
+// (mmvq.cu:610 / :761). That assumes a row is a contiguous array of blocks, which is false for
+// row-meta types. The row-meta vec_dot kernels instead expect vbq = ROW BASE and a WITHIN-ROW
+// block index, and read the f32 header themselves (ik's calling convention).
+static __host__ __device__ __forceinline__ int ggml_cuda_iqk_row_meta_size(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ5_KS:
+        case GGML_TYPE_IQ2_KT:
+        case GGML_TYPE_IQ3_KT:
+        case GGML_TYPE_IQ4_KT:
+        case GGML_TYPE_IQ1_KT:
+            return 4;
+        default:
+            return 0;
+    }
+}
+
 //////////////////////
 
 struct ggml_cuda_device_info {
