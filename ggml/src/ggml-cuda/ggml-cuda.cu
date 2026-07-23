@@ -1884,10 +1884,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
-                if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-                    return;
+                // IQK P1 row-meta types (IQ1/2/3/4_KT, IQ5_KS) have no MMVQ vec_dot kernel.
+                // Without this guard they reach mul_mat_vec_q_switch_type's default -> GGML_ABORT.
+                // They are still quantized, so they must fall through to MMQ/cuBLAS here rather
+                // than into the non-quantized branch below. Mirrors ggml_cuda_should_use_mmvq().
+                if (!ggml_cuda_iqk_mmvq_blocked(src0->type)) {
+                    const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                    if (ne2 <= mmvq_mmid_max) {
+                        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                        return;
+                    }
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
