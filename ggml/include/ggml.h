@@ -430,7 +430,18 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // IQK quant types, ported from ik_llama.cpp (author: Iwan Kawrakow).
+        // The type numbers match ik_llama.cpp so that GGUF files are interchangeable;
+        // the values in between are intentionally left unused (all-zero type traits,
+        // see the hole-safety guards where types are enumerated).
+        GGML_TYPE_IQ4_K   = 139,
+        GGML_TYPE_IQ6_K   = 141,
+        GGML_TYPE_IQ5_KS  = 152,
+        GGML_TYPE_IQ2_KT  = 153,
+        GGML_TYPE_IQ3_KT  = 154,
+        GGML_TYPE_IQ4_KT  = 155,
+        GGML_TYPE_IQ1_KT  = 158,
+        GGML_TYPE_COUNT   = 159,
     };
 
     // precision
@@ -476,6 +487,13 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ4_K   = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ6_K   = 30, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ5_KS  = 31, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ2_KT  = 32, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ3_KT  = 33, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ4_KT  = 34, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ1_KT  = 35, // except 1d tensors
     };
 
     // available tensor operations:
@@ -747,8 +765,9 @@ extern "C" {
     GGML_API size_t  ggml_nbytes_pad(const struct ggml_tensor * tensor); // same as ggml_nbytes() but padded to GGML_MEM_ALIGN
 
     GGML_API int64_t ggml_blck_size(enum ggml_type type);
-    GGML_API size_t  ggml_type_size(enum ggml_type type);             // size in bytes for all elements in a block
-    GGML_API size_t  ggml_row_size (enum ggml_type type, int64_t ne); // size in bytes for all elements in a row
+    GGML_API size_t  ggml_type_size(enum ggml_type type);              // size in bytes for all elements in a block
+    GGML_API size_t  ggml_row_size (enum ggml_type type, int64_t ne);  // size in bytes for all elements in a row (incl. the per-row header, if any)
+    GGML_API size_t  ggml_row_meta_size(enum ggml_type type);          // size in bytes of the per-row header in front of the block data (0 for most types)
 
     GGML_DEPRECATED(
     GGML_API double ggml_type_sizef(enum ggml_type type), // ggml_type_size()/ggml_blck_size() as float
@@ -2902,6 +2921,7 @@ extern "C" {
         int64_t                  blck_size;
         int64_t                  blck_size_interleave; // interleave elements in blocks
         size_t                   type_size;
+        size_t                   row_meta_size;        // per-row header in front of the block data (e.g. an f32 row scale); 0 for most types
         bool                     is_quantized;
         ggml_to_float_t          to_float;
         ggml_from_float_t        from_float_ref;

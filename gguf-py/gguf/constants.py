@@ -4616,6 +4616,15 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    # IQK quants, ported from ik_llama.cpp (author: Iwan Kawrakow);
+    # type numbers match ik_llama.cpp, values in between are unused
+    IQ4_K   = 139
+    IQ6_K   = 141
+    IQ5_KS  = 152
+    IQ2_KT  = 153
+    IQ3_KT  = 154
+    IQ4_KT  = 155
+    IQ1_KT  = 158
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -4672,6 +4681,14 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    # IQK quants, ported from ik_llama.cpp; ftype numbers match ik_llama.cpp
+    MOSTLY_IQ4_K         = 140  # except 1d tensors
+    MOSTLY_IQ6_K         = 142  # except 1d tensors
+    MOSTLY_IQ5_KS        = 150  # except 1d tensors
+    MOSTLY_IQ2_KT        = 151  # except 1d tensors
+    MOSTLY_IQ3_KT        = 152  # except 1d tensors
+    MOSTLY_IQ4_KT        = 153  # except 1d tensors
+    MOSTLY_IQ1_KT        = 156  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -4799,6 +4816,23 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.IQ4_K:   (256, 2 + 2 + QK_K // 2 + 3 * QK_K // 64),
+    GGMLQuantizationType.IQ6_K:   (256, 2 + 2 + QK_K // 16 + QK_K // 2 + QK_K // 4),
+    GGMLQuantizationType.IQ5_KS:  (256, QK_K // 32 + QK_K // 2 + QK_K // 8),
+    GGMLQuantizationType.IQ2_KT:  (256, QK_K // 64 + QK_K // 4),
+    GGMLQuantizationType.IQ3_KT:  (256, QK_K // 64 + QK_K // 4 + QK_K // 8),
+    GGMLQuantizationType.IQ4_KT:  (256, QK_K // 2),
+    GGMLQuantizationType.IQ1_KT:  (256, QK_K // 8 + QK_K // 16 + QK_K // 32),
+}
+
+# per-row header bytes stored in front of the block data (see ggml_type_traits.row_meta_size);
+# rows of these types are: [row header][block 0][block 1]...
+GGML_ROW_META_SIZES: dict[GGMLQuantizationType, int] = {
+    GGMLQuantizationType.IQ5_KS: 4,
+    GGMLQuantizationType.IQ2_KT: 4,
+    GGMLQuantizationType.IQ3_KT: 4,
+    GGMLQuantizationType.IQ4_KT: 4,
+    GGMLQuantizationType.IQ1_KT: 4,
 }
 
 
