@@ -228,6 +228,26 @@ static void llama_tensor_dequantize_impl(
         throw std::runtime_error(format("cannot dequantize/convert tensor type %s", ggml_type_name(tensor->type)));
     }
 
+    if (ggml_row_meta_size(tensor->type) != 0) {
+        // row_meta types store a per-row header, so to_float must be called
+        // once per row (it cannot span row boundaries)
+        const int64_t n_per_row = tensor->ne[0];
+        const int64_t nrows     = nelements / n_per_row;
+        const size_t  row_size  = ggml_row_size(tensor->type, n_per_row);
+        const int64_t rows_per_thread = (nrows + nthread - 1)/std::max(nthread, 1);
+        for (int64_t first = 0; first < nrows; first += rows_per_thread) {
+            const int64_t last = std::min(first + rows_per_thread, nrows);
+            workers.emplace_back([=]() {
+                for (int64_t row = first; row < last; ++row) {
+                    qtype->to_float((const uint8_t *) tensor->data + row*row_size, f32_output + row*n_per_row, n_per_row);
+                }
+            });
+        }
+        for (auto & w : workers) { w.join(); }
+        workers.clear();
+        return;
+    }
+
     if (nthread < 2) {
         if (tensor->type == GGML_TYPE_F16) {
             ggml_fp16_to_fp32_row((ggml_fp16_t *)tensor->data, f32_output, nelements);
@@ -392,7 +412,14 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_IQ2_S:
             case GGML_TYPE_IQ3_XXS:
             case GGML_TYPE_IQ3_S:   // types on the right: block size 32
+            case GGML_TYPE_IQ1_KT:
+            case GGML_TYPE_IQ2_KT:
+            case GGML_TYPE_IQ3_KT:
+            case GGML_TYPE_IQ4_KT:
+            case GGML_TYPE_IQ4_K:
+            case GGML_TYPE_IQ5_KS:
             case GGML_TYPE_IQ4_XS:  return_type = GGML_TYPE_IQ4_NL; break;
+            case GGML_TYPE_IQ6_K:   return_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_Q2_0:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
@@ -843,6 +870,15 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:  return GGML_TYPE_IQ4_XS;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   return GGML_TYPE_IQ3_S;
+
+        // IQK quants (ported from ik_llama.cpp)
+        case LLAMA_FTYPE_MOSTLY_IQ4_K:   return GGML_TYPE_IQ4_K;
+        case LLAMA_FTYPE_MOSTLY_IQ5_KS:  return GGML_TYPE_IQ5_KS;
+        case LLAMA_FTYPE_MOSTLY_IQ6_K:   return GGML_TYPE_IQ6_K;
+        case LLAMA_FTYPE_MOSTLY_IQ1_KT:  return GGML_TYPE_IQ1_KT;
+        case LLAMA_FTYPE_MOSTLY_IQ2_KT:  return GGML_TYPE_IQ2_KT;
+        case LLAMA_FTYPE_MOSTLY_IQ3_KT:  return GGML_TYPE_IQ3_KT;
+        case LLAMA_FTYPE_MOSTLY_IQ4_KT:  return GGML_TYPE_IQ4_KT;
 
         default: return GGML_TYPE_COUNT;
     }

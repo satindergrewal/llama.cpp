@@ -801,6 +801,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
             if (ret.axis >= 0 && ret.axis <= GGML_MAX_DIMS) {
+                // splitting rows across buffers cannot preserve the per-row header of row_meta types
+                GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_0 || ggml_row_meta_size(tensor->type) == 0);
                 const int64_t granularity = ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1;
                 int64_t ne_sum = 0;
                 for (size_t s = 0; s < ret.n_segments; s++) {
@@ -1288,6 +1290,8 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             const int64_t row_count = size   / row_stride;
             GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
 
+            // intra-row segment copies cannot preserve the per-row header of row_meta types
+            GGML_ASSERT(ggml_row_meta_size(tensor->type) == 0);
             const int64_t blck_size = ggml_blck_size(tensor->type);
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 for (size_t r = 0; r < split_state.nr[s]; r++) {
@@ -1402,6 +1406,8 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             const int64_t row_count = size   / row_stride;
             GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
 
+            // intra-row segment copies cannot preserve the per-row header of row_meta types
+            GGML_ASSERT(ggml_row_meta_size(tensor->type) == 0);
             const int64_t blck_size = ggml_blck_size(tensor->type);
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 for (size_t r = 0; r < split_state.nr[s]; r++) {
