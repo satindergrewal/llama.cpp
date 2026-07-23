@@ -1202,7 +1202,7 @@ static __host__ __device__ __forceinline__ bool ggml_cuda_iqk_mmvq_blocked(ggml_
 // (mmvq.cu:610 / :761). That assumes a row is a contiguous array of blocks, which is false for
 // row-meta types. The row-meta vec_dot kernels instead expect vbq = ROW BASE and a WITHIN-ROW
 // block index, and read the f32 header themselves (ik's calling convention).
-static __host__ __device__ __forceinline__ int ggml_cuda_iqk_row_meta_size(ggml_type type) {
+static constexpr __host__ __device__ int ggml_cuda_iqk_row_meta_size(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ5_KS:
         case GGML_TYPE_IQ2_KT:
