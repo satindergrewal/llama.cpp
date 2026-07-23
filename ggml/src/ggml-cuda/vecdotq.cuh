@@ -1510,3 +1510,127 @@ static __device__ __forceinline__ float vec_dot_iq1_kt_q8_1(
     }
     return dl * __low2float(bq8_1[ib32].ds) * sumi;
 }
+
+// IQ2_KT — 2.125 bpw trellis. Row-meta contract (vbq = ROW BASE, leading f32 = row scale).
+// Ported from ik_llama.cpp mmvq-instance-iq2_kt.cu (MIT, ikawrakow); returns instead of accumulating.
+#define VDR_IQ2_KT_Q8_1_MMVQ 4
+
+static __device__ __forceinline__ float vec_dot_iq2_kt_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    constexpr uint32_t ka = 0xCBAC1FED;
+    constexpr uint32_t km = 0x3f3f3f3f;
+
+    const float scale = *(const float *) vbq;
+    const block_iq2_kt * bq2 = (const block_iq2_kt *)((const char *) vbq + sizeof(float)) + kbx;
+
+    const int ib32 = iqs/4;
+    const int32_t * q8 = (const int *) bq8_1[ib32].qs;
+    const int ls = iq4k_values[(bq2->scales[ib32%4] >> 4*(ib32/4)) & 0xf];
+    const float dl = scale * ls * 1.05f;
+    const uint16_t * ql = (const uint16_t *) bq2->ql;
+
+    int sumi = 0;
+    for (int j = 0; j < 4; ++j) {
+        uint32_t val = ql[4*ib32+j] + 4096;
+        int v4 = 0;
+        for (int k = 0; k < 4; ++k) {
+            val *= ka;
+            v4 |= (ggml_cuda_dp4a(val & km, 0x01010101, -126) & 0xff) << 8*k;
+        }
+        sumi = ggml_cuda_dp4a(v4, q8[2*j+0], sumi);
+        v4 = 0;
+        for (int k = 0; k < 4; ++k) {
+            val *= ka;
+            v4 |= (ggml_cuda_dp4a(val & km, 0x01010101, -126) & 0xff) << 8*k;
+        }
+        sumi = ggml_cuda_dp4a(v4, q8[2*j+1], sumi);
+    }
+    return dl * __low2float(bq8_1[ib32].ds) * sumi;
+}
+
+// IQ3_KT — 3.125 bpw trellis with a sign plane (qh). Row-meta contract as above.
+// Ported from ik_llama.cpp mmvq-instance-iq3_kt.cu (MIT, ikawrakow).
+#define VDR_IQ3_KT_Q8_1_MMVQ 4
+
+static __device__ __forceinline__ float vec_dot_iq3_kt_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    constexpr uint32_t ka = 0xCBAC1FED;
+    constexpr uint32_t km = 0x3f3f3f3f;
+
+    const float scale = *(const float *) vbq;
+    const block_iq3_kt * bq3 = (const block_iq3_kt *)((const char *) vbq + sizeof(float)) + kbx;
+
+    const int ib32 = iqs/4;
+    const int32_t * q8 = (const int *) bq8_1[ib32].qs;
+    const int ls = (bq3->scales[ib32%4] >> 4*(ib32/4)) & 0xf;
+    const float dl = scale * ls * 1.015f;
+    const uint16_t * ql = (const uint16_t *) bq3->ql;
+    const uint32_t mask = 0x01010101 << ib32;
+    const uint32_t * qh = (const uint32_t *) bq3->qh;
+
+    int sumi = 0;
+    for (int j = 0; j < 4; ++j) {
+        uint32_t val = ql[4*ib32+j] + 4096;
+        int v4 = 0;
+        for (int k = 0; k < 4; ++k) {
+            val *= ka;
+            const int8_t q = abs(ggml_cuda_dp4a(val & km, 0x01010101, -126));
+            v4 |= q << 8*k;
+        }
+        uint32_t signs = __vcmpne4(qh[2*j+0] & mask, 0);
+        v4 = __vsub4(v4 ^ signs, signs);
+        sumi = ggml_cuda_dp4a(v4, q8[2*j+0], sumi);
+        v4 = 0;
+        for (int k = 0; k < 4; ++k) {
+            val *= ka;
+            const int8_t q = abs(ggml_cuda_dp4a(val & km, 0x01010101, -126));
+            v4 |= q << 8*k;
+        }
+        signs = __vcmpne4(qh[2*j+1] & mask, 0);
+        v4 = __vsub4(v4 ^ signs, signs);
+        sumi = ggml_cuda_dp4a(v4, q8[2*j+1], sumi);
+    }
+    return dl * __low2float(bq8_1[ib32].ds) * sumi;
+}
+
+// IQ5_KS — 5.25 bpw non-linear (NOT trellis) but still row-meta. Uses the iq5nl lookup table.
+// Ported from ik_llama.cpp mmvq-instance-iq5_ks.cu (MIT, ikawrakow).
+// NOTE: qi = QI5_XS here (not QI4_XS), and ik pairs it with VDR_IQ5_K -> i4 = iqs/4 in 0..7.
+#define VDR_IQ5_KS_Q8_1_MMVQ 4
+
+static __device__ __forceinline__ float vec_dot_iq5_ks_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const float scale = *(const float *) vbq;
+    const block_iq5_ks * bq5 = (const block_iq5_ks *)((const char *) vbq + sizeof(float)) + kbx;
+    const uint8_t * all_values = (const uint8_t *) iq5nl_values;
+
+    const int i4 = iqs/4;  // 0...7
+
+    const int32_t  * q8_1p = (const int *) bq8_1[2*(i4/2)+0].qs + 4*(i4%2);
+    const int32_t  * q8_2p = (const int *) bq8_1[2*(i4/2)+1].qs + 4*(i4%2);
+    const uint32_t * q4 = (const uint32_t *) bq5->qs + 8*(i4/2) + 4*(i4%2);
+    const uint32_t * qh = (const uint32_t *) bq5->qh + 4*(i4%2);
+    const uint8_t * values1 = all_values + ((bq5->scales[2*(i4/2)+0] & 1) << 5);
+    const uint8_t * values2 = all_values + ((bq5->scales[2*(i4/2)+1] & 1) << 5);
+
+    uint32_t aux32[2];
+    const uint8_t * a8 = (const uint8_t *) aux32;
+    int v1, v2;
+    int sumi1 = 0, sumi2 = 0;
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t h = qh[j] >> 2*(i4/2);
+        aux32[0] = ((q4[j] >> 0) & 0x0f0f0f0f) | ((h << 4) & 0x10101010);
+        aux32[1] = ((q4[j] >> 4) & 0x0f0f0f0f) | ((h << 3) & 0x10101010);
+        v1 = int_from_table(a8+0, values1);
+        v2 = int_from_table(a8+4, values2);
+        sumi1 = ggml_cuda_dp4a(v1, q8_1p[j], sumi1);
+        sumi2 = ggml_cuda_dp4a(v2, q8_2p[j], sumi2);
+    }
+    const int ls1 = (bq5->scales[2*(i4/2)+0] & 254) - 127;
+    const int ls2 = (bq5->scales[2*(i4/2)+1] & 254) - 127;
+    return scale * (__low2float(bq8_1[2*(i4/2)+0].ds) * sumi1 * ls1 + __low2float(bq8_1[2*(i4/2)+1].ds) * sumi2 * ls2);
+}
+

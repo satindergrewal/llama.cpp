@@ -1184,11 +1184,24 @@ static __host__ __device__ __forceinline__ bool ggml_cuda_is_iqk_row_meta(ggml_t
 // (their per-row f32 header does not fit mainline's whole-block mmvq stride) -- P1 item 3 TODO.
 static __host__ __device__ __forceinline__ bool ggml_cuda_iqk_mmvq_blocked(ggml_type type) {
     switch (type) {
-        case GGML_TYPE_IQ5_KS:
+        // All five row-meta types now have MMVQ kernels. IQ1_KT stays gated until a
+        // properly imatrix-quantised model can prove correctness (the no-imatrix dev gguf
+        // cannot discriminate - its logits are near-tied garbage on BOTH paths).
+        case GGML_TYPE_IQ1_KT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Kept for reference: types whose MMVQ kernels are implemented and logit-parity verified.
+static __host__ __device__ __forceinline__ bool ggml_cuda_iqk_mmvq_verified(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ4_KT:
         case GGML_TYPE_IQ2_KT:
         case GGML_TYPE_IQ3_KT:
+        case GGML_TYPE_IQ5_KS:
             return true;
-        // IQ4_KT, IQ1_KT: row-meta MMVQ kernels landed -> no longer blocked.
         default:
             return false;
     }
