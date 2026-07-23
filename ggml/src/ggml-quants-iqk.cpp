@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -2369,14 +2370,64 @@ void quantize_row_iq4_kt_impl(const float * x, void * vy, int n_per_row, const f
 }
 } // namespace
 
+// ---------------------------------------------------------------------------------------------
+// EXPERIMENTAL: incoherence processing (the missing half of QTIP).
+//
+// QTIP = random-Hadamard incoherence + trellis coding. ik's KT implements only the trellis half.
+// The Hadamard step makes a weight block approximately i.i.d. Gaussian, which is the distribution
+// the trellis codebook is actually good at -- without it, outliers dominate the block scale and
+// every other value loses resolution.
+//
+// This is a self-contained variant: rotate a block at quantise time, un-rotate at dequantise time.
+// Normalised WHT is its own inverse (H*H = I), so no extra state is stored and the on-disk layout
+// is unchanged.
+//
+// ⚠️ FORMAT-INCOMPATIBLE WHEN ENABLED. A file quantised with GGML_KT_ROTATE=1 MUST be read back
+// with GGML_KT_ROTATE=1, and the CUDA dequant/MMVQ paths do NOT implement the rotation yet -- so
+// rotated files are CPU-only (-ngl 0) until those kernels are taught the inverse transform.
+// Default OFF: every existing KT gguf keeps byte-identical behaviour.
+static inline bool iqk_rotate_enabled() {
+    static const bool e = [] {
+        const char * s = getenv("GGML_KT_ROTATE");
+        return s && *s == '1';
+    }();
+    return e;
+}
+
+// In-place fast Walsh-Hadamard transform, normalised (orthogonal => self-inverse).
+// n must be a power of two.
+static inline void iqk_wht_inplace(float * v, int n) {
+    for (int len = 1; len < n; len <<= 1) {
+        for (int i = 0; i < n; i += (len << 1)) {
+            for (int j = i; j < i + len; ++j) {
+                const float a = v[j];
+                const float b = v[j + len];
+                v[j]       = a + b;
+                v[j + len] = a - b;
+            }
+        }
+    }
+    const float inv = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; ++i) v[i] *= inv;
+}
+
 size_t quantize_iq4_kt(const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
     GGML_ASSERT(n_per_row%QK_K == 0);
     auto row_size = ggml_row_size(GGML_TYPE_IQ4_KT, n_per_row);
     std::vector<float> scales(n_per_row/QuantizerIQ4KT::kBlockSize);
     std::vector<float> weights(n_per_row);
+    std::vector<float> rot;                       // rotated copy, only when enabled
+    const bool rotate = iqk_rotate_enabled();
+    if (rotate) rot.resize(n_per_row);
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrows; ++row) {
-        quantize_row_iq4_kt_impl(src, (void *)qrow, n_per_row, imatrix, scales.data(), weights.data());
+        const float * row_src = src;
+        if (rotate) {
+            std::memcpy(rot.data(), src, n_per_row*sizeof(float));
+            for (int64_t off = 0; off < n_per_row; off += QK_K) iqk_wht_inplace(rot.data() + off, QK_K);
+            row_src = rot.data();
+        }
+        quantize_row_iq4_kt_impl(row_src, (void *)qrow, n_per_row, imatrix, scales.data(), weights.data());
         src += n_per_row;
         qrow += row_size;
     }
@@ -2401,6 +2452,7 @@ void dequantize_row_iq4_kt(const block_iq4_kt * x, float * y, int64_t k) {
     const float * dptr = (const float *)x;
     const float d = dptr[0] * Q::kScale;
     x = (const block_iq4_kt *)(dptr + 1);
+    float * const y_row_start = y;   // for the inverse rotation below (see iqk_rotate_enabled)
     for (int ibl = 0; ibl < nb; ++ibl) {
         auto shb = x[ibl].qs;
         auto ql = (const uint8_t *)(shb + Q::kNblock);
@@ -2416,6 +2468,10 @@ void dequantize_row_iq4_kt(const block_iq4_kt * x, float * y, int64_t k) {
                 y += Q::kGroupSize;
             }
         }
+    }
+    // Undo the incoherence rotation applied at quantise time. Normalised WHT is self-inverse.
+    if (iqk_rotate_enabled()) {
+        for (int64_t off = 0; off < k; off += QK_K) iqk_wht_inplace(y_row_start + off, QK_K);
     }
 }
 
