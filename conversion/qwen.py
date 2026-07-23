@@ -710,6 +710,37 @@ class DSparkModel(DFlashModel):
         return super().filter_tensors((name, gen))
 
 
+@ModelBase.register("DSparkDraftModel", "DSparkSpeculator")
+class SpeculatorsDSparkModel(DSparkModel):
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    # vLLM-speculators DSpark export (e.g. RedHatAI GLM-5.2 speculator): the drafter geometry
+    # nests under transformer_layer_config, and aux_hidden_state_layer_ids are already in
+    # layer-input semantics (vLLM aux ids), so they are written WITHOUT the +1 shift that
+    # DeepSpec-style target_layer_ids require. The drafter rotary is the speculators DFlash
+    # module default (transformers Qwen3Config, rope_theta 10000) unless the export sets one.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        tlc = dict(self.hparams.get("transformer_layer_config") or {})
+        for key, value in tlc.items():
+            self.hparams.setdefault(key, value)
+        self.block_count = self.hparams["num_hidden_layers"]
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        self.rope_parameters = self.hparams.get("rope_parameters") or {}
+        self._aux_layer_ids = [int(i) for i in (self.hparams.get("aux_hidden_state_layer_ids") or [])]
+        # suppress the DeepSpec-style +1 path
+        self.hparams.pop("target_layer_ids", None)
+        if isinstance(self.hparams.get("dflash_config"), dict):
+            self.hparams["dflash_config"].pop("target_layer_ids", None)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        if self._aux_layer_ids:
+            self.gguf_writer.add_target_layers(self._aux_layer_ids)
+        theta = self.rope_parameters.get("rope_theta") or self.hparams.get("rope_theta") or 10000.0
+        self.gguf_writer.add_rope_freq_base(theta)
+
+
 @ModelBase.register("Qwen35DSparkModel")
 class Qwen35DSparkModel(DSparkModel):
     model_arch = gguf.MODEL_ARCH.DFLASH
