@@ -1182,16 +1182,15 @@ static __host__ __device__ __forceinline__ bool ggml_cuda_is_iqk_row_meta(ggml_t
 // route these to the cuBLAS dequant path instead of dispatching to a missing kernel.
 // IQ4_K/IQ6_K (block-scale) have MMVQ vec_dot kernels; the row-meta types do not yet
 // (their per-row f32 header does not fit mainline's whole-block mmvq stride) -- P1 item 3 TODO.
-static __host__ __device__ __forceinline__ bool ggml_cuda_iqk_mmvq_blocked(ggml_type type) {
-    switch (type) {
-        // All five row-meta types now have MMVQ kernels. IQ1_KT stays gated until a
-        // properly imatrix-quantised model can prove correctness (the no-imatrix dev gguf
-        // cannot discriminate - its logits are near-tied garbage on BOTH paths).
-        case GGML_TYPE_IQ1_KT:
-            return true;
-        default:
-            return false;
-    }
+// All five row-meta types (IQ1_KT, IQ2_KT, IQ3_KT, IQ4_KT, IQ5_KS) have MMVQ kernels and are
+// logit-parity verified, so nothing is blocked. IQ1_KT was the last gated one: validated
+// 2026-07-24 on a 27B imatrix-quantised model (Qwen3.6-27B IQ1_KT, 1.75 bpw) where
+// MMVQ PPL = 10.9118 +/- 0.40293 and the cuBLAS dequant reference = 10.9118 +/- 0.40293,
+// i.e. exact parity. The earlier 4B dev gguf could not discriminate the two paths (near-tied
+// garbage logits on BOTH), which is precisely why the gate existed until a large enough,
+// properly calibrated model was available.
+static __host__ __device__ __forceinline__ bool ggml_cuda_iqk_mmvq_blocked(ggml_type /*type*/) {
+    return false;
 }
 
 // Kept for reference: types whose MMVQ kernels are implemented and logit-parity verified.
