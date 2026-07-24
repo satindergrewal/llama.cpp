@@ -973,6 +973,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, conf_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, this->params.conf_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
 
+        // confidence gating needs the confidence head tensors; without them the gate would
+        // read a stale encoder buffer and truncate drafts on garbage. Fail fast instead.
+        if (this->params.conf_min > 0.0f && !llama_model_has_dspark_conf(model_dft)) {
+            throw std::runtime_error("--spec-draft-conf-min > 0 requires a draft model with a DSpark confidence head "
+                                     "(this GGUF has none)");
+        }
+
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, DSpark yield a full block_size draft tokens
         const int32_t n_draft_max = is_dspark ? block_size : block_size - 1;

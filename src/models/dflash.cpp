@@ -155,11 +155,21 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     const int64_t n_blocks = g.ubatch.n_seqs_unq;
     if (n_blocks == 0 || n_tok % n_blocks != 0) {
+        // Mixed per-sequence draft widths in one batch (or a block straddling a ubatch
+        // boundary) cannot be mapped onto the strided anchor views below; drafting then
+        // runs WITHOUT the markov bias and acceptance quietly degrades. Warn instead of
+        // failing: use a uniform --spec-draft-n-max across slots and an n_ubatch large
+        // enough for n_slots * block to avoid this state.
+        LLAMA_LOG_WARN("%s: DSpark markov bias skipped: %lld tokens do not divide into %lld uniform blocks "
+                       "(mixed draft widths or ubatch-straddled block); acceptance will degrade\n",
+                       __func__, (long long) n_tok, (long long) n_blocks);
         return;
     }
     // runtime tokens per block in this ubatch (anchor + drafted positions), bounded by training block_size
     const int64_t block_drafts = n_tok / n_blocks;
     if (block_drafts > block_size) {
+        LLAMA_LOG_WARN("%s: DSpark markov bias skipped: runtime block width %lld exceeds trained block_size %lld\n",
+                       __func__, (long long) block_drafts, (long long) block_size);
         return;
     }
 

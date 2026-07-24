@@ -2782,3 +2782,7 @@ const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
 }
+
+bool llama_model_has_dspark_conf(const struct llama_model * model) {
+    return model->dspark_conf_proj != nullptr;
+}

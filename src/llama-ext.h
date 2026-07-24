@@ -124,3 +124,5 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+// returns true if the (draft) model carries a DSpark confidence head
+LLAMA_API bool            llama_model_has_dspark_conf   (const struct llama_model * model);
