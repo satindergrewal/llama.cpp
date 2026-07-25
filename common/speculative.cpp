@@ -12,6 +12,8 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <cmath>
+#include <random>
 #include <cassert>
 #include <cstring>
 #include <iomanip>
@@ -916,6 +918,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
+    // RNG for temperature-sampled drafts (rejection-sampling path only). The greedy path never
+    // touches it, so seeded greedy runs remain reproducible.
+    std::mt19937 rng_draft{std::random_device{}()};
+
     int32_t n_embd_dec = 0;  // draft hidden size
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
@@ -1207,6 +1213,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // at the first position below the confidence threshold.
                 const float * conf = params.conf_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
 
+                // At temp > 0 the verifier uses rejection sampling, which only pays off when the
+                // draft is sampled from the drafter's own distribution rather than argmax'd:
+                // acceptance becomes sum_x min(p(x), q(x)) instead of p(argmax_q). Below that,
+                // stay greedy so the exact-match path is bit-for-bit unchanged.
+                // OFF by default: measured on this stack, sampled drafts + rejection verification
+                // score slightly WORSE than exact match at temp 0.6-0.8 (see docs). Opt-in only.
+                static const bool rs_on     = getenv("LLAMA_SPEC_REJECTION_SAMPLING") != nullptr;
+                static const bool no_rs     = !rs_on;
+                // headroom probe: keep ARGMAX drafts (so the markov chain stays consistent) but
+                // still snapshot q, letting the verifier compare what exact-match accepts against
+                // what rejection sampling would have accepted. Measurement only, no behavior change.
+                static const bool headroom  = getenv("LLAMA_SPEC_HEADROOM") != nullptr;
+                const bool snapshot_q  = dp.result_probs != nullptr && (headroom || (!no_rs && dp.temp > 0.0f));
+                const bool sample_soft = !no_rs && !headroom && dp.temp > 0.0f && dp.result_probs != nullptr;
+                auto * dprobs = dp.result_probs;
+
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
@@ -1224,7 +1246,54 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                                 common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                     }
 
-                    const llama_token id = cur_p->data[0].id;
+                    llama_token id = cur_p->data[0].id;
+                    float       q  = 1.0f;
+
+                    if (snapshot_q) {
+                        // q = softmax(draft logits / temp) over the drafter's candidate list
+                        const float * logits = llama_get_logits_ith(ctx_dft, idx);
+
+                        std::vector<common_speculative_draft_probs::entry> top;
+                        top.reserve(cur_p->size);
+
+                        float maxl = -INFINITY;
+                        for (size_t k = 0; k < cur_p->size; ++k) {
+                            maxl = std::max(maxl, logits[cur_p->data[k].id]);
+                        }
+                        float sum = 0.0f;
+                        for (size_t k = 0; k < cur_p->size; ++k) {
+                            const float p = expf((logits[cur_p->data[k].id] - maxl) / dp.temp);
+                            top.push_back({ cur_p->data[k].id, p });
+                            sum += p;
+                        }
+                        for (auto & e : top) {
+                            e.p /= sum;
+                        }
+
+                        // sample from q
+                        const float u = std::uniform_real_distribution<float>(0.0f, 1.0f)(rng_draft);
+                        float acc = 0.0f;
+                        size_t sel = top.size() - 1;
+                        for (size_t k = 0; k < top.size(); ++k) {
+                            acc += top[k].p;
+                            if (u <= acc) { sel = k; break; }
+                        }
+
+                        if (sample_soft) {
+                            id = top[sel].id;
+                            q  = top[sel].p;
+                        } else {
+                            // argmax draft retained; record q(argmax) for the headroom comparison
+                            for (const auto & e : top) {
+                                if (e.id == id) { q = e.p; break; }
+                            }
+                        }
+
+                        std::sort(top.begin(), top.end(),
+                                  [](const auto & a, const auto & b) { return a.p > b.p; });
+                        dprobs->sampled.push_back(q);
+                        dprobs->top.push_back(std::move(top));
+                    }
 
                     common_sampler_accept(smpl, id, true);
 

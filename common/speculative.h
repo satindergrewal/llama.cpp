@@ -29,6 +29,19 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+// drafter-side distribution snapshot for one draft, used by rejection-sampling verification.
+// `sampled[i]` is q(x_i) for the token actually drafted at position i. `top[i]` holds the
+// highest-probability entries of q at that position (sorted, descending) so the verifier can
+// evaluate q on the target's candidate support when building the residual distribution.
+struct common_speculative_draft_probs {
+    std::vector<float> sampled;
+
+    struct entry { llama_token id; float p; };
+    std::vector<std::vector<entry>> top;
+
+    void clear() { sampled.clear(); top.clear(); }
+};
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -43,11 +56,22 @@ struct common_speculative_draft_params {
     llama_pos   n_past;
     llama_token id_last;
 
+    // sampling temperature the TARGET will use for this sequence. Drafting from the same
+    // distribution the verifier samples from is what makes rejection-sampling verification pay
+    // off; at temp <= 0 the drafter stays greedy and the exact-match path is used unchanged.
+    float temp = 0.0f;
+
     // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
     const llama_tokens * prompt;
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // optional: when non-null, the implementation fills it with the drafter's own probability
+    // for each token in `result`, plus a truncated snapshot of the drafter distribution at that
+    // position. Required for rejection-sampling verification at temperature > 0; ignored by the
+    // exact-match (greedy-equivalent) path.
+    common_speculative_draft_probs * result_probs = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

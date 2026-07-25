@@ -8,6 +8,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <random>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -647,6 +648,152 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
     }
+
+    return result;
+}
+
+// RNG for the rejection test and residual draw. Kept separate from the sampler chain's own
+// generator so that enabling rejection verification cannot perturb a seeded greedy run.
+static std::mt19937 & rs_rng() {
+    static thread_local std::mt19937 rng{std::random_device{}()};
+    return rng;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_rs(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const common_speculative_draft_probs * dprobs,
+        bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    // OFF by default (measured slightly worse than exact match at temp 0.6-0.8 on this stack);
+    // opt in with LLAMA_SPEC_REJECTION_SAMPLING=1 to A/B it on your own head and target.
+    static const bool disabled = getenv("LLAMA_SPEC_REJECTION_SAMPLING") == nullptr;
+
+    // no drafter distribution -> nothing to reject against; behave exactly as before
+    if (disabled || dprobs == nullptr || dprobs->sampled.size() < draft.size() || dprobs->top.size() < draft.size()) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    }
+
+    // headroom probe: report what exact-match accepts, p(x*), against what rejection sampling
+    // would accept, sum_x min(p(x), q(x)), without changing behavior. Gates whether in-graph
+    // sampled drafting is worth implementing at all.
+    static const bool headroom = getenv("LLAMA_SPEC_HEADROOM") != nullptr;
+    if (headroom) {
+        double sum_pstar = 0.0, sum_min = 0.0;
+        size_t n = 0;
+        for (size_t k = 0; k < draft.size(); ++k) {
+            common_sampler_sample(gsmpl, ctx, idxs[k], grammar_first);
+            const auto * cp = common_sampler_get_candidates(gsmpl, true);
+
+            std::unordered_map<llama_token, float> qm;
+            for (const auto & e : dprobs->top[k]) qm[e.id] = e.p;
+
+            double p_star = 0.0, s_min = 0.0;
+            for (size_t j = 0; j < cp->size; ++j) {
+                const auto it = qm.find(cp->data[j].id);
+                const float qk = it == qm.end() ? 0.0f : it->second;
+                s_min += std::min<double>(cp->data[j].p, qk);
+                if (cp->data[j].id == draft[k]) p_star = cp->data[j].p;
+            }
+            sum_pstar += p_star; sum_min += s_min; ++n;
+            common_sampler_accept(gsmpl, draft[k], true);
+        }
+        if (n) {
+            LOG_INF("%s: HEADROOM over %zu positions: exact-match E[accept]=%.4f, "
+                    "rejection-sampling E[accept]=%.4f, gain=%+.1f%%\n",
+                    __func__, n, sum_pstar/n, sum_min/n,
+                    sum_pstar > 0 ? 100.0*(sum_min - sum_pstar)/sum_pstar : 0.0);
+        }
+        common_sampler_reset(gsmpl);
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    }
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        // p = the target's distribution at this position, AFTER the user's full sampler chain
+        // (truncation, penalties and all): that is the distribution we must preserve. Sampling
+        // also gives us the target's own pick, used only if the residual degenerates.
+        const llama_token y = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+
+        const llama_token x = draft[i];
+        const float       q = dprobs->sampled[i];
+
+        float p_x = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            if (cur_p->data[k].id == x) {
+                p_x = cur_p->data[k].p;
+                break;
+            }
+        }
+
+        // accept with probability min(1, p(x)/q(x)); q > 0 by construction (x was sampled from q)
+        const float u = dist(rs_rng());
+        if (q > 0.0f && u <= p_x / q) {
+            common_sampler_accept(gsmpl, x, true);
+            result.push_back(x);
+            continue;
+        }
+
+        // rejected: sample from the normalized residual max(0, p - q).
+        // q is evaluated from the drafter snapshot; tokens the drafter never considered have
+        // q = 0 there, which is correct up to the snapshot's truncated tail mass.
+        std::unordered_map<llama_token, float> qmap;
+        qmap.reserve(dprobs->top[i].size() * 2);
+        for (const auto & e : dprobs->top[i]) {
+            qmap[e.id] = e.p;
+        }
+
+        std::vector<llama_token> ids;
+        std::vector<float>       res;
+        ids.reserve(cur_p->size);
+        res.reserve(cur_p->size);
+
+        float sum = 0.0f;
+        for (size_t k = 0; k < cur_p->size; ++k) {
+            const auto it = qmap.find(cur_p->data[k].id);
+            const float qk = it == qmap.end() ? 0.0f : it->second;
+            const float r  = cur_p->data[k].p - qk;
+            if (r > 0.0f) {
+                ids.push_back(cur_p->data[k].id);
+                res.push_back(r);
+                sum += r;
+            }
+        }
+
+        llama_token id;
+        if (sum <= 0.0f || ids.empty()) {
+            // degenerate residual (p fully covered by q): fall back to the target's own draw
+            id = y;
+        } else {
+            const float v = dist(rs_rng()) * sum;
+            float acc = 0.0f;
+            id = ids.back();
+            for (size_t k = 0; k < ids.size(); ++k) {
+                acc += res[k];
+                if (v <= acc) { id = ids[k]; break; }
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+
+        return result; // first rejection ends the block
+    }
+
+    // every draft token accepted: take the free bonus token from the target
+    const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+    common_sampler_accept(gsmpl, id, true);
+    result.push_back(id);
 
     return result;
 }

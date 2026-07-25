@@ -172,6 +172,7 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    common_speculative_draft_probs spec_draft_probs; // drafter distribution, for temp>0 rejection verify
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -2958,13 +2959,17 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        slot.spec_draft_probs.clear();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
+                            /* .drafting     = */ true,
+                            /* .n_max        = */ n_draft_max,
+                            /* .n_past       = */ slot.prompt.n_tokens(),
+                            /* .id_last      = */ slot.sampled,
+                            /* .temp         = */ slot.task ? slot.task->params.sampling.temp : 0.0f,
+                            /* .prompt       = */ &slot.spec_prompt,
+                            /* .result       = */ &slot.spec_draft,
+                            /* .result_probs = */ &slot.spec_draft_probs,
                         };
 
                         drafting.push_back(&slot);
@@ -3807,7 +3812,12 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                // temperature > 0 with a drafter distribution -> rejection-sampling verification
+                // (accepts sum_x min(p,q) instead of p(argmax_q), same output distribution);
+                // greedy stays on the exact-match path, unchanged bit for bit
+                auto accepted = slot.spec_draft_probs.sampled.empty()
+                    ? common_sampler_sample_and_accept_n   (slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                    : common_sampler_sample_and_accept_n_rs(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, &slot.spec_draft_probs);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

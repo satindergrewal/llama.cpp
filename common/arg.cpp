@@ -3861,7 +3861,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_SPLIT"));
     add_opt(common_arg(
         {"--spec-draft-p-min", "--draft-p-min"}, "P",
-        string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),
+        string_format("minimum speculative decoding probability (greedy) (default: %.2f)\n"
+                      "(ignored by --spec-type draft-dspark, which drafts a full block; use --spec-draft-conf-min "
+                      "for confidence-gated truncation on heads that carry a confidence head)", (double)params.speculative.draft.p_min),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.p_min = std::stof(value);
         }
