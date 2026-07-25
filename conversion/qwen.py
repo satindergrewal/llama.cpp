@@ -665,7 +665,13 @@ class DFlashModel(Qwen3Model):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
-        block_size = self.hparams.get("block_size", 16)
+        block_size = self.hparams.get("block_size")
+        if block_size is None:
+            raise ValueError(
+                "DSpark head config has no 'block_size'. Guessing it writes a wrong trained "
+                "block width into the GGUF and the runtime then drafts untrained positions. "
+                "Add block_size to config.json (check the model card) and re-run."
+            )
         self.gguf_writer.add_block_size(block_size)
         dflash_config = self.hparams.get("dflash_config", {})
 
@@ -701,6 +707,21 @@ class DSparkModel(DFlashModel):
         self.hparams.setdefault("dflash_config", {
             k: self.hparams[k] for k in ("target_layer_ids", "mask_token_id") if k in self.hparams
         })
+
+    def set_vocab(self):
+        # The drafter shares the target's frozen embedding and lm_head (paper design), so this
+        # converter drops both and the runtime borrows them from the target. That is only valid
+        # for full-vocab heads: a reduced draft vocabulary needs its own lm_head plus the d2t/t2d
+        # remap tables, which the DFLASH graph has no support for.
+        draft_vocab = self.hparams.get("draft_vocab_size")
+        vocab_size  = self.hparams.get("vocab_size")
+        if draft_vocab is not None and vocab_size is not None and int(draft_vocab) != int(vocab_size):
+            raise ValueError(
+                f"reduced draft vocabulary is not supported: draft_vocab_size={draft_vocab} != "
+                f"vocab_size={vocab_size}. This head needs its own lm_head and d2t/t2d mapping; "
+                "converting it would silently produce near-random drafts."
+            )
+        super().set_vocab()
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
