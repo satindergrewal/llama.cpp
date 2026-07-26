@@ -699,6 +699,7 @@ struct common_params {
     bool compute_ppl     = true;  // whether to compute perplexity
     bool show_statistics = false; // show imatrix statistics per tensor
     bool parse_special   = false; // whether to parse special tokens during imatrix tokenization
+    bool imat_no_mtp     = false; // skip the extra MTP pass on models that have nextn layers
 
     // cvector-generator params
     int n_pca_batch = 100;

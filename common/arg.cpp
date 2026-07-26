@@ -2874,6 +2874,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
     add_opt(common_arg(
+        {"--no-mtp"},
+        string_format("skip the extra MTP pass that collects data for nextn tensors (default: %s)", params.imat_no_mtp ? "true" : "false"),
+        [](common_params & params) {
+            params.imat_no_mtp = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
         {"--ppl"},
         {"--no-ppl"},
         string_format("whether to compute perplexity (default: %s)", params.compute_ppl ? "true" : "false"),
