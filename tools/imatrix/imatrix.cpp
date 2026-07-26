@@ -5,6 +5,8 @@
 #include "llama.h"
 #include "gguf.h"
 
+#include "../../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn (used by the MTP pass)
+
 #include <algorithm>
 #include <chrono>
 #include <clocale>
@@ -769,7 +771,7 @@ static void process_logits(
     }
 }
 
-static bool compute_imatrix(llama_context * ctx, const common_params & params, const int32_t n_ctx) {
+static bool compute_imatrix(llama_context * ctx, llama_context * ctx_mtp, const common_params & params, const int32_t n_ctx) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -828,6 +830,21 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
 
     llama_batch batch = llama_batch_init(std::min(n_batch, n_ctx*n_seq), 0, 1);
 
+    // the MTP (nextn) layers are excluded from the main graph by hparams.n_layer(), so a normal
+    // pass never multiplies their tensors and they end up with no importance data at all. run the
+    // same tokens through a second, MTP-typed context so the collector sees them too.
+    const int32_t n_embd_mtp = ctx_mtp ? llama_model_n_embd(model) : 0;
+
+    llama_batch batch_mtp = {};
+    std::vector<std::vector<float>> pending_h; // last hidden row of the previous batch, per sequence
+    if (ctx_mtp) {
+        const int32_t n_b = std::min(n_batch, n_ctx*n_seq);
+        batch_mtp = llama_batch_init(n_b, n_embd_mtp, 1);
+        // llama_batch_init allocates only one of token/embd; the MTP graph needs both.
+        batch_mtp.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        pending_h.assign(n_seq, std::vector<float>(n_embd_mtp, 0.0f));
+    }
+
     std::vector<float> logits;
     if (params.compute_ppl && num_batches > 1) {
         logits.reserve((size_t)n_ctx * n_vocab);
@@ -847,6 +864,13 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
 
         // clear the KV cache
         llama_memory_clear(llama_get_memory(ctx), true);
+
+        if (ctx_mtp) {
+            llama_memory_clear(llama_get_memory(ctx_mtp), true);
+            for (auto & h : pending_h) {
+                std::fill(h.begin(), h.end(), 0.0f);
+            }
+        }
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -881,6 +905,51 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
                 LOG_ERR("%s : failed to eval\n", __func__);
                 llama_batch_free(batch);
                 return false;
+            }
+
+            // second pass: feed the same tokens to the MTP context, with each row's input hidden
+            // state taken from the target's h_nextn shifted right by one position within its own
+            // sequence (an MTP head predicts token t+1 from the state that produced token t).
+            if (ctx_mtp) {
+                const float * h_tgt = llama_get_embeddings_nextn(ctx);
+                if (h_tgt == nullptr) {
+                    LOG_ERR("%s : MTP pass enabled but the target produced no nextn embeddings\n", __func__);
+                    llama_batch_free(batch);
+                    llama_batch_free(batch_mtp);
+                    return false;
+                }
+
+                const size_t row_bytes = (size_t) n_embd_mtp * sizeof(float);
+
+                common_batch_clear(batch_mtp);
+                for (int r = 0; r < batch.n_tokens; ++r) {
+                    // only the last row needs an output; the point here is the matmuls, not the logits
+                    common_batch_add(batch_mtp, batch.token[r], batch.pos[r], { batch.seq_id[r][0] },
+                                     r == batch.n_tokens - 1);
+                }
+
+                for (int seq = 0; seq < n_seq_batch; seq++) {
+                    const int row0 = seq * batch_size;
+
+                    // first row of this batch continues from the previous batch of the same sequence
+                    // (zeros at the start of a chunk, which costs one row of statistics)
+                    std::memcpy(batch_mtp.embd + (size_t) row0 * n_embd_mtp, pending_h[seq].data(), row_bytes);
+
+                    for (int k = 1; k < batch_size; ++k) {
+                        std::memcpy(batch_mtp.embd + (size_t) (row0 + k) * n_embd_mtp,
+                                    h_tgt          + (size_t) (row0 + k - 1) * n_embd_mtp, row_bytes);
+                    }
+
+                    std::memcpy(pending_h[seq].data(),
+                                h_tgt + (size_t) (row0 + batch_size - 1) * n_embd_mtp, row_bytes);
+                }
+
+                if (llama_decode(ctx_mtp, batch_mtp)) {
+                    LOG_ERR("%s : failed to eval the MTP pass\n", __func__);
+                    llama_batch_free(batch);
+                    llama_batch_free(batch_mtp);
+                    return false;
+                }
             }
 
             if (params.compute_ppl && num_batches > 1) {
@@ -942,6 +1011,9 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
     }
 
     llama_batch_free(batch);
+    if (ctx_mtp) {
+        llama_batch_free(batch_mtp);
+    }
 
     return true;
 }
@@ -1153,13 +1225,45 @@ int main(int argc, char ** argv) {
                 __func__, n_ctx_train, params.n_ctx);
     }
 
+    // MTP/nextn layers sit outside hparams.n_layer(), so a normal imatrix run never activates them
+    // and their tensors get quantized with no importance data. when the model has such layers, run a
+    // second MTP-typed context over the same tokens so the collector sees them.
+    llama_context * ctx_mtp = nullptr;
+    llama_context_ptr ctx_mtp_ptr;
+
+    const int32_t n_layer_nextn = llama_model_n_layer_nextn(model);
+    if (n_layer_nextn > 0 && !params.imat_no_mtp) {
+        auto cparams_mtp = common_context_params_to_llama(params);
+
+        cparams_mtp.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+        cparams_mtp.n_rs_seq  = 0;
+        cparams_mtp.ctx_other = ctx;
+
+        ctx_mtp_ptr.reset(llama_init_from_model(model, cparams_mtp));
+        ctx_mtp = ctx_mtp_ptr.get();
+
+        if (ctx_mtp == nullptr) {
+            LOG_ERR("%s : failed to create the MTP context (use --no-mtp to skip the MTP pass)\n", __func__);
+            return 1;
+        }
+
+        // the MTP graph consumes the target's pre-final-norm hidden state
+        llama_set_embeddings_nextn(ctx,     true, /*masked*/ false);
+        llama_set_embeddings_nextn(ctx_mtp, true, /*masked*/ true);
+
+        LOG_INF("%s: collecting data for %d MTP (nextn) layer(s) via a second pass\n", __func__, n_layer_nextn);
+    } else if (n_layer_nextn > 0) {
+        LOG_WRN("%s: model has %d MTP (nextn) layer(s) but --no-mtp was given; "
+                "their tensors will have no imatrix data\n", __func__, n_layer_nextn);
+    }
+
     // print system information
     {
         LOG_INF("\n");
         LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     }
 
-    if (!compute_imatrix(ctx, params, n_ctx)) {
+    if (!compute_imatrix(ctx, ctx_mtp, params, n_ctx)) {
         return 1;
     }
 
