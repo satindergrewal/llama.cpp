@@ -1222,7 +1222,25 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 if (imatrix_data) {
                     auto it = imatrix_data->find(tm.remapped_imatrix_name);
                     if (it == imatrix_data->end()) {
-                        LLAMA_LOG_INFO("\n====== %s: did not find weights for %s\n", __func__, tensor->name);
+                        // KT/trellis types are NOT in tensor_requires_imatrix(), so a tensor missing
+                        // from the imatrix silently falls back to UNCALIBRATED quantization here.
+                        // At KT bit-widths that fallback is catastrophic (measured: IQ1_KT no-imatrix
+                        // PPL ~99k vs ~96 with; a full transformer layer can be ruined with no error).
+                        // Escalate to a WARN for KT types so the hole is visible in every log, and
+                        // call out the common cause: MTP/nextn layers get no activations in a normal
+                        // forward pass, so they are absent from every conventionally-made imatrix.
+                        switch (new_type) {
+                            case GGML_TYPE_IQ1_KT: case GGML_TYPE_IQ2_KT:
+                            case GGML_TYPE_IQ3_KT: case GGML_TYPE_IQ4_KT:
+                                LLAMA_LOG_WARN("\n====== %s: NO IMATRIX DATA for %s -> quantizing to %s UNCALIBRATED. "
+                                        "At trellis bit-widths this can silently ruin the tensor "
+                                        "(MTP/nextn layers are never in a standard imatrix; consider --tensor-type <blk>=q8_0)\n",
+                                        __func__, tensor->name, ggml_type_name(new_type));
+                                break;
+                            default:
+                                LLAMA_LOG_INFO("\n====== %s: did not find weights for %s\n", __func__, tensor->name);
+                                break;
+                        }
                     } else {
                         if (it->second.size() == (size_t)tensor->ne[0]*tensor->ne[2]) {
                             imatrix = it->second.data();
