@@ -125,7 +125,12 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader & ml) {
         // LLM_GRAPH_TYPE_DECODER_MTP draft head, so they must actually be LOADED,
         // not TENSOR_SKIP'd as upstream does. trunk_flags/mtp_flags additionally
         // allow either side to be absent when target and draft live in split files.
-        const int flags = (i >= n_layer) ? mtp_flags : trunk_flags;
+        // NextN/MTP layers are only loaded when something will actually run them
+        // (params.load_nextn, set from --spec-type draft-mtp). Otherwise skip like
+        // upstream and keep the VRAM.
+        const int flags = (i >= n_layer)
+            ? (params.load_nextn ? mtp_flags : (TENSOR_SKIP | TENSOR_NOT_REQUIRED))
+            : trunk_flags;
 
         auto & layer = layers[i];
 

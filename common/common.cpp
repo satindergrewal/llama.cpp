@@ -1554,6 +1554,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.devices = params.devices.data();
     }
 
+    // MTP speculative decoding runs the NextN layers, so their tensors must be loaded.
+    // Anything else leaves them skipped, which is upstream's behaviour and saves the VRAM.
+    mparams.load_nextn      = std::find(params.speculative.types.begin(),
+                                        params.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;

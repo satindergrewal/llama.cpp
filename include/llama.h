@@ -345,6 +345,9 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool load_nextn;      // load NextN/MTP layer tensors (needed for MTP speculative decoding).
+                              // default false: they are skipped, which saves real VRAM on large MoE
+                              // models (7.5+ GiB on GLM-5.2) when speculation is not used.
     };
 
     struct llama_sampler_seq_config {
