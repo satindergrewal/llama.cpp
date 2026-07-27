@@ -79,9 +79,19 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
+void llama_model_glm_dsa::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
     const int64_t n_expert_shared = hparams.n_expert_shared;
+
+    // MTP-only: the GGUF carries only the NextN/MTP block(s) (user split target/draft).
+    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
+    // Trunk-only: the GGUF declares MTP layers in metadata but the actual MTP
+    // tensors live in a separate file (or were stripped at conversion). Mark
+    // MTP tensors NOT_REQUIRED so the trunk loads cleanly.
+    const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
+    const bool trunk_only = (hparams.n_layer_nextn > 0) && (ml.get_weight(mtp_probe.c_str()) == nullptr);
+    const int trunk_flags = mtp_only   ? TENSOR_NOT_REQUIRED : 0;
+    const int mtp_flags   = trunk_only ? TENSOR_NOT_REQUIRED : 0;
 
     const bool is_mla = hparams.is_mla();
     if (!is_mla) {
@@ -111,12 +121,11 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
     }
 
     for (int i = 0; i < n_layer_all; ++i) {
-        int flags = 0;
-        if (i >= n_layer) {
-            // skip all tensors in the NextN layers
-            // TODO @ngxson : TENSOR_NOT_REQUIRED was a hack, need to remove it later
-            flags |= TENSOR_SKIP | TENSOR_NOT_REQUIRED;
-        }
+        // NextN/MTP layers (i >= n_layer) are full decoder blocks used by the
+        // LLM_GRAPH_TYPE_DECODER_MTP draft head, so they must actually be LOADED,
+        // not TENSOR_SKIP'd as upstream does. trunk_flags/mtp_flags additionally
+        // allow either side to be absent when target and draft live in split files.
+        const int flags = (i >= n_layer) ? mtp_flags : trunk_flags;
 
         auto & layer = layers[i];
 
