@@ -2278,7 +2278,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             LLAMA_LOG_INFO("%s: Detected kv_paged=%d, creating llama_kv_cache_paged.\n", __func__, cparams.kv_paged);
                             const uint32_t head_dim   = hparams.n_embd_head_v();
                             const uint32_t n_head     = hparams.n_head_kv();
-                            const uint32_t n_layers   = hparams.n_layer;
+                            const uint32_t n_layers   = hparams.n_layer();
                             const uint32_t block_size = cparams.block_size;
 
                             const uint32_t n_gpu_blocks = cparams.n_gpu_blocks;
