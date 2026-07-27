@@ -543,6 +543,8 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_dsv4_context * mctx;
+};
+
 class llm_graph_input_attn_kv_paged : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv_paged(

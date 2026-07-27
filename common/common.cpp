@@ -1264,8 +1264,6 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     params.n_cpu_blocks = n_cpu_blocks;
 }
 
-common_init_result::common_init_result(common_params & params) :
-
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);

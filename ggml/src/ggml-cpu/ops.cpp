@@ -12001,6 +12001,8 @@ void ggml_compute_forward_lightning_indexer(
             }
         }
     }
+}
+
 void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_tensor * dst) {
     // Single threaded reference
     if (params->ith != 0) {

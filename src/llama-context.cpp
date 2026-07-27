@@ -83,7 +83,7 @@ namespace {
 // paged KV cache cannot be used with the current model placement.
 std::string validate_paged_kv_placement(const llama_model & model) {
     std::set<ggml_backend_dev_t> devs_used;
-    for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
         ggml_backend_dev_t dev = model.dev_layer(il);
         if (dev != nullptr) {
             devs_used.insert(dev);

@@ -3197,6 +3197,8 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
     }
 
     return (llm_graph_input_attn_k_dsa *) res->add_input(std::move(inp));
+}
+
 llm_graph_input_attn_kv_paged * llm_graph_context::build_attn_inp_kv_paged() const {
     const auto * mctx_paged = static_cast<const llama_kv_cache_paged_context*>(mctx);
 
