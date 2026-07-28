@@ -2970,6 +2970,14 @@ ggml_tensor * llm_graph_context::build_attn(
             kq_mask->type == GGML_TYPE_F16 && q_cur->type == GGML_TYPE_F32;
 
         if (dsa_gather) {
+            // one-shot, so an A/B can PROVE which path ran instead of inferring it from timings
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LLAMA_LOG_INFO("%s: DSA gather path ACTIVE (n_kv=%lld, top_k=%lld)\n",
+                        __func__, (long long) k_sel->ne[2], (long long) n_top_k_sel);
+            }
+
             ggml_tensor * qd = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
             ggml_tensor * kd = ggml_permute(ctx0, k_sel, 0, 2, 1, 3);
             ggml_tensor * vd = ggml_permute(ctx0, v_sel, 0, 2, 1, 3);
