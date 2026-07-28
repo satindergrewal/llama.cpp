@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include <algorithm>
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -462,6 +464,34 @@ llama_context::llama_context(
                     }
                 }
                 layer_backends[il] = be;
+            }
+
+            // Report what we resolved, so a silent fallback to the single-device path
+            // is visible instead of looking like success.
+            std::vector<ggml_backend_t> distinct;
+            for (auto * b : layer_backends) {
+                if (std::find(distinct.begin(), distinct.end(), b) == distinct.end()) {
+                    distinct.push_back(b);
+                }
+            }
+            LLAMA_LOG_INFO("%s: kv_paged layer->backend map: %u layers over %zu distinct backend(s)\n",
+                           __func__, (uint32_t) layer_backends.size(), distinct.size());
+            for (size_t d = 0; d < distinct.size(); ++d) {
+                size_t n = 0;
+                for (auto * b : layer_backends) { if (b == distinct[d]) n++; }
+                ggml_backend_dev_t dv = ggml_backend_get_device(distinct[d]);
+                LLAMA_LOG_INFO("%s:   backend %s (dev %s): %zu layer(s)\n", __func__,
+                               ggml_backend_name(distinct[d]),
+                               dv ? ggml_backend_dev_name(dv) : "null", n);
+            }
+            // and what the model itself says about device placement
+            {
+                std::vector<ggml_backend_dev_t> ddev;
+                for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                    ggml_backend_dev_t d = model.dev_layer(il);
+                    if (std::find(ddev.begin(), ddev.end(), d) == ddev.end()) ddev.push_back(d);
+                }
+                LLAMA_LOG_INFO("%s:   model.dev_layer spans %zu distinct device(s)\n", __func__, ddev.size());
             }
         }
 
