@@ -109,3 +109,41 @@ Anything failing a guard returns false -> existing path runs. **Fail-safe by con
 4. Compile-gate (CPU).
 5. Measure on a GPU window: gather vs mask-shaped(#25407) vs dense, decode t/s + KV traffic at
    64K/128K, plus NIAH + loop-rate for quality. Success = faster than dense (today's path is slower).
+
+---
+
+# BREAKTHROUGH: mainline already has the exact pattern we need (found 2026-07-28)
+
+The integration seam I flagged (ik reads `dst->src[5]`, mainline FA nodes carry 5 srcs) is
+**already solved in mainline by precedent**:
+
+```c
+GGML_API struct ggml_tensor * ggml_flash_attn_ext_banded(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * rel_logits,   // <-- SIXTH SOURCE, same slot we need
+        float                 scale,
+        int64_t               rel_extent);
+```
+
+- Op: `GGML_OP_FLASH_ATTN_EXT_BANDED` (ggml.h:580)
+- CUDA impl: `ggml/src/ggml-cuda/fattn-banded.cu` (**247 lines** - comparable to ik's 312-line
+  dsa_attn.cu, so the shape and size of the work is now calibrated against a real example)
+- Emitted by: `src/models/inkling.cpp:466` - a model file adding an FA-family op with an extra
+  tensor, which is EXACTLY our glm-dsa case
+- Dispatch: registered in ggml-cuda.cu alongside GGML_OP_FLASH_ATTN_EXT
+
+**Consequence for the port:** we are no longer inventing a pattern. `fattn-banded` is a
+mainline-blessed, in-tree template for "FA variant + extra source tensor + its own CUDA kernel +
+model-file emission". The DSA port becomes: follow fattn-banded's structure, swap its rel_logits
+for the indexer top-k tensor, and put ik's gather pipeline (mask-gather / K-V-gather / Q-stage /
+softmax / copy-out) inside instead of the banded kernel.
+
+This de-risks Option A substantially and gives the reviewer (and us) a familiar shape.
+Revised order: (1) copy fattn-banded.cu as the skeleton, (2) transplant ik's four gather kernels
+into it, (3) add `ggml_flash_attn_ext_dsa()` + op enum mirroring the banded declaration,
+(4) emit from src/models/glm-dsa.cpp gated on the indexer tensor + ik's guards, (5) compile-gate,
+(6) measure on a GPU window.
