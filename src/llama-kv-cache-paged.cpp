@@ -1,5 +1,7 @@
 #include "llama-kv-cache-paged.h"
 
+#include <algorithm>
+
 #include "llama-impl.h"
 
 //
@@ -23,6 +25,99 @@ llama_kv_cache_paged::llama_kv_cache_paged(uint32_t head_dim,
     num_cpu_blocks(0),
     gpu_backend(nullptr),
     cpu_backend(nullptr) {}
+
+void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_backends,
+                                      ggml_backend_t backend_cpu,
+                                      enum ggml_type type,
+                                      uint32_t       n_gpu_blocks,
+                                      uint32_t       n_cpu_blocks,
+                                      float          watermark) {
+    GGML_ASSERT(backend_cpu && "backend_cpu is nullptr");
+    GGML_ASSERT(layer_backends.size() == n_layers && "need one backend per layer");
+    GGML_ASSERT(n_gpu_blocks && "n_gpu_blocks need to be greater than 0.");
+    GGML_ASSERT(n_cpu_blocks && "n_cpu_blocks need to be greater than 0.");
+
+    num_gpu_blocks = n_gpu_blocks;
+    num_cpu_blocks = n_cpu_blocks;
+    kv_type        = type;
+    cpu_backend    = backend_cpu;
+    gpu_backend    = layer_backends[0];  // representative; per-layer truth is in the vector
+    block_bytes    = 2 * block_size * n_heads_kv * head_dim * ggml_type_size(kv_type);
+
+    // Group layers by the device that holds them. llama.cpp's --tensor-split splits
+    // by LAYER, so layer il's KV must live on dev_layer(il). Every device allocates
+    // the same n_gpu_blocks, which is what keeps a block id valid on all of them and
+    // leaves the block table, scheduler and attention kernel completely unchanged.
+    std::vector<ggml_backend_t> distinct;
+    for (auto * be : layer_backends) {
+        if (std::find(distinct.begin(), distinct.end(), be) == distinct.end()) {
+            distinct.push_back(be);
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: paged KV across %zu device(s), n_gpu_blocks=%u per device, "
+                   "n_cpu_blocks=%u, block_size=%u, watermark=%0.2f\n",
+                   __func__, distinct.size(), n_gpu_blocks, n_cpu_blocks, block_size, watermark);
+
+    kv_gpu_layers.assign(n_layers, nullptr);
+
+    for (auto * be : distinct) {
+        size_t n_here = 0;
+        for (uint32_t il = 0; il < n_layers; ++il) {
+            if (layer_backends[il] == be) n_here++;
+        }
+
+        struct ggml_init_params gp;
+        gp.mem_size   = ggml_tensor_overhead() * 5 * n_here;
+        gp.mem_buffer = NULL;
+        gp.no_alloc   = true;
+
+        struct ggml_context * ctx = ggml_init(gp);
+        GGML_ASSERT(ctx && "failed to create paged KV context");
+
+        for (uint32_t il = 0; il < n_layers; ++il) {
+            if (layer_backends[il] != be) continue;
+            kv_gpu_layers[il] =
+                ggml_new_tensor_4d(ctx, type, head_dim, block_size, 2 * n_heads_kv, n_gpu_blocks);
+        }
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        GGML_ASSERT(buf && "Failed to allocate paged KV buffer on a device");
+        ggml_backend_buffer_clear(buf, 0);
+
+        LLAMA_LOG_INFO("%s:   device %s holds %zu layer(s), %.2f MiB\n", __func__,
+                       ggml_backend_name(be), n_here,
+                       ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
+
+        gpu_ctxs.push_back(ctx);
+        gpu_bufs.push_back(buf);
+    }
+
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        GGML_ASSERT(kv_gpu_layers[il] && "layer tensor not allocated");
+        GGML_ASSERT(kv_gpu_layers[il]->buffer && "layer tensor has null buffer");
+    }
+
+    // CPU mirror for the swap path, identical to the single-device init: one tensor
+    // per layer, allocated on the CPU backend with pinned memory for faster PCIe.
+    struct ggml_init_params cpu_params;
+    cpu_params.mem_size           = ggml_tensor_overhead() * 5 * n_layers;
+    cpu_params.mem_buffer         = NULL;
+    cpu_params.no_alloc           = true;
+    struct ggml_context * ctx_cpu = ggml_init(cpu_params);
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        kv_cpu_layers.push_back(
+            ggml_new_tensor_4d(ctx_cpu, type, head_dim, block_size, 2 * n_heads_kv, n_cpu_blocks));
+    }
+    ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
+    GGML_ASSERT(buf_cpu && "Failed to allocate CPU KV cache buffer");
+    ggml_backend_buffer_clear(buf_cpu, 0);
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        GGML_ASSERT(kv_cpu_layers[il]->buffer && "CPU layer tensor has null buffer");
+    }
+
+    block_manager.init(n_gpu_blocks, n_cpu_blocks, watermark);
+}
 
 void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
                                 ggml_backend_t backend_cpu,
