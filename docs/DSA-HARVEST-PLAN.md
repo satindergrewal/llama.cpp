@@ -54,3 +54,58 @@ All three gates need both box cards (169G GLM) = a GPU window. Study + port code
 work, done now on this branch; the measurements queue on a window behind v0.3.
 
 Autonomy: experiment freely on this branch (Satinder #1109); merge-to-fleet is the only gate.
+
+---
+
+# PORT DESIGN (read from ik source 2026-07-28, baseline built)
+
+## Baseline
+Worktree `/mnt/nvme0/llama.cpp-dsaport` (branch `fable-dsa-harvest-box`, off fleet ffee9f47e),
+CUDA build clean: DBRC=0, llama-server + llama-bench at 16:54. Opus's fleet tree untouched
+(separate worktree by construction).
+
+## ik's gather is a SELF-CONTAINED PIPELINE, not an FA modification
+
+`ggml_cuda_dsa_attn_ext(ctx, dst) -> bool` (returns "I handled this op"), built from four small
+kernels plus its own softmax:
+1. `k_prepare_mask` - gathers the mask rows for the selected indices into a compact
+   `[nidx x rows]` buffer (the full-size mask never drives the math).
+2. `k_prepare_one_batch_kv` - gathers ONLY the selected K (and V) rows into a compact f16
+   buffer. **This is the O(k) harvest: it reads top-k rows instead of streaming all of KV.**
+3. `k_prepare_one_batch_q` - f32->f16 Q staging.
+4. `soft_max_f16_simple` + `k_copy_dst` - softmax over the compact scores, f16->f32 out.
+
+It **sidesteps FlashAttention entirely** for DSA layers rather than teaching FA about sparsity.
+That is exactly why it ports as a unit, and why it is lower-risk than mainline's #25917 approach
+(which threads sparse indices through the MMA FA kernel).
+
+## THE INTEGRATION SEAM (the one thing that needs graph work)
+
+ik's entry reads **`dst->src[5]` = indexer** (the top-k index tensor), i.e. their FA node carries
+a 6th source. Mainline's `ggml_flash_attn_ext` node has 5 (Q,K,V,mask,sinks). So the port needs
+either:
+- **(A)** a new op `GGML_OP_DSA_ATTN` emitted by the glm-dsa/deepseek32 graph builders when the
+  indexer top-k tensor exists, with the gather as its CUDA impl (cleanest, no FA disturbance); or
+- **(B)** extend the FA node with an optional 6th src and dispatch to the gather when present
+  (closer to ik, touches shared FA plumbing).
+Recommendation: **(A)** - new op keeps FA untouched, matches mainline's own style of adding
+`GGML_OP_LIGHTNING_INDEXER` as a discrete op, and the CPU fallback can simply be the existing
+mask-shaped path.
+
+## Guards ik enforces (must replicate, they define the fast path's domain)
+- no sinks; requires Q,K,V,mask,indexer all present
+- `indexer->ne[0] % 256 == 0` (top-k multiple of 256; ours is 2048 OK)
+- `K->ne[1] >= 4*indexer->ne[0]` (only worth it when context >> top-k: at 2048 top-k this means
+  ctx >= 8192 - below that, fall back to dense, which matches the "identity below 2048" fact)
+- K/V/mask f16, Q f32; single-batch (ne[2]/ne[3] == 1)
+Anything failing a guard returns false -> existing path runs. **Fail-safe by construction.**
+
+## Order of work
+1. ~~baseline build~~ DONE
+2. Port the four kernels + softmax into `ggml/src/ggml-cuda/dsa-attn.cu` (new file), adapted to
+   mainline's ggml-cuda conventions (ctx, stream, pool allocs).
+3. Add `GGML_OP_DSA_ATTN` (option A) + dispatch registration; graph emit in `src/models/glm-dsa.cpp`
+   gated on the indexer tensor + the guards above.
+4. Compile-gate (CPU).
+5. Measure on a GPU window: gather vs mask-shaped(#25407) vs dense, decode t/s + KV traffic at
+   64K/128K, plus NIAH + loop-rate for quality. Success = faster than dense (today's path is slower).
