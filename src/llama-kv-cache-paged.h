@@ -21,6 +21,17 @@ class llama_kv_cache_paged : public llama_memory_i {
                          uint32_t n_ubatch,
                          uint32_t n_seq_max);
 
+    // Multi-device init: one backend per layer, so a model split across devices
+    // (llama.cpp splits by LAYER, not by head) keeps each layer's KV on the same
+    // device as the layer itself. Block ids stay device-agnostic because every
+    // device allocates the SAME number of blocks, so a block id is valid anywhere.
+    void init_multi(const std::vector<ggml_backend_t> & layer_backends,
+                    ggml_backend_t backend_cpu,
+                    enum ggml_type type,
+                    uint32_t       n_gpu_blocks,
+                    uint32_t       n_cpu_blocks,
+                    float          watermark);
+
     void init(ggml_backend_t backend_gpu,
               ggml_backend_t backend_cpu,
               enum ggml_type type,
@@ -114,6 +125,10 @@ class llama_kv_cache_paged : public llama_memory_i {
     uint32_t       num_gpu_blocks;
     uint32_t       num_cpu_blocks;
     uint32_t       block_bytes;
+
+    // one context+buffer per distinct device holding layers (multi-device path)
+    std::vector<struct ggml_context *>     gpu_ctxs;
+    std::vector<ggml_backend_buffer_t>     gpu_bufs;
 
     ggml_backend_t gpu_backend;
     ggml_backend_t cpu_backend;
