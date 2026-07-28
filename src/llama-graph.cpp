@@ -3094,8 +3094,16 @@ ggml_tensor * llm_graph_context::build_attn(
         kq_scale, cparams.block_size, max_blocks);
     cb(cur, "kqv_out", il);
 
-    // Reshape to [n_embd, n_tokens] (just a view)
-    cur = ggml_reshape_2d(ctx0, cur, hparams.n_embd, n_tokens);
+    // Reshape to [attn_out_width, n_tokens] (just a view).
+    //
+    // NOT hparams.n_embd. That assumes n_head*head_dim == n_embd, which holds for
+    // Llama but NOT for architectures that decouple head_dim from n_embd (Qwen3 sets
+    // head_dim explicitly, so n_head*head_dim != n_embd). Assuming n_embd there made
+    // ggml_reshape_2d abort with GGML_ASSERT(ggml_nelements(a) == ne0*ne1) before a
+    // single token was generated. Derive the width from the tensor so it is correct
+    // for any architecture.
+    const int64_t n_attn_out = ggml_nelements(cur) / n_tokens;
+    cur = ggml_reshape_2d(ctx0, cur, n_attn_out, n_tokens);
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
