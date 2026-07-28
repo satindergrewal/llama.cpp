@@ -1216,15 +1216,40 @@ struct common_init_result::impl {
 
 static void common_fit_paged_kv_blocks(common_params& params, const llama_model * model) {
     GGML_ASSERT(model && "model must be loaded before fitting paged KV blocks.");
-    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-    if (!dev) {
+    // Every device holding layers allocates the SAME number of blocks, because a block
+    // id must be valid on all of them. So the pool has to be sized off the MOST
+    // CONSTRAINED device, not the first one found. Sizing off device 0 on an
+    // asymmetric split (e.g. 97.8 GiB free on one card, 57.0 on the other) hands out
+    // blocks the second card cannot back, and it OOMs while the first reports space.
+    size_t free_vram  = 0;
+    size_t total_vram = 0;
+    size_t n_gpus     = 0;
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (!d || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        size_t d_free = 0, d_total = 0;
+        ggml_backend_dev_memory(d, &d_free, &d_total);
+        LOG_INF("%s: device %s: %.1f MiB free of %.1f MiB\n", __func__,
+                ggml_backend_dev_name(d), d_free / 1024.0f / 1024.0f, d_total / 1024.0f / 1024.0f);
+        if (n_gpus == 0 || d_free < free_vram) {
+            free_vram  = d_free;
+            total_vram = d_total;
+        }
+        n_gpus++;
+    }
+
+    if (n_gpus == 0) {
         LOG_WRN("%s: no GPU device found, cannot fit paged KV blocks.\n", __func__);
         return;
     }
-
-    size_t free_vram = 0;
-    size_t total_vram = 0;
-    ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+    if (n_gpus > 1) {
+        LOG_INF("%s: %zu GPUs; sizing the block pool off the most constrained "
+                "(%.1f MiB free) so a block id is valid on every device\n",
+                __func__, n_gpus, free_vram / 1024.0f / 1024.0f);
+    }
 
     const uint32_t n_heads_kv = llama_model_n_head_kv(model);
     const uint32_t n_layers   = llama_model_n_layer(model);
