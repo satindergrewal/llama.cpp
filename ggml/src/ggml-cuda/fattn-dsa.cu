@@ -14,10 +14,11 @@
 #include "fattn-dsa.cuh"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
-// The gathered path is built on cublasHgemmStridedBatched, which has no HIP/MUSA
-// mapping in ggml's vendor headers, so it is CUDA-only. Other backends report the
+// The gathered path is built on batched cuBLAS calls that have no HIP/MUSA mapping
+// in ggml's vendor headers, so it is CUDA-only. Other backends report the
 // op as unsupported and the entry point is a no-op that returns false.
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 
@@ -241,6 +242,48 @@ static void dsa_soft_max_f16_cuda(half * x, const half * mask, const int ncols_x
     }
 }
 
+// Both matmuls feed fp16 A/B and store fp16 C. cublasHgemmStridedBatched also ACCUMULATES
+// in fp16, which puts a rounding floor on the result that grows with the reduction length
+// (~sqrt(k) for the PV gemm, where k = top_k). LLAMA_DSA_F32ACC=1 switches to
+// cublasGemmStridedBatchedEx with CUBLAS_COMPUTE_32F: identical shapes, strides, batch
+// count, transposes and stream, identical fp16 storage for A/B/C, but the dot products
+// accumulate in fp32. Default is off, so the fp16 path is bit-for-bit what it always was.
+//
+// Note this fixes accumulation only. The KQ and KQV buffers are still fp16, so a rounding
+// floor from those stores remains either way.
+static bool dsa_f32_acc_enabled() {
+    static const bool enabled = []() {
+        const char * s = getenv("LLAMA_DSA_F32ACC");
+        return s != nullptr && s[0] != '\0' && s[0] != '0';
+    }();
+    return enabled;
+}
+
+static inline cublasStatus_t dsa_gemm_strided_batched(
+        cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
+        int m, int n, int k,
+        const half * A, int lda, long long int strideA,
+        const half * B, int ldb, long long int strideB,
+        half       * C, int ldc, long long int strideC,
+        int batch_count) {
+    if (dsa_f32_acc_enabled()) {
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+        return cublasGemmStridedBatchedEx(handle, transa, transb, m, n, k,
+                &alpha, A, CUDA_R_16F, lda, strideA,
+                        B, CUDA_R_16F, ldb, strideB,
+                &beta,  C, CUDA_R_16F, ldc, strideC,
+                batch_count, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+
+    const half alpha = 1.0f;
+    const half beta  = 0.0f;
+    return cublasHgemmStridedBatched(handle, transa, transb, m, n, k,
+            &alpha, A, lda, strideA,
+                    B, ldb, strideB,
+            &beta,  C, ldc, strideC, batch_count);
+}
+
 // ik's guard logic, kept as-is: any miss means "not handled here" and must be safe.
 static bool dsa_attn_layout_ok(const ggml_tensor * dst) {
     if (!dst) {
@@ -294,9 +337,6 @@ bool ggml_cuda_flash_attn_ext_dsa(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
-
-    const half alpha = 1.0f;
-    const half beta  = 0.0f;
 
     const int  max_rows   = std::min<int>(Q->ne[1], k_max_rows);
     const bool is_k_view  = dsa_v_is_k_view(K, V);
@@ -363,28 +403,28 @@ bool ggml_cuda_flash_attn_ext_dsa(ggml_backend_cuda_context & ctx, ggml_tensor *
         }
 
         // KQ = K_gathered^T * Q, one gemm per query row in the chunk
-        CUBLAS_CHECK(cublasHgemmStridedBatched(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        CUBLAS_CHECK(dsa_gemm_strided_batched(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
                     indexer->ne[0], Q->ne[2], Q->ne[0],
-                    &alpha, k16.get(), K->ne[0], K->ne[0]*indexer->ne[0],
+                    k16.get(), K->ne[0], K->ne[0]*indexer->ne[0],
                     q16.get(), Q->ne[0], Q->ne[0]*Q->ne[2],
-                    &beta, kq16.get(), indexer->ne[0], indexer->ne[0]*Q->ne[2], nrows));
+                    kq16.get(), indexer->ne[0], indexer->ne[0]*Q->ne[2], nrows));
 
         dsa_soft_max_f16_cuda(kq16.get(), mask16.get() + first*indexer->ne[0], indexer->ne[0], Q->ne[2]*nrows,
                 Q->ne[2], scale, stream);
         CUDA_CHECK(cudaGetLastError());
 
         if (is_k_view) {
-            CUBLAS_CHECK(cublasHgemmStridedBatched(ctx.cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N,
+            CUBLAS_CHECK(dsa_gemm_strided_batched(ctx.cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N,
                         V->ne[0], Q->ne[2], indexer->ne[0],
-                        &alpha, k16.get() + v_offset, K->ne[0], K->ne[0]*indexer->ne[0],
+                        k16.get() + v_offset, K->ne[0], K->ne[0]*indexer->ne[0],
                         kq16.get(), indexer->ne[0], indexer->ne[0]*Q->ne[2],
-                        &beta, kqv16.get(), V->ne[0], V->ne[0]*Q->ne[2], nrows));
+                        kqv16.get(), V->ne[0], V->ne[0]*Q->ne[2], nrows));
         } else {
-            CUBLAS_CHECK(cublasHgemmStridedBatched(ctx.cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N,
+            CUBLAS_CHECK(dsa_gemm_strided_batched(ctx.cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N,
                         V->ne[0], Q->ne[2], indexer->ne[0],
-                        &alpha, v16.get(), V->ne[0], V->ne[0]*indexer->ne[0],
+                        v16.get(), V->ne[0], V->ne[0]*indexer->ne[0],
                         kq16.get(), indexer->ne[0], indexer->ne[0]*Q->ne[2],
-                        &beta, kqv16.get(), V->ne[0], V->ne[0]*Q->ne[2], nrows));
+                        kqv16.get(), V->ne[0], V->ne[0]*Q->ne[2], nrows));
         }
 
         {
