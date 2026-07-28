@@ -113,8 +113,13 @@ struct bench_case {
     bool    v_is_k_view;
 };
 
-// GLM-5.2 MLA: DK 576, DV 512, 128 heads, 1 KV head, n_indexer_top_k 2048, V a view into K.
-#define GLM_ROW(nkv, ntok, tk) { "glm", 576, 512, 128, (nkv), (ntok), (tk), true }
+// GLM-5.2 MLA: DK 576, DV 512, 64 heads, 1 KV head, n_indexer_top_k 2048, V a view into K.
+// The head count is glm-dsa.attention.head_count = 64, read from the served GGUF. An earlier
+// revision of this file used 128, which is wrong and inflates the gathered path: n_head is
+// the n dimension of both batched GEMMs, so a larger value makes them less skinny and the
+// batched cuBLAS calls more efficient than they really are. Use --nhead to reproduce the
+// old numbers.
+#define GLM_ROW(nkv, ntok, tk) { "glm", 576, 512, 64, (nkv), (ntok), (tk), true }
 
 static const bench_case g_cases[] = {
     // headline: top_k = 2048, decode
@@ -544,9 +549,9 @@ static run_result run_one(ggml_backend_t backend, const bench_case & c, path_kin
 
 static void print_result(const bench_case & c, path_kind path, const run_result & R) {
     if (!R.supported) {
-        printf("RESULT tag=%s path=%s n_kv=%lld n_tokens=%lld top_k=%lld REFUSED reason=\"%s\"\n",
+        printf("RESULT tag=%s path=%s n_kv=%lld n_tokens=%lld top_k=%lld n_head=%lld REFUSED reason=\"%s\"\n",
                 c.tag, path_name(path), (long long) c.n_kv, (long long) c.n_tokens, (long long) c.top_k,
-                R.refusal ? R.refusal : "?");
+                (long long) c.n_head, R.refusal ? R.refusal : "?");
         return;
     }
 
@@ -555,12 +560,12 @@ static void print_result(const bench_case & c, path_kind path, const run_result 
     const long long d_compute = (long long) (R.dev_after_inputs  - R.dev_after_reserve);
     const long long d_pool    = (long long) (R.dev_after_reserve - R.dev_after_run);
 
-    printf("RESULT tag=%s path=%s n_kv=%lld n_tokens=%lld top_k=%lld nodes=%lld "
+    printf("RESULT tag=%s path=%s n_kv=%lld n_tokens=%lld top_k=%lld n_head=%lld nodes=%lld "
            "iters=%d med_ms=%.4f min_ms=%.4f p25_ms=%.4f p75_ms=%.4f max_ms=%.4f "
            "compute_buf=%llu input_buf=%llu dev_inputs=%lld dev_compute=%lld dev_pool=%lld "
            "absmean=%.9g nonfinite=%lld\n",
             c.tag, path_name(path), (long long) c.n_kv, (long long) c.n_tokens, (long long) c.top_k,
-            (long long) R.n_nodes,
+            (long long) c.n_head, (long long) R.n_nodes,
             R.t.n, R.t.med, R.t.mn, R.t.p25, R.t.p75, R.t.mx,
             (unsigned long long) R.compute_buf, (unsigned long long) R.input_buf,
             d_inputs, d_compute, d_pool,
@@ -578,6 +583,7 @@ int main(int argc, char ** argv) {
     int64_t     ov_nkv    = 0;   // --nkv/--ntok/--topk override the selected case in place,
     int64_t     ov_ntok   = 0;   // so one-off shapes can be probed without editing the table
     int64_t     ov_topk   = 0;
+    int64_t     ov_nhead  = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -591,6 +597,7 @@ int main(int argc, char ** argv) {
         else if (a == "--nkv")     ov_nkv    = atoll(next());
         else if (a == "--ntok")    ov_ntok   = atoll(next());
         else if (a == "--topk")    ov_topk   = atoll(next());
+        else if (a == "--nhead")   ov_nhead  = atoll(next());
         else if (a == "--path") {
             const std::string p = next();
             if      (p == "gather")    only_path = PATH_GATHER;
@@ -642,6 +649,7 @@ int main(int argc, char ** argv) {
             if (ov_nkv)  c.n_kv     = ov_nkv;
             if (ov_ntok) c.n_tokens = ov_ntok;
             if (ov_topk) c.top_k    = ov_topk;
+            if (ov_nhead) c.n_head  = ov_nhead;
 
             const run_result R = run_one(backend, c, (path_kind) p, seed, min_iters, target_s, verbose);
             print_result(c, (path_kind) p, R);
