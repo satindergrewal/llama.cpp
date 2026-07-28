@@ -2049,7 +2049,8 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams,
-                                            ggml_backend_t backend_gpu, ggml_backend_t backend_cpu) const {
+                                            ggml_backend_t backend_gpu, ggml_backend_t backend_cpu,
+                                            const std::vector<ggml_backend_t> & layer_backends) const {
     llama_memory_i * res;
 
     switch (arch) {
@@ -2291,13 +2292,33 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             auto * paged_cache = new llama_kv_cache_paged(head_dim, n_head, block_size, n_layers, n_ubatch, n_seq_max);
                             GGML_ASSERT(paged_cache && "unable to create paged KV cache.");
 
-                            paged_cache->init(
-                                backend_gpu,
-                                backend_cpu,
-                                params.type_k,
-                                n_gpu_blocks,
-                                n_cpu_blocks,
-                                watermark);
+                            // Split across devices only if the layers actually span more
+                            // than one backend; otherwise take the original single-device
+                            // path unchanged so it cannot regress.
+                            bool multi_dev = false;
+                            if (layer_backends.size() == n_layers) {
+                                for (uint32_t il = 1; il < n_layers; ++il) {
+                                    if (layer_backends[il] != layer_backends[0]) { multi_dev = true; break; }
+                                }
+                            }
+
+                            if (multi_dev) {
+                                paged_cache->init_multi(
+                                    layer_backends,
+                                    backend_cpu,
+                                    params.type_k,
+                                    n_gpu_blocks,
+                                    n_cpu_blocks,
+                                    watermark);
+                            } else {
+                                paged_cache->init(
+                                    backend_gpu,
+                                    backend_cpu,
+                                    params.type_k,
+                                    n_gpu_blocks,
+                                    n_cpu_blocks,
+                                    watermark);
+                            }
 
                             res = paged_cache;
                         } else {
