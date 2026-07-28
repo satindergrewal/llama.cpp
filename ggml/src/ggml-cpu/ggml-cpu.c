@@ -2047,6 +2047,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
+        case GGML_OP_FLASH_ATTN_EXT_DSA:
+            {
+                // gathered top-k attention is implemented in the CUDA backend only
+                GGML_ABORT("GGML_OP_FLASH_ATTN_EXT_DSA has no CPU implementation");
+            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);

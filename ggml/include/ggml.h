@@ -578,6 +578,7 @@ extern "C" {
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_EXT_BANDED,
+        GGML_OP_FLASH_ATTN_EXT_DSA,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2460,6 +2461,19 @@ extern "C" {
             struct ggml_tensor  * rel_logits,
             float                 scale,
             int64_t               rel_extent);
+
+    // sparse flash attention over the indexer-selected top-k keys only ("DSA"):
+    //   topk_idx: [top_k, n_batch, 1, 1] I32; row i lists the kv positions selected for query token i
+    //   the result is computed by gathering those K/V rows, not by masking a full-size KQ
+    //   mask is the ordinary [n_kv, n_batch] F16 causal mask; it is gathered with the same indices
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_dsa(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * topk_idx,
+            float                 scale);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
