@@ -137,6 +137,12 @@ static void audit_guards(const ggml_tensor * dst) {
     chk("indexer->type == I32",                   indexer && indexer->type == GGML_TYPE_I32);
     chk("indexer ne1 >= Q->ne[1], ne2/ne3 == 1",  indexer && Q && indexer->ne[1] >= Q->ne[1] &&
                                                   indexer->ne[2] == 1 && indexer->ne[3] == 1);
+    if (indexer) {
+        // same expression as dsa_soft_max_shmem() in fattn-dsa.cu. The device limit is not
+        // visible from here, so report the requirement and let the reader compare it.
+        const long long shmem = (((indexer->ne[0] + 31)/32)*32 + 32)*(long long) sizeof(float);
+        printf("      guard %-46s needs %lld B\n", "softmax shmem < device smpb", shmem);
+    }
 }
 
 // ---------------------------------------------------------------------------- the case
@@ -435,6 +441,12 @@ int main(int argc, char ** argv) {
         { "GUARD n_kv=512 < 4*top_k",                  128, 128,  8,  512,    8,  256, false, false, false, true,  false },
         // formulation caveat, not a kernel bug: gather double-counts a repeated index
         { "DUP indices (expected divergence)",         128, 128,  8, 2048,    8,  256, false, false, false, false, true  },
+        // softmax shared-memory boundary. The softmax stages a whole top_k row in shared
+        // memory, so top_k is bounded by the device smpb. Measured on RTX PRO 6000 Blackwell
+        // (smpb 49152): 12032 needs 48256 B and runs, 12288 needs 49280 B and must be
+        // rejected by the guard rather than aborting inside the launcher.
+        { "top_k=12032, largest that fits smpb",       128, 128,  1,49152,    1,12032, false, true,  false, false, false },
+        { "GUARD top_k=12288 (softmax shmem > smpb)",  128, 128,  1,49152,    1,12288, false, false, false, true,  false },
     };
 
     int n_pass = 0;

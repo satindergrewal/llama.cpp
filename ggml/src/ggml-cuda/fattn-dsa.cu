@@ -200,13 +200,22 @@ static __global__ void dsa_soft_max_f16(half * x, const half * mask, const int n
 
 #define DSA_SOFT_MAX_BLOCK_SIZE 1024
 
+// The softmax stages an entire top_k row in shared memory, so top_k is bounded by the
+// shared memory per block of the device that will run it. This is the single definition
+// of that requirement: the launcher asserts on it and dsa_attn_layout_ok() rejects on it,
+// so supports_op can never accept a shape the launcher would then abort on, and the two
+// cannot drift apart.
+static inline size_t dsa_soft_max_shmem(int64_t ncols_x) {
+    return (GGML_PAD(ncols_x, WARP_SIZE) + WARP_SIZE)*sizeof(float);
+}
+
 static void dsa_soft_max_f16_cuda(half * x, const half * mask, const int ncols_x, const int nrows_x,
         const int nrows_y, const float scale, cudaStream_t stream) {
     int nth = WARP_SIZE;
     while (nth < ncols_x && nth < DSA_SOFT_MAX_BLOCK_SIZE) nth *= 2;
     const dim3 block_dims(nth,     1, 1);
     const dim3 block_nums(nrows_x, 1, 1);
-    const size_t shmem = (GGML_PAD(ncols_x, WARP_SIZE) + WARP_SIZE)*sizeof(float);
+    const size_t shmem = dsa_soft_max_shmem(ncols_x);
     static_assert(DSA_SOFT_MAX_BLOCK_SIZE == 1024, "These values need to be adjusted.");
 
     GGML_ASSERT(shmem < ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
@@ -285,7 +294,7 @@ static inline cublasStatus_t dsa_gemm_strided_batched(
 }
 
 // ik's guard logic, kept as-is: any miss means "not handled here" and must be safe.
-static bool dsa_attn_layout_ok(const ggml_tensor * dst) {
+static bool dsa_attn_layout_ok(int device, const ggml_tensor * dst) {
     if (!dst) {
         return false;
     }
@@ -314,16 +323,21 @@ static bool dsa_attn_layout_ok(const ggml_tensor * dst) {
     if (indexer->type != GGML_TYPE_I32) return false;
     if (indexer->ne[1] < Q->ne[1] || indexer->ne[2] > 1 || indexer->ne[3] > 1) return false;
 
+    // the softmax cannot stage a top_k row larger than the device allows. Without this the
+    // shape is ACCEPTED here and then hard-aborts inside dsa_soft_max_f16_cuda, which kills
+    // the process instead of falling back to the dense path.
+    if (device < 0 || device >= ggml_cuda_info().device_count) return false;
+    if (!(dsa_soft_max_shmem(indexer->ne[0]) < ggml_cuda_info().devices[device].smpb)) return false;
+
     return true;
 }
 
 bool ggml_cuda_flash_attn_ext_dsa_supported(int device, const ggml_tensor * dst) {
-    GGML_UNUSED(device);
-    return dsa_attn_layout_ok(dst);
+    return dsa_attn_layout_ok(device, dst);
 }
 
 bool ggml_cuda_flash_attn_ext_dsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (!dsa_attn_layout_ok(dst)) {
+    if (!dsa_attn_layout_ok(ctx.device, dst)) {
         return false;
     }
 
