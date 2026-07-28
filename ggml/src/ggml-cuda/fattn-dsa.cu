@@ -45,6 +45,11 @@ static inline bool dsa_v_is_k_view(const ggml_tensor * K, const ggml_tensor * V)
     const char * v_data = (const char *) V->data;
     const size_t k_row_size = ggml_row_size(K->type, K->ne[0]);
     const size_t v_row_size = ggml_row_size(V->type, V->ne[0]);
+    // the reuse path indexes the gathered K buffer with K's row stride, so an
+    // aliasing V whose stride differs would silently read the wrong rows
+    if (V->nb[1] != K->nb[1]) {
+        return false;
+    }
     return v_data >= k_data && v_data + v_row_size <= k_data + k_row_size;
 }
 
