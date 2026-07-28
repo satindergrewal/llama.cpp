@@ -27,6 +27,23 @@ activations. So:
   absorbed path produces a large `[wv_b.ne1 x n_head x ctx]` intermediate independent of the FA
   KQ matrix. THIS is the piece worth measuring and possibly porting.
 
+## UPDATE (2026-07-28, converging evidence from the KT lane)
+
+Opus independently traced their GLM compute-buffer ceiling to a term neither ik's -amb nor FA
+addresses: **the unfused lightning-indexer score tensor `[n_kv, 32, n_ubatch]` F32**. FA never
+covers it because it is not the attention matmul. That explains why our buffer stayed huge with
+FA on and why `-ub` was the only lever that moved it.
+
+**Revised model of the GLM compute-buffer wall:** indexer score tensor (dominant, unfused) +
+MLA wv_b intermediate (-amb's target (b)) + FA mask/activations (-ub scales). The FA KQ matrix
+(-amb's target (a)) is NOT a term for us.
+
+**Consequence: the ik DSA port supersedes this branch's value.** ik's `indexer_topk.cu` FUSES
+the top-k so the score tensor never materializes (kills the dominant term), and `dsa_attn.cu`
+adds the O(k) gather (the decode harvest). One 591-line port, both walls. See
+`fable-dsa-harvest`. Keep this branch for the wv_b measurement only if the DSA port leaves a
+residual wv_b term.
+
 ## Measure-first step (do before writing the port)
 
 On a GLM serve, dump per-op compute-buffer allocation at 64K/128K with FA on and -ub 512, and
