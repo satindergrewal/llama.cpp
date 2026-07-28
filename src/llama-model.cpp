@@ -12,6 +12,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -2049,7 +2050,9 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
-llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams,
+                                            ggml_backend_t backend_gpu, ggml_backend_t backend_cpu,
+                                            const std::vector<ggml_backend_t> & layer_backends) const {
     llama_memory_i * res;
 
     switch (arch) {
@@ -2273,24 +2276,76 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
+                        if (cparams.kv_paged) {
+                            GGML_ASSERT(!cparams.kv_unified && "conflicting parameters: kv_unified cannot be used with kv_paged.");
+                            GGML_ASSERT(cparams.n_ubatch == cparams.n_batch && "kv_paged requires n_ubatch == n_batch.");
+                            LLAMA_LOG_INFO("%s: Detected kv_paged=%d, creating llama_kv_cache_paged.\n", __func__, cparams.kv_paged);
+                            const uint32_t head_dim   = hparams.n_embd_head_v();
+                            const uint32_t n_head     = hparams.n_head_kv();
+                            const uint32_t n_layers   = hparams.n_layer();
+                            const uint32_t block_size = cparams.block_size;
 
-                        res = new llama_kv_cache(
-                                *this,
-                                hparams,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                1,
-                                hparams.n_swa,
-                                hparams.swa_type,
-                                nullptr,
-                                filter,
-                                nullptr,
-                                nullptr);
+                            const uint32_t n_gpu_blocks = cparams.n_gpu_blocks;
+                            const uint32_t n_cpu_blocks = cparams.n_cpu_blocks;
+                            const float    watermark    = cparams.kv_paged_watermark;
+
+                            const uint32_t n_ubatch  = cparams.n_ubatch;
+                            const uint32_t n_seq_max = cparams.n_seq_max;
+
+                            auto * paged_cache = new llama_kv_cache_paged(head_dim, n_head, block_size, n_layers, n_ubatch, n_seq_max);
+                            GGML_ASSERT(paged_cache && "unable to create paged KV cache.");
+
+                            // Split across devices only if the layers actually span more
+                            // than one backend; otherwise take the original single-device
+                            // path unchanged so it cannot regress.
+                            bool multi_dev = false;
+                            if (layer_backends.size() == n_layers) {
+                                for (uint32_t il = 1; il < n_layers; ++il) {
+                                    if (layer_backends[il] != layer_backends[0]) { multi_dev = true; break; }
+                                }
+                            }
+
+                            if (multi_dev) {
+                                paged_cache->init_multi(
+                                    layer_backends,
+                                    backend_cpu,
+                                    params.type_k,
+                                    n_gpu_blocks,
+                                    n_cpu_blocks,
+                                    watermark);
+                            } else {
+                                paged_cache->init(
+                                    backend_gpu,
+                                    backend_cpu,
+                                    params.type_k,
+                                    n_gpu_blocks,
+                                    n_cpu_blocks,
+                                    watermark);
+                            }
+
+                            res = paged_cache;
+                        } else {
+                            // NOTE: rebased onto current mainline. The upstream ctor gained
+                            // `hparams` and a `filter` argument since this branch was written,
+                            // so this is HEAD's call, not the one the original commit carried.
+                            res = new llama_kv_cache(
+                                    *this,
+                                    hparams,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    1,
+                                    hparams.n_swa,
+                                    hparams.swa_type,
+                                    nullptr,
+                                    filter,
+                                    nullptr,
+                                    nullptr);
+                        }
                     }
                 }
             }

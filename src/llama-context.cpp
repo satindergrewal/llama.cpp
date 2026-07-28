@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include <algorithm>
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -78,6 +80,39 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+namespace {
+// Returns empty string on success, or an error message describing why
+// paged KV cache cannot be used with the current model placement.
+std::string validate_paged_kv_placement(const llama_model & model) {
+    std::set<ggml_backend_dev_t> devs_used;
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        if (dev != nullptr) {
+            devs_used.insert(dev);
+        }
+    }
+
+    // A layer-split across devices IS supported now: llama_kv_cache_paged::init_multi
+    // allocates one context+buffer per device and places layer il on dev_layer(il).
+    // Uniform n_gpu_blocks per device keeps block ids device-agnostic, so the block
+    // table, scheduler and attention kernel are untouched.
+    if (false && devs_used.size() > 1) {
+        std::string dev_list;
+        for (auto * d : devs_used) {
+            if (!dev_list.empty()) dev_list += ", ";
+            dev_list += ggml_backend_dev_name(d);
+        }
+        return format(
+            "paged KV cache (--kv-paged) currently requires all model layers "
+            "to live on a single device, but the model is split across %zu "
+            "devices (%s). Re-run with `-sm none -mg <gpu_id>` to pin the "
+            "model to one device, or omit --kv-paged.",
+            devs_used.size(), dev_list.c_str());
+    }
+
+    return {};
+}
+} // namespace
 
 llama_context::llama_context(
         const llama_model & model,
@@ -267,6 +302,11 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_paged   = params.kv_paged;
+    cparams.block_size = params.block_size;
+    cparams.n_gpu_blocks = params.n_gpu_blocks;
+    cparams.n_cpu_blocks = params.n_cpu_blocks;
+    cparams.kv_paged_watermark = params.kv_paged_watermark;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -387,7 +427,75 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
+        ggml_backend_t gpu_handle = nullptr;
+        if (cparams.kv_paged) {
+            std::string err = validate_paged_kv_placement(model);
+            if (!err.empty()) {
+                LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
+                throw std::runtime_error(err);
+            }
+            // Find the first non-CPU backend to use as the primary GPU/Compute backend
+            for (auto & b : backends) {
+                if (ggml_backend_get_device(b.get()) &&
+                    ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    gpu_handle = b.get();
+                    break;
+                }
+            }
+            // Fallback: If no GPU, use CPU for both
+            if (!gpu_handle) {
+                gpu_handle = backend_cpu;
+            }
+        }
+
+        // Map each layer to the backend that owns its device, so paged KV can place
+        // layer il's cache on the same card as layer il. llama.cpp splits by LAYER,
+        // so this is a straight per-layer lookup rather than a head-slice split.
+        std::vector<ggml_backend_t> layer_backends;
+        if (cparams.kv_paged) {
+            layer_backends.resize(hparams.n_layer());
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                ggml_backend_dev_t dev_l = model.dev_layer(il);
+                ggml_backend_t     be    = gpu_handle;   // fallback
+                for (auto & b : backends) {
+                    if (ggml_backend_get_device(b.get()) == dev_l) {
+                        be = b.get();
+                        break;
+                    }
+                }
+                layer_backends[il] = be;
+            }
+
+            // Report what we resolved, so a silent fallback to the single-device path
+            // is visible instead of looking like success.
+            std::vector<ggml_backend_t> distinct;
+            for (auto * b : layer_backends) {
+                if (std::find(distinct.begin(), distinct.end(), b) == distinct.end()) {
+                    distinct.push_back(b);
+                }
+            }
+            LLAMA_LOG_INFO("%s: kv_paged layer->backend map: %u layers over %zu distinct backend(s)\n",
+                           __func__, (uint32_t) layer_backends.size(), distinct.size());
+            for (size_t d = 0; d < distinct.size(); ++d) {
+                size_t n = 0;
+                for (auto * b : layer_backends) { if (b == distinct[d]) n++; }
+                ggml_backend_dev_t dv = ggml_backend_get_device(distinct[d]);
+                LLAMA_LOG_INFO("%s:   backend %s (dev %s): %zu layer(s)\n", __func__,
+                               ggml_backend_name(distinct[d]),
+                               dv ? ggml_backend_dev_name(dv) : "null", n);
+            }
+            // and what the model itself says about device placement
+            {
+                std::vector<ggml_backend_dev_t> ddev;
+                for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                    ggml_backend_dev_t d = model.dev_layer(il);
+                    if (std::find(ddev.begin(), ddev.end(), d) == ddev.end()) ddev.push_back(d);
+                }
+                LLAMA_LOG_INFO("%s:   model.dev_layer spans %zu distinct device(s)\n", __func__, ddev.size());
+            }
+        }
+
+        memory.reset(model.create_memory(params_mem, cparams, gpu_handle, backend_cpu, layer_backends));
     }
 
     // init backends
@@ -758,6 +866,10 @@ uint32_t llama_context::n_ubatch() const {
 
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
+}
+
+uint32_t llama_context::block_size() const {
+    return cparams.block_size;
 }
 
 uint32_t llama_context::n_threads() const {
@@ -3499,6 +3611,11 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_paged                    =*/ false,
+        /*.block_size                  =*/ 16,
+        /*.n_gpu_blocks                =*/ 0,
+        /*.n_cpu_blocks                =*/ 0,
+        /*.kv_paged_watermark          =*/ 0.05,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

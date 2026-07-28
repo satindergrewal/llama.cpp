@@ -110,7 +110,7 @@ llama_model_mistral3::graph::graph(const llama_model & model, const llm_graph_pa
         inp_attn_scale = build_inp_attn_scale();
     }
 
-    auto * inp_attn = build_attn_inp_kv();
+    auto * inp_attn = build_attn_inp_kv_auto();
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 

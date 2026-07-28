@@ -2645,9 +2645,6 @@ static common_chat_params common_chat_params_init_minimax_m3(const common_chat_t
     return data;
 }
 
-    return data;
-}
-
 namespace workaround {
 
 static void map_developer_role_to_system(json & messages) {

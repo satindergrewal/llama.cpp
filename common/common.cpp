@@ -1214,6 +1214,81 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+static void common_fit_paged_kv_blocks(common_params& params, const llama_model * model) {
+    GGML_ASSERT(model && "model must be loaded before fitting paged KV blocks.");
+    // Every device holding layers allocates the SAME number of blocks, because a block
+    // id must be valid on all of them. So the pool has to be sized off the MOST
+    // CONSTRAINED device, not the first one found. Sizing off device 0 on an
+    // asymmetric split (e.g. 97.8 GiB free on one card, 57.0 on the other) hands out
+    // blocks the second card cannot back, and it OOMs while the first reports space.
+    size_t free_vram  = 0;
+    size_t total_vram = 0;
+    size_t n_gpus     = 0;
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (!d || ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        size_t d_free = 0, d_total = 0;
+        ggml_backend_dev_memory(d, &d_free, &d_total);
+        LOG_INF("%s: device %s: %.1f MiB free of %.1f MiB\n", __func__,
+                ggml_backend_dev_name(d), d_free / 1024.0f / 1024.0f, d_total / 1024.0f / 1024.0f);
+        if (n_gpus == 0 || d_free < free_vram) {
+            free_vram  = d_free;
+            total_vram = d_total;
+        }
+        n_gpus++;
+    }
+
+    if (n_gpus == 0) {
+        LOG_WRN("%s: no GPU device found, cannot fit paged KV blocks.\n", __func__);
+        return;
+    }
+    if (n_gpus > 1) {
+        LOG_INF("%s: %zu GPUs; sizing the block pool off the most constrained "
+                "(%.1f MiB free) so a block id is valid on every device\n",
+                __func__, n_gpus, free_vram / 1024.0f / 1024.0f);
+    }
+
+    const uint32_t n_heads_kv = llama_model_n_head_kv(model);
+    const uint32_t n_layers   = llama_model_n_layer(model);
+    const uint32_t head_dim   = llama_model_n_embd(model) / llama_model_n_head(model);
+    const uint32_t block_size = params.block_size;
+
+    const size_t bytes_per_block = (size_t)2 * head_dim * n_heads_kv * block_size * n_layers * ggml_type_size(GGML_TYPE_F16);
+
+    const size_t margin = params.fit_params_target.empty()
+        ? (size_t)(total_vram * 0.05f)
+        : (size_t)params.fit_params_target[0];
+
+    if (free_vram <= margin) {
+        LOG_ERR("%s: not enough free VRAM for paged KV blocks. "
+                "free_vram=%.1f MiB <= margin=%.1f MiB. "
+                "Try reducing --margin or offloading fewer layers to GPU.\n",
+                __func__, free_vram / 1024.0f / 1024.0f, margin    / 1024.0f / 1024.0f);
+        return; // leave params.n_gpu_blocks at its existing value
+    }
+
+    const size_t available = (free_vram > margin) ? free_vram - margin : 0;
+
+    if (bytes_per_block == 0 || available < bytes_per_block) {
+        LOG_ERR("%s: available VRAM (%.1f MiB) is less than one block (%.1f MiB). "
+                "Try increasing n_gpu_blocks manually or reducing block_size.\n",
+                __func__, available      / 1024.0f / 1024.0f, bytes_per_block / 1024.0f / 1024.0f);
+        return;
+    }
+
+    const uint32_t n_gpu_blocks = (uint32_t)(available / bytes_per_block);
+    const uint32_t n_cpu_blocks = (uint32_t)(n_gpu_blocks * params.cpu_to_gpu_blocks_ratio);
+
+    LOG_INF("%s: free_vram=%0.1f MiB, bytes_per_block=%ld, n_gpu_blocks=%d, n_cpu_blocks=%d\n",
+            __func__, free_vram / 1024.0f / 1024.0f, bytes_per_block, n_gpu_blocks, n_cpu_blocks);
+
+    params.n_gpu_blocks = n_gpu_blocks;
+    params.n_cpu_blocks = n_cpu_blocks;
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1239,6 +1314,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (model_only) {
         return;
+    }
+
+    if (params.fit_params && params.kv_paged) {
+        LOG_INF("%s: fitting KV paged params to device memory\n", __func__);
+        common_fit_paged_kv_blocks(params, pimpl->model.get());
+        cparams = common_context_params_to_llama(params); // re-derive to reflect the fit
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1615,6 +1696,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+
+    // --kv-paged (rebased in): the block pool is sized from these.
+    cparams.kv_paged                = params.kv_paged;
+    cparams.block_size              = params.block_size;
+    cparams.n_gpu_blocks            = params.n_gpu_blocks;
+    cparams.n_cpu_blocks            = params.n_cpu_blocks;
+    cparams.kv_paged_watermark      = params.kv_paged_watermark;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
