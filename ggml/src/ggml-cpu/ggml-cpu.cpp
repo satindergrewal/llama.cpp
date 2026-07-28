@@ -465,6 +465,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
+        case GGML_OP_FLASH_ATTN_EXT_DSA:
+            return false; // gathered top-k attention is implemented in the CUDA backend only
         case GGML_OP_OUT_PROD:
             return (src0->type == GGML_TYPE_F32 ||
                     ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
