@@ -256,14 +256,18 @@ static void dsa_soft_max_f16_cuda(half * x, const half * mask, const int ncols_x
 // (~sqrt(k) for the PV gemm, where k = top_k). LLAMA_DSA_F32ACC=1 switches to
 // cublasGemmStridedBatchedEx with CUBLAS_COMPUTE_32F: identical shapes, strides, batch
 // count, transposes and stream, identical fp16 storage for A/B/C, but the dot products
-// accumulate in fp32. Default is off, so the fp16 path is bit-for-bit what it always was.
+// accumulate in fp32. Default is on; LLAMA_DSA_F32ACC=0 restores the original
+// fp16-accumulate path bit-for-bit.
 //
 // Note this fixes accumulation only. The KQ and KQV buffers are still fp16, so a rounding
 // floor from those stores remains either way.
 static bool dsa_f32_acc_enabled() {
     static const bool enabled = []() {
+        // default ON: measured 1.9-3.6x error reduction (rel_L2 flat ~3.1e-4 across
+        // top_k, better than stock FA vs the same fp64 reference) at -0.8% median
+        // throughput on the box. LLAMA_DSA_F32ACC=0 restores fp16 accumulate.
         const char * s = getenv("LLAMA_DSA_F32ACC");
-        return s != nullptr && s[0] != '\0' && s[0] != '0';
+        return s == nullptr || s[0] == '\0' || s[0] != '0';
     }();
     return enabled;
 }
