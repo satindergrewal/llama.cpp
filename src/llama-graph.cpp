@@ -13,6 +13,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -2836,6 +2837,67 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     const auto & kq_mask = inp->get_kq_mask_mla();
+
+    // Gather path: attend to the top-k rows directly instead of widening them back
+    // out into a full-cache mask. Conditions mirror ggml_cuda_flash_attn_ext_dsa()
+    // one-for-one; every shape is known here, so an unsupported case never reaches
+    // the backend (where it would hit the CPU abort).
+    static const bool dsa_gather_env = []() {
+        const char * s = getenv("LLAMA_DSA_GATHER");
+        return s != nullptr && atoi(s) != 0;
+    }();
+
+    {
+        ggml_tensor * k_sel = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v_sel = ggml_view_4d(ctx0, k_sel, v_cur->ne[0], k_sel->ne[1], k_sel->ne[2], k_sel->ne[3], k_sel->nb[1], k_sel->nb[2], k_sel->nb[3], 0);
+
+        const int64_t n_top_k_sel = top_k->ne[0];
+
+        // k_sel is pre-permute [n_embd, n_head_kv, n_kv, n_stream]; the kernel sees
+        // it permuted to [n_embd, n_kv, n_head_kv, n_stream].
+        const bool dsa_gather =
+            dsa_gather_env &&
+            cparams.flash_attn && kq_b == nullptr && sinks == nullptr &&
+            n_top_k_sel % 256 == 0 &&
+            k_sel->ne[2] >= 4*n_top_k_sel &&
+            k_sel->ne[1] == 1 && k_sel->ne[3] == 1 &&
+            k_sel->ne[0] == q_cur->ne[0] &&
+            kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 &&
+            top_k->ne[1] >= q_cur->ne[2] && top_k->ne[2] == 1 && top_k->ne[3] == 1 &&
+            top_k->type == GGML_TYPE_I32 &&
+            k_sel->type == GGML_TYPE_F16 && v_sel->type == GGML_TYPE_F16 &&
+            kq_mask->type == GGML_TYPE_F16 && q_cur->type == GGML_TYPE_F32;
+
+        if (dsa_gather) {
+            ggml_tensor * qd = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
+            ggml_tensor * kd = ggml_permute(ctx0, k_sel, 0, 2, 1, 3);
+            ggml_tensor * vd = ggml_permute(ctx0, v_sel, 0, 2, 1, 3);
+
+            ggml_tensor * cur = ggml_flash_attn_ext_dsa(ctx0, qd, kd, vd, kq_mask, top_k, kq_scale);
+            cb(cur, "kqv_dsa", il);
+
+            if (v_mla) {
+                cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+                cur = ggml_mul_mat(ctx0, v_mla, cur);
+                cb(cur, "fattn_mla", il);
+                cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+                cur = ggml_cont(ctx0, cur);
+            }
+
+            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+            cb(cur, "kqv_out", il);
+
+            if (wo) {
+                cur = build_lora_mm(wo, cur, wo_s);
+            }
+
+            if (wo_b) {
+                cur = ggml_add(ctx0, cur, wo_b);
+            }
+
+            return cur;
+        }
+    }
 
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
