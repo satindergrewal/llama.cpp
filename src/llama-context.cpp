@@ -90,7 +90,11 @@ std::string validate_paged_kv_placement(const llama_model & model) {
         }
     }
 
-    if (devs_used.size() > 1) {
+    // A layer-split across devices IS supported now: llama_kv_cache_paged::init_multi
+    // allocates one context+buffer per device and places layer il on dev_layer(il).
+    // Uniform n_gpu_blocks per device keeps block ids device-agnostic, so the block
+    // table, scheduler and attention kernel are untouched.
+    if (false && devs_used.size() > 1) {
         std::string dev_list;
         for (auto * d : devs_used) {
             if (!dev_list.empty()) dev_list += ", ";
@@ -442,7 +446,26 @@ llama_context::llama_context(
             }
         }
 
-        memory.reset(model.create_memory(params_mem, cparams, gpu_handle, backend_cpu));
+        // Map each layer to the backend that owns its device, so paged KV can place
+        // layer il's cache on the same card as layer il. llama.cpp splits by LAYER,
+        // so this is a straight per-layer lookup rather than a head-slice split.
+        std::vector<ggml_backend_t> layer_backends;
+        if (cparams.kv_paged) {
+            layer_backends.resize(hparams.n_layer());
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                ggml_backend_dev_t dev_l = model.dev_layer(il);
+                ggml_backend_t     be    = gpu_handle;   // fallback
+                for (auto & b : backends) {
+                    if (ggml_backend_get_device(b.get()) == dev_l) {
+                        be = b.get();
+                        break;
+                    }
+                }
+                layer_backends[il] = be;
+            }
+        }
+
+        memory.reset(model.create_memory(params_mem, cparams, gpu_handle, backend_cpu, layer_backends));
     }
 
     // init backends
