@@ -1,0 +1,6 @@
+set(TARGET llama-frontend-audit)
+add_executable(${TARGET} frontend-audit.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/tools/server ${CMAKE_SOURCE_DIR}/tools/mtmd ${CMAKE_SOURCE_DIR})
+target_link_libraries(${TARGET} PRIVATE server-context llama-common ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
