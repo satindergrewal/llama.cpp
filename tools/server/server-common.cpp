@@ -9,6 +9,8 @@
 
 #include "server-common.h"
 
+#include <map>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -767,6 +769,197 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, mtmd_co
    }
 }
 
+//
+// typed segments  (see server-common.h)
+//
+
+bool typed_segments_enabled() {
+    static const bool enabled = []() {
+        const char * v = getenv("LLAMA_TYPED_SEGMENTS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+// sentinel alphabet is deliberately [A-Za-z0-9] only, so it survives the string
+// operations chat templates routinely perform on content (strip, split, tojson)
+static std::string typed_segments_nonce() {
+    static const char * ALPHA = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    static std::mt19937_64 rng(std::random_device{}());
+    std::string s = "zZq";
+    for (int i = 0; i < 24; i++) {
+        s += ALPHA[rng() % 62];
+    }
+    return s + "qZz";
+}
+
+std::vector<std::pair<std::string, std::string>> typed_segments_mask(json & messages) {
+    std::vector<std::pair<std::string, std::string>> subs;
+    if (!typed_segments_enabled() || !messages.is_array()) {
+        return subs;
+    }
+
+    const std::string nonce = typed_segments_nonce();
+    size_t idx = 0;
+
+    auto mask_one = [&](const std::string & text) {
+        // empty content carries no injection surface, and masking it could flip a
+        // template's `if content` branch
+        if (text.empty()) {
+            return text;
+        }
+        std::string sentinel = nonce + std::to_string(idx++) + "S";
+        subs.emplace_back(sentinel, text);
+        return sentinel;
+    };
+
+    for (auto & msg : messages) {
+        const std::string role = json_value(msg, "role", std::string());
+        // only the content the operator does not control: user turns and tool results
+        if (role != "user" && role != "tool") {
+            continue;
+        }
+        if (!msg.contains("content")) {
+            continue;
+        }
+        json & content = msg.at("content");
+        if (content.is_string()) {
+            content = mask_one(content.get<std::string>());
+        } else if (content.is_array()) {
+            for (auto & part : content) {
+                if (part.is_object()
+                    && json_value(part, "type", std::string()) == "text"
+                    && part.contains("text") && part.at("text").is_string()) {
+                    part["text"] = mask_one(part.at("text").get<std::string>());
+                }
+            }
+        }
+    }
+
+    return subs;
+}
+
+json typed_segments_split(const std::string & prompt,
+                          const std::vector<std::pair<std::string, std::string>> & subs) {
+    json segments = json::array();
+
+    size_t cursor = 0;
+    for (const auto & sub : subs) {
+        const std::string & sentinel = sub.first;
+        const std::string & original = sub.second;
+
+        const size_t at = prompt.find(sentinel, cursor);
+        if (at == std::string::npos) {
+            // template dropped, reordered or mangled this content; we cannot build
+            // a faithful segment map -> caller falls back to the legacy path
+            throw std::runtime_error("sentinel not found in rendered prompt");
+        }
+        if (at > cursor) {
+            segments.push_back({{"text", prompt.substr(cursor, at - cursor)}, {"special", true}});
+        }
+        segments.push_back({{"text", original}, {"special", false}});
+        cursor = at + sentinel.size();
+    }
+    if (cursor < prompt.size()) {
+        const std::string tail = prompt.substr(cursor);
+        if (!subs.empty() && tail.find(subs.front().first.substr(0, 27)) != std::string::npos) {
+            throw std::runtime_error("unconsumed sentinel in rendered prompt");
+        }
+        segments.push_back({{"text", tail}, {"special", true}});
+    }
+
+    return segments;
+}
+
+// texts of every control / user-defined token in the vocab, cached per vocab
+static const std::vector<std::string> & typed_segments_control_texts(const llama_vocab * vocab) {
+    static std::mutex mtx;
+    static std::map<const llama_vocab *, std::vector<std::string>> cache;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = cache.find(vocab);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    std::vector<std::string> texts;
+    const int n = llama_vocab_n_tokens(vocab);
+    for (int i = 0; i < n; i++) {
+        const llama_token_attr attr = llama_vocab_get_attr(vocab, i);
+        if (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+            std::string t = common_token_to_piece(vocab, i, true);
+            if (!t.empty()) {
+                texts.push_back(std::move(t));
+            }
+        }
+    }
+    return cache.emplace(vocab, std::move(texts)).first->second;
+}
+
+static void push_span(std::vector<std::pair<std::string, bool>> & merged, std::string text, bool special) {
+    if (text.empty()) {
+        return;
+    }
+    if (!merged.empty() && merged.back().second == special) {
+        merged.back().first += text;
+    } else {
+        merged.emplace_back(std::move(text), special);
+    }
+}
+
+server_tokens tokenize_input_segments(const llama_vocab * vocab, const json & segments, bool add_special) {
+    // Splitting the prompt costs the BPE merges that would have happened across each
+    // seam. A structural span containing no control token at all is not a real
+    // boundary, so demote it to content and merge it with its neighbours; ordinary
+    // prompts then tokenize byte-for-byte as before, and seams remain only where a
+    // control token already forces one.
+    std::vector<std::pair<std::string, bool>> merged; // (text, parse_special)
+
+    for (const auto & seg : segments) {
+        std::string text    = json_value(seg, "text", std::string());
+        bool        special = json_value(seg, "special", true);
+        if (text.empty()) {
+            continue;
+        }
+        if (special) {
+            // trim the span down to the part that actually holds control tokens; the
+            // plain text on either side belongs with its neighbouring content span
+            const auto & ctrl = typed_segments_control_texts(vocab);
+            size_t lo = std::string::npos;
+            size_t hi = 0;
+            for (const auto & c : ctrl) {
+                size_t at = text.find(c);
+                while (at != std::string::npos) {
+                    lo = std::min(lo, at);
+                    hi = std::max(hi, at + c.size());
+                    at = text.find(c, at + 1);
+                }
+            }
+            if (lo == std::string::npos) {
+                special = false; // no control tokens in this span at all
+            } else {
+                if (lo > 0) {
+                    push_span(merged, text.substr(0, lo), false);
+                }
+                if (hi < text.size()) {
+                    push_span(merged, text.substr(lo, hi - lo), true);
+                    push_span(merged, text.substr(hi), false);
+                    continue;
+                }
+                text = text.substr(lo);
+            }
+        }
+        push_span(merged, text, special);
+    }
+
+    llama_tokens out;
+    bool first = true;
+    for (const auto & m : merged) {
+        llama_tokens t = common_tokenize(vocab, m.first, add_special && first, m.second);
+        first = false;
+        out.insert(out.end(), t.begin(), t.end());
+    }
+    return server_tokens(out, false);
+}
+
 std::vector<server_tokens> tokenize_input_prompts(const llama_vocab * vocab, mtmd_context * mctx, const json & json_prompt, bool add_special, bool parse_special) {
     std::vector<server_tokens> result;
     if (json_prompt.is_array() && !json_is_array_and_contains_numbers(json_prompt)) {
@@ -1034,6 +1227,9 @@ json oaicompat_chat_params_parse(
 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
 
+    // typed segments: swap user/tool content for sentinels before rendering
+    const auto typed_subs = typed_segments_mask(messages);
+
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
@@ -1101,6 +1297,13 @@ json oaicompat_chat_params_parse(
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
+    if (!typed_subs.empty()) {
+        try {
+            llama_params["prompt_segments"] = typed_segments_split(chat_params.prompt, typed_subs);
+        } catch (const std::exception & e) {
+            SRV_WRN("typed segments disabled for this request: %s\n", e.what());
+        }
+    }
     if (!chat_params.grammar.empty()) {
         llama_params["grammar"]      = chat_params.grammar;
         llama_params["grammar_type"] = std::string("tool_calls");

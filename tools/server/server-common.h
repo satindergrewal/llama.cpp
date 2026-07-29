@@ -281,6 +281,30 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, const std::string & promp
  * - "prompt": [[12, 34, 56], [78, 90, 12]]
  * - "prompt": [[12, 34, "string", 56, 78], [12, 34, 56], { "prompt_string": "string", "multimodal_data": [ "base64" ]}]
  */
+// Typed-segment tokenization (opt-in via LLAMA_TYPED_SEGMENTS=1).
+//
+// llama-server tokenizes the whole rendered chat prompt with parse_special=true,
+// so control-token text that appears inside user or tool content (e.g.
+// "<|assistant|>" in a file an agent just read) becomes a real control token.
+// Structural tokens must keep parse_special=true; role content must not.
+// We render the template with each piece of user/tool content replaced by an
+// unguessable sentinel, split the rendered prompt on those sentinels, and
+// tokenize each span with the appropriate flag.
+bool typed_segments_enabled();
+
+// Replace the text content of user/tool messages with sentinels, in place.
+// Returns sentinel -> original text in creation order; empty when disabled.
+std::vector<std::pair<std::string, std::string>> typed_segments_mask(json & messages);
+
+// Split a rendered prompt on those sentinels -> [{"text":..,"special":bool},..].
+// Throws if a sentinel was mangled, so the caller can fall back to the legacy path.
+json typed_segments_split(const std::string & prompt,
+                          const std::vector<std::pair<std::string, std::string>> & subs);
+
+// Tokenize a segment list: special spans with parse_special=true, content spans
+// with parse_special=false. add_special applies to the first span only.
+server_tokens tokenize_input_segments(const llama_vocab * vocab, const json & segments, bool add_special);
+
 std::vector<server_tokens> tokenize_input_prompts(
                                         const llama_vocab * vocab,
                                         mtmd_context * mctx,

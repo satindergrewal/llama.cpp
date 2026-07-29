@@ -4057,6 +4057,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+        } else if (data.contains("prompt_segments")) {
+            // typed segments: structural spans keep parse_special, role content does not
+            inputs.push_back(tokenize_input_segments(ctx_server.vocab, data.at("prompt_segments"), true));
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
