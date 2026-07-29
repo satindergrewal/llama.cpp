@@ -122,9 +122,9 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader & ml) {
 
     for (int i = 0; i < n_layer_all; ++i) {
         // NextN/MTP layers (i >= n_layer) are full decoder blocks used by the
-        // LLM_GRAPH_TYPE_DECODER_MTP draft head, so they must actually be LOADED,
-        // not TENSOR_SKIP'd as upstream does. trunk_flags/mtp_flags additionally
-        // allow either side to be absent when target and draft live in split files.
+        // LLM_GRAPH_TYPE_DECODER_MTP draft head; load them like qwen35moe/step35/hy_v3.
+        // trunk_flags/mtp_flags additionally allow either side to be absent when the
+        // target and the draft live in separate files.
         const int flags = (i >= n_layer) ? mtp_flags : trunk_flags;
 
         auto & layer = layers[i];
@@ -178,7 +178,7 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
         }
 
-        // NextN/MTP tensors (preserved but unused) - conditionally load for last n_layer_nextn
+        // NextN/MTP tensors - the NextN-specific wiring around the extra decoder block
         if (i >= n_layer) {
             layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), { 2 * n_embd, n_embd }, flags);
             layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM, "weight", i), { n_embd }, flags);
@@ -193,6 +193,9 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader & ml) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_glm_dsa::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
@@ -480,7 +483,9 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
                         Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, top_k, kq_scale, il);
             }
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        // when unmasked nextn embeddings are requested, t_h_nextn must keep all rows,
+        // so the early output masking has to be skipped (it is applied after the final norm instead)
+        if (il == n_layer - 1 && inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -542,6 +547,14 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
     cur = inpL;
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+
+    // post-norm hidden state feeds the NextN/MTP draft head
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
@@ -749,15 +762,18 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
         (llama_expert_gating_func_type) hparams.expert_gating_func,
         il,
         nullptr,
-        layer.ffn_gate_up_exps);
+        layer.ffn_gate_up_exps,
+        layer.ffn_up_exps_s,
+        layer.ffn_gate_exps_s,
+        layer.ffn_down_exps_s);
     cb(moe_out, "mtp_ffn_moe_out", il);
 
     // FFN shared expert
     ggml_tensor * ffn_shexp =
         build_ffn(cur,
-            layer.ffn_up_shexp, NULL, NULL,
-            layer.ffn_gate_shexp, NULL, NULL,
-            layer.ffn_down_shexp, NULL, NULL,
+            layer.ffn_up_shexp, NULL, layer.ffn_up_shexp_s,
+            layer.ffn_gate_shexp, NULL, layer.ffn_gate_shexp_s,
+            layer.ffn_down_shexp, NULL, layer.ffn_down_shexp_s,
             NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
     cb(ffn_shexp, "mtp_ffn_shexp", il);
 
