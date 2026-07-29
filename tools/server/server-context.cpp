@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -38,6 +39,11 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// budget on the total number of tokens in a speculative verify batch, used to scale
+// the draft length down as more slots become active. see [TAG_SPEC_ADAPTIVE_NDRAFT]
+// in update_slots() for the cost model this comes from. 0 disables the adaptation.
+constexpr int SERVER_SPEC_BATCH_BUDGET_DEFAULT = 8;
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -2967,6 +2973,62 @@ private:
                 }
             }
         });
+
+        // adapt the draft length to how busy the batch is [TAG_SPEC_ADAPTIVE_NDRAFT]
+        //
+        // speculative decoding buys fewer forward passes at the price of a wider verify
+        // batch. that trade only pays while the target forward pass is dominated by its
+        // fixed cost (weight traffic, attention, kernel launches) rather than by the
+        // per-token cost. measured on GLM-5.2 744B IQ1_S, decode step vs total batch
+        // tokens B, taken from the server itself at np 1/2/4/8:
+        //
+        //   step(B) ~= 13.1 ms + 6.4 ms * B     B = total tokens in the verify batch
+        //
+        // at B=1 the fixed part is ~67% of the step, so extra draft tokens are nearly
+        // free and speculation wins big (+23% measured at np1). with n_active slots
+        // each drafting n tokens, B = n_active * (1 + n): a busy server is already past
+        // that free regime, so every extra draft token costs close to full price while
+        // only acceptance[k] of them survive. measured at np4, drafting 3 tokens per
+        // slot cost 31% of throughput versus not drafting at all.
+        //
+        // holding B under a budget keeps the server in the regime where drafting still
+        // pays => n = budget/n_active - 1, and n == 0 means "do not draft at all",
+        // which is the correct answer once the batch is wide enough on its own.
+        //
+        // n_active == 1 is left untouched, so single-stream behaviour is unchanged.
+        // set LLAMA_SPEC_BATCH_BUDGET=0 to restore the previous fixed-length behaviour.
+        if (spec && !drafting.empty()) {
+            static const int spec_batch_budget = [] {
+                const char * s = getenv("LLAMA_SPEC_BATCH_BUDGET");
+                const int    v = s ? atoi(s) : SERVER_SPEC_BATCH_BUDGET_DEFAULT;
+                LOG_INF("%s: speculative verify-batch budget = %d token(s)%s\n",
+                        __func__, v, v > 0 ? "" : " (adaptive draft length disabled)");
+                return v;
+            }();
+
+            const int n_active = (int) generating.size();
+
+            if (spec_batch_budget > 0 && n_active > 1) {
+                const int n_cfg  = common_speculative_n_max(&params_base.speculative);
+                const int n_adap = std::max(0, std::min(n_cfg, spec_batch_budget / n_active - 1));
+
+                for (auto * slot : drafting) {
+                    auto & dp = common_speculative_get_draft_params(spec.get(), slot->id);
+
+                    if (n_adap == 0) {
+                        // note: dp.n_max == 0 means "no limit" downstream, so a slot that
+                        // should not draft has to be switched off explicitly. it stays in
+                        // `drafting` and simply produces an empty draft, which the code
+                        // below already handles.
+                        dp.drafting = false;
+                        continue;
+                    }
+
+                    // never grow past the context-limited cap already stored in dp.n_max
+                    dp.n_max = std::min(dp.n_max, n_adap);
+                }
+            }
+        }
 
         // generate the actual drafts (if any)
         {

@@ -156,6 +156,12 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
+    // process() runs a full draft-model decode over the whole verify batch, so its cost
+    // scales with n_active*(1 + n_draft). it used to be untracked, which hid it from the
+    // stats line entirely. [TAG_SPEC_ADAPTIVE_NDRAFT]
+    size_t  n_call_process = 0;
+    int64_t t_process_us   = 0; // total time spent in process() in microseconds.
+
     common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
 
     virtual ~common_speculative_impl() = default;
@@ -1615,7 +1621,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                // honor the per-sequence n_max override, not just the global config.
+                // common_speculative_draft() truncates the result to dp.n_max afterwards,
+                // but truncating there has already paid for the draft decode; stopping
+                // here also saves the ctx_dft forward pass and the per-seq sampling.
+                // mirrors the draft-simple impl. [TAG_SPEC_ADAPTIVE_NDRAFT]
+                if ((params.n_max <= (int) result.size()) ||
+                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2564,6 +2576,8 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     for (auto & impl : spec->impls) {
+        common_time_meas tm(impl->t_process_us, !impl->gen_perf);
+        impl->n_call_process++;
         result = result && impl->process(batch);
     }
 
@@ -2748,8 +2762,10 @@ void common_speculative_print_stats(const common_speculative * spec) {
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(3) << impl->t_begin_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
-            oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
-            str_perf = ", dur(b,g,a) = " + oss.str() + " ms";
+            oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0 << ", ";
+            oss << std::fixed << std::setprecision(3) << impl->t_process_us / 1000.0;
+            str_perf = ", dur(b,g,a,p) = " + oss.str() + " ms, #calls(p) = " +
+                       std::to_string(impl->n_call_process);
         } else {
             str_perf = "";
         }
