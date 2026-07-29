@@ -392,6 +392,17 @@ bool ggml_cuda_flash_attn_ext_dsa(ggml_backend_cuda_context & ctx, ggml_tensor *
         CUDA_CHECK(cudaGetLastError());
     }
 
+    // one-shot execution proof. Deliberately fprintf, not the ggml/llama logger:
+    // llama-context mutes the logger during probe reserves, which can swallow a
+    // one-shot exactly once (measured: the graph-build INFO line never surfaced
+    // while the graph itself provably contained the op).
+    static bool dsa_exec_logged = false;
+    if (!dsa_exec_logged) {
+        dsa_exec_logged = true;
+        fprintf(stderr, "ggml_cuda_flash_attn_ext_dsa: EXEC (n_kv=%lld, top_k=%lld, f32acc=%d)\n",
+                (long long) K->ne[1], (long long) indexer->ne[0], dsa_f32_acc_enabled() ? 1 : 0);
+    }
+
     const int nstep = (Q->ne[1] + max_rows - 1)/max_rows;
 
     for (int istep = 0; istep < nstep; ++istep) {
