@@ -46,10 +46,26 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
 
     LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+    // Only "full" indexer layers ever write into this cache: the cpy_k above is guarded by
+    // hparams.is_indexer_full(il), and "shared" layers reuse the previous full layer's top_k.
+    // Allocating all layers wastes (n_layer - n_full) x n_ctx x indexer_head_size x 2 bytes,
+    // which on GLM-5.2 (20 full of 79) is 1.78 GiB at 128K and 14.2 GiB at 1M.
+    // NOTE: must COMPOSE with any caller-supplied filter, not replace it. The GLM_DSA
+    // call site passes a non-null filter whenever the model has NextN/MTP layers, so
+    // choosing between them silently drops one of the two constraints.
+    const auto & hp_full = model.hparams;
+    llama_memory_i::layer_filter_cb filter_outer = filter;
+    llama_memory_i::layer_filter_cb filter_lid = [&hp_full, filter_outer](int32_t il) {
+        if (filter_outer && !filter_outer(il)) {
+            return false;
+        }
+        return hp_full.is_indexer_full(il);
+    };
+
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter_lid, reuse, nullptr);
 }
 
 void llama_kv_cache_dsa::clear(bool data) {
