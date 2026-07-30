@@ -1253,7 +1253,12 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
 
     const uint32_t n_heads_kv = llama_model_n_head_kv(model);
     const uint32_t n_layers   = llama_model_n_layer(model);
-    const uint32_t head_dim   = llama_model_n_embd(model) / llama_model_n_head(model);
+    // MUST match what llama_kv_cache_paged actually allocates, which uses
+    // hparams.n_embd_head_v(). Deriving it as n_embd/n_head assumes
+    // n_head*head_dim == n_embd - true for Llama, FALSE for Qwen3 (80 vs 128),
+    // which made the fitter under-budget by 1.60x and abort in init() on a
+    // busy card. Same assumption already fixed in llama-graph.cpp.
+    const uint32_t head_dim   = llama_model_n_embd_head_v(model);
     const uint32_t block_size = params.block_size;
 
     const size_t bytes_per_block = (size_t)2 * head_dim * n_heads_kv * block_size * n_layers * ggml_type_size(GGML_TYPE_F16);
