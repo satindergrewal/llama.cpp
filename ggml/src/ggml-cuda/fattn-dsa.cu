@@ -12,6 +12,7 @@
 //
 
 #include "fattn-dsa.cuh"
+#include "fattn-common.cuh"   // [TAG_DSA_DEQUANT_GATHER] dequantize_V_* helpers
 
 #include <algorithm>
 #include <cstdlib>
@@ -73,6 +74,60 @@ static __global__ void k_dsa_prepare_one_batch_kv(int nk, int ncol, const int * 
     k_out += (row*ncol + col)*nk;
     for (int j = threadIdx.x; j < nk; j += blockDim.x) {
         k_out[j] = k_row[j];
+    }
+}
+
+// [TAG_DSA_DEQUANT_GATHER] Same gather, but decoding a quantized K/V row in-pass.
+//
+// The gather above already materialises the selected rows into a contiguous F16 buffer for the
+// batched cuBLAS calls, touching each selected element exactly once. So decoding that element
+// from a quantized block instead of copying a half changes only how the source is read -- the
+// GEMM, the softmax and k_out's layout are all untouched. That is what makes quantized KV on the
+// gathered path cost (almost) nothing, and it is why this is worth doing at all.
+//
+// k_in is already a byte-strided const char *, so k_in + stride_k*i addresses a quantized row
+// with no arithmetic change; only the F16 cast in the original was type-specific.
+//
+// ne == 4 follows lightning-indexer.cu:92, which dequantizes K the same way.
+// Callers must guarantee nk % ggml_blck_size(type) == 0 (checked in dsa_attn_layout_ok), which
+// implies nk % ne == 0 for ne in {2,4} since every quant block size here is a multiple of 32.
+template <ggml_type type_KV, int ne>
+static __global__ void k_dsa_prepare_one_batch_kv_q(int nk, int ncol, const int * __restrict__ idx,
+        const char * __restrict__ kv_in, half * __restrict__ kv_out, size_t stride_kv, size_t stride_idx) {
+    constexpr dequantize_V_t dequantize_kv = get_dequantize_V<type_KV, half, ne>();
+
+    const int row = blockIdx.y;
+    const int col = blockIdx.x;
+    const int i   = idx[row*stride_idx + col];
+
+    const char * kv_row = kv_in + stride_kv * i;
+    kv_out += (row*ncol + col)*nk;
+
+    for (int j = threadIdx.x*ne; j < nk; j += blockDim.x*ne) {
+        dequantize_kv(kv_row, &kv_out[j], j);
+    }
+}
+
+// [TAG_DSA_DEQUANT_GATHER] type dispatch for the gather. F16 keeps the original kernel so the
+// existing, measured-good path stays bit-identical.
+static void dsa_launch_prepare_kv(ggml_type type, dim3 grid, cudaStream_t stream,
+        int nk, int ncol, const int * idx, const char * kv_in, half * kv_out,
+        size_t stride_kv, size_t stride_idx) {
+    switch (type) {
+        case GGML_TYPE_F16:
+            k_dsa_prepare_one_batch_kv<<<grid, 256, 0, stream>>>(
+                    nk, ncol, idx, kv_in, kv_out, stride_kv, stride_idx);
+            break;
+        case GGML_TYPE_Q8_0:
+            k_dsa_prepare_one_batch_kv_q<GGML_TYPE_Q8_0, 4><<<grid, 256, 0, stream>>>(
+                    nk, ncol, idx, kv_in, kv_out, stride_kv, stride_idx);
+            break;
+        case GGML_TYPE_Q4_0:
+            k_dsa_prepare_one_batch_kv_q<GGML_TYPE_Q4_0, 4><<<grid, 256, 0, stream>>>(
+                    nk, ncol, idx, kv_in, kv_out, stride_kv, stride_idx);
+            break;
+        default:
+            GGML_ABORT("dsa gather: unsupported K/V cache type %s", ggml_type_name(type));
     }
 }
 
@@ -298,6 +353,11 @@ static inline cublasStatus_t dsa_gemm_strided_batched(
 }
 
 // ik's guard logic, kept as-is: any miss means "not handled here" and must be safe.
+// [TAG_DSA_DEQUANT_GATHER] kept in lockstep with dsa_launch_prepare_kv's switch
+static inline bool dsa_kv_type_supported(ggml_type t) {
+    return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
+}
+
 static bool dsa_attn_layout_ok(int device, const ggml_tensor * dst) {
     if (!dst) {
         return false;
@@ -319,7 +379,13 @@ static bool dsa_attn_layout_ok(int device, const ggml_tensor * dst) {
     if (indexer->ne[0] % 256 != 0) return false; // no tail handling for top_k not a multiple of 256
     if (K->ne[1] < 4*indexer->ne[0]) return false; // gathering only pays off when the cache is much larger than top_k
     if (K->ne[2] > 1 || K->ne[3] > 1 || mask->ne[2] > 1 || mask->ne[3] > 1 || Q->ne[3] > 1) return false;
-    if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 || Q->type != GGML_TYPE_F32) return false;
+    // [TAG_DSA_DEQUANT_GATHER] K/V may be quantized: the gather decodes them into F16 in-pass.
+    // Only types with a dequantize_V_* helper AND a launch case in dsa_launch_prepare_kv qualify.
+    if (!dsa_kv_type_supported(K->type) || !dsa_kv_type_supported(V->type)) return false;
+    if (mask->type != GGML_TYPE_F16 || Q->type != GGML_TYPE_F32) return false;
+    // a gathered row must be a whole number of quant blocks (GLM-5.2: 576 == 18*32)
+    if (ggml_is_quantized(K->type) && (K->ne[0] % ggml_blck_size(K->type)) != 0) return false;
+    if (ggml_is_quantized(V->type) && (V->ne[0] % ggml_blck_size(V->type)) != 0) return false;
     if (K->ne[0] != Q->ne[0]) return false;
 
     // not in ik's original, added because this path indexes V and the top-k tensor directly:
@@ -411,12 +477,12 @@ bool ggml_cuda_flash_attn_ext_dsa(ggml_backend_cuda_context & ctx, ggml_tensor *
         const int nrows = last - first;
         {
             dim3 grid(indexer->ne[0], nrows, 1);
-            k_dsa_prepare_one_batch_kv<<<grid, 256, 0, stream>>>(K->ne[0], indexer->ne[0],
+            dsa_launch_prepare_kv(K->type, grid, stream, K->ne[0], indexer->ne[0],
                     (const int *)indexer->data + stride_idx*first,
                     (const char *)K->data, k16.get(), K->nb[1], stride_idx);
             CUDA_CHECK(cudaGetLastError());
             if (!is_k_view) {
-                k_dsa_prepare_one_batch_kv<<<grid, 256, 0, stream>>>(V->ne[0], indexer->ne[0],
+                dsa_launch_prepare_kv(V->type, grid, stream, V->ne[0], indexer->ne[0],
                         (const int *)indexer->data + stride_idx*first,
                         (const char *)V->data, v16.get(), V->nb[1], stride_idx);
                 CUDA_CHECK(cudaGetLastError());
