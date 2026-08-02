@@ -1398,6 +1398,65 @@ uint32_t llama_kv_cache::get_n_kv_pos_contiguous(const slot_info & sinfo, const 
     return pos_max + 1;
 }
 
+uint32_t llama_kv_cache::get_n_kv_pos_contiguous_stream(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t is) const {
+    // Per-stream variant for multi-stream ubatches: token group `is` of an equal-split
+    // ubatch must be the monotonic tail of its own stream's cells. Each stream slice gets
+    // its own banded attention call (the banded kernel aligns Q to the tail of the K VIEW,
+    // so a uniform max-tail view would misalign shorter streams - see the FA4-convention
+    // rel_dist in the banded kernels).
+    const uint32_t n_stream_cur = sinfo.n_stream();
+    if (is >= n_stream_cur || n_stream_cur == 0 || ubatch.n_tokens == 0 ||
+        ubatch.n_tokens % n_stream_cur != 0 ||
+        ubatch.pos == nullptr || ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
+        return 0;
+    }
+
+    const uint32_t spt = ubatch.n_tokens / n_stream_cur; // tokens per stream slice
+    const uint32_t i0  = is*spt;
+
+    if (ubatch.seq_id[i0] == nullptr) {
+        return 0;
+    }
+
+    const llama_seq_id seq_id = ubatch.seq_id[i0][0];
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return 0;
+    }
+
+    const uint32_t stream = seq_to_stream[seq_id];
+    if (sinfo.strm[is] < 0 || (uint32_t) sinfo.strm[is] != stream || stream >= v_cells.size()) {
+        return 0;
+    }
+
+    const auto & cells = v_cells[stream];
+
+    const llama_pos pos_max = cells.seq_pos_max(seq_id);
+    if (pos_max < 0 || pos_max >= (llama_pos) cells.size()) {
+        return 0;
+    }
+
+    // the banded op aligns this slice's Q rows to the tail of its stream's K
+    if ((uint32_t) pos_max + 1 < spt) {
+        return 0;
+    }
+
+    const llama_pos pos_start = pos_max + 1 - spt;
+    for (uint32_t i = 0; i < spt; ++i) {
+        if (ubatch.pos[i0 + i] != pos_start + (llama_pos) i ||
+            ubatch.n_seq_id[i0 + i] < 1 || ubatch.seq_id[i0 + i] == nullptr || ubatch.seq_id[i0 + i][0] != seq_id) {
+            return 0;
+        }
+    }
+
+    for (llama_pos pos = 0; pos <= pos_max; ++pos) {
+        if (cells.is_empty(pos) || cells.pos_get(pos) != pos || !cells.seq_has(pos, seq_id)) {
+            return 0;
+        }
+    }
+
+    return pos_max + 1;
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -2918,6 +2977,21 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
     }
 
     const uint32_t result = kv->get_n_kv_pos_contiguous(sinfos[i_cur], ubatches[i_cur]);
+    return result <= (uint32_t) n_kv ? result : 0;
+}
+
+uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous_stream(uint32_t is) const {
+    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
+        // reserve context: report the whole cache as position-contiguous so the worst-case
+        // graph is the banded path (mirrors get_n_kv_pos_contiguous, without its
+        // single-stream restriction - per-stream banding is what multi-stream reserves use)
+        if (kv != nullptr && lctx == nullptr) {
+            return n_kv;
+        }
+        return 0;
+    }
+
+    const uint32_t result = kv->get_n_kv_pos_contiguous_stream(sinfos[i_cur], ubatches[i_cur], is);
     return result <= (uint32_t) n_kv ? result : 0;
 }
 

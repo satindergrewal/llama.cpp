@@ -173,6 +173,10 @@ public:
     // active cell count when position p lives in physical cell p; 0 for any non-contiguous layout
     uint32_t get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const;
 
+    // per-stream variant: tail length of stream slice `is` of an equal-split multi-stream
+    // ubatch (0 if that slice is not the monotonic tail of its own stream's cells)
+    uint32_t get_n_kv_pos_contiguous_stream(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t is) const;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -379,6 +383,7 @@ public:
 
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_pos_contiguous() const;
+    uint32_t get_n_kv_pos_contiguous_stream(uint32_t is) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
