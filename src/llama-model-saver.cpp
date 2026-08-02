@@ -29,8 +29,10 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_LAGUNA:
-        case LLM_ARCH_INKLING:
             return false;
+        // LLM_ARCH_INKLING supported for the explicit-KV path (test-llama-archs supplies its
+        // six arch-specific keys); the save-from-model path does not re-emit loader-side
+        // extra keys for any arch, so inkling is no worse off than the rest.
         default:
             return true;
     }
@@ -270,6 +272,22 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT,  hparams.n_rel_attn_bkts);
     add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,          hparams.n_swa);
     // add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,  ???);
+    // ^ the generic re-emit is unresolved (scalar-modulo vs per-layer-array semantics differ
+    //   by arch). For INKLING the loader reads it via get_key_or_arr, so the expanded
+    //   per-layer array is the faithful form; emitted arch-scoped below with its other keys.
+    if (model->arch == LLM_ARCH_INKLING) {
+        std::vector<uint32_t> swa_pattern(hparams.n_layer());
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            swa_pattern[il] = hparams.is_swa_impl[il];
+        }
+        add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_pattern);
+        add_kv(LLM_KV_INKLING_D_REL,             hparams.inkling_d_rel);
+        add_kv(LLM_KV_INKLING_REL_EXTENT,        hparams.inkling_rel_extent);
+        add_kv(LLM_KV_INKLING_REL_EXTENT_SWA,    hparams.inkling_rel_extent_swa);
+        add_kv(LLM_KV_INKLING_SHORTCONV_KERNEL,  hparams.n_shortconv_l_cache);
+        add_kv(LLM_KV_INKLING_DENSE_BLOCK_COUNT, hparams.n_layer_dense_lead);
+        add_kv(LLM_KV_INKLING_LOGIT_SCALE_DENOM, 1.0f / hparams.f_logit_scale);
+    }
     add_kv(LLM_KV_ATTENTION_SCALE,                   hparams.f_attention_scale);
     add_kv(LLM_KV_ATTENTION_OUTPUT_SCALE,            hparams.f_attn_out_scale);
     add_kv(LLM_KV_ATTENTION_VALUE_SCALE,             hparams.f_attn_value_scale);

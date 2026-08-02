@@ -172,6 +172,19 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         // partial rotary: n_rot must not exceed the indexer key length (64)
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
     }
+
+    if (arch == LLM_ARCH_INKLING) {
+        // hybrid iSWA rel-attention + packed shortconv; these keys are required by the
+        // arch's hparam loader (shortconv kernel > 1, extents/d_rel > 0, denom != 0).
+        // EXPERT_WEIGHTS_SCALE is required by inkling but not in the generic MoE block.
+        ms.add_kv(LLM_KV_INKLING_D_REL,             uint32_t(32));
+        ms.add_kv(LLM_KV_INKLING_REL_EXTENT,        uint32_t(64));
+        ms.add_kv(LLM_KV_INKLING_REL_EXTENT_SWA,    uint32_t(32));
+        ms.add_kv(LLM_KV_INKLING_SHORTCONV_KERNEL,  uint32_t(4));
+        ms.add_kv(LLM_KV_INKLING_DENSE_BLOCK_COUNT, uint32_t(1));
+        ms.add_kv(LLM_KV_INKLING_LOGIT_SCALE_DENOM, 1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,      1.0f);
+    }
     ms.add_kv(LLM_KV_ATTENTION_CLAMP_KQV,              1.0f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
@@ -330,6 +343,7 @@ static std::vector<float> get_logits(
 
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
+        case LLM_ARCH_INKLING: // loader requires expert_feed_forward_length etc.
         case LLM_ARCH_LLAMA4:
         case LLM_ARCH_COHERE2MOE:
         case LLM_ARCH_GROK:
@@ -427,9 +441,8 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK4) {
         return false;
     }
-    if (arch == LLM_ARCH_INKLING) {
-        return false; // TODO fixture params for the arch-specific hparams (d_rel, rel_extent, shortconv, logit_scale_denom)
-    }
+    // LLM_ARCH_INKLING: supported since the fixture fills its arch-specific hparams
+    // (d_rel, rel_extent(+swa), shortconv kernel, dense lead, logit_scale_denom)
 
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU
