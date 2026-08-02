@@ -221,8 +221,29 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
-    const uint32_t n_kv_flash_base = cparams.flash_attn ? mctx_attn->get_base()->get_n_kv_pos_contiguous() : 0;
-    const uint32_t n_kv_flash_swa  = cparams.flash_attn ? mctx_attn->get_swa ()->get_n_kv_pos_contiguous() : 0;
+    // Per-stream tail lengths: each stream gets its own banded call (the kernel aligns Q to
+    // the tail of the K VIEW, so one uniform max-tail view would misalign shorter streams'
+    // rel windows). A single non-qualifying stream disables banding for the whole layer,
+    // which keeps the mask/rel plumbing uniform.
+    const uint32_t n_stream_attn = std::max<uint32_t>(1, mctx_attn->get_base()->get_n_stream());
+
+    std::vector<uint32_t> n_kv_flash_base_s(n_stream_attn, 0);
+    std::vector<uint32_t> n_kv_flash_swa_s (n_stream_attn, 0);
+
+    if (cparams.flash_attn) {
+        for (uint32_t is = 0; is < n_stream_attn; ++is) {
+            n_kv_flash_base_s[is] = n_stream_attn == 1
+                ? mctx_attn->get_base()->get_n_kv_pos_contiguous()
+                : mctx_attn->get_base()->get_n_kv_pos_contiguous_stream(is);
+            n_kv_flash_swa_s[is] = n_stream_attn == 1
+                ? mctx_attn->get_swa()->get_n_kv_pos_contiguous()
+                : mctx_attn->get_swa()->get_n_kv_pos_contiguous_stream(is);
+        }
+    }
+
+    // 0 iff any stream fails to qualify
+    const uint32_t n_kv_flash_base = *std::min_element(n_kv_flash_base_s.begin(), n_kv_flash_base_s.end());
+    const uint32_t n_kv_flash_swa  = *std::min_element(n_kv_flash_swa_s.begin(),  n_kv_flash_swa_s.end());
 
     bool has_global = false;
     bool needs_rel_idx_local  = false;
@@ -416,58 +437,84 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
             ggml_build_forward_expand(gf, cache->cpy_k(ctx0, k, k_idxs, il));
             ggml_build_forward_expand(gf, cache->cpy_v(ctx0, v, v_idxs, il));
 
-            ggml_tensor * q_fa = ggml_view_4d(ctx0, q,
+            ggml_tensor * q_all = ggml_view_4d(ctx0, q,
                     q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
                     q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
-            ggml_tensor * k_fa = cache->get_k(ctx0, il);
-            ggml_tensor * v_fa = cache->get_v(ctx0, il);
+            ggml_tensor * k_all = cache->get_k(ctx0, il);
+            ggml_tensor * v_all = cache->get_v(ctx0, il);
 
-            const int64_t n_kv_flash = is_swa ? n_kv_flash_swa : n_kv_flash_base;
-            GGML_ASSERT(n_stream == 1 && n_kv_flash <= k_fa->ne[2]);
-
-            k_fa = ggml_view_4d(ctx0, k_fa,
-                    k_fa->ne[0], k_fa->ne[1], n_kv_flash, k_fa->ne[3],
-                    k_fa->nb[1], k_fa->nb[2], k_fa->nb[3], 0);
-
-            const bool v_trans = v_fa->nb[1] > v_fa->nb[2];
-            if (v_trans) {
-                GGML_ASSERT(n_kv_flash <= v_fa->ne[0]);
-                v_fa = ggml_view_4d(ctx0, v_fa,
-                        n_kv_flash, v_fa->ne[1], v_fa->ne[2], v_fa->ne[3],
-                        v_fa->nb[1], v_fa->nb[2], v_fa->nb[3], 0);
-            } else {
-                GGML_ASSERT(n_kv_flash <= v_fa->ne[2]);
-                v_fa = ggml_view_4d(ctx0, v_fa,
-                        v_fa->ne[0], v_fa->ne[1], n_kv_flash, v_fa->ne[3],
-                        v_fa->nb[1], v_fa->nb[2], v_fa->nb[3], 0);
-            }
-
-            q_fa = ggml_permute(ctx0, q_fa, 0, 2, 1, 3);
-            k_fa = ggml_permute(ctx0, k_fa, 0, 2, 1, 3);
-            v_fa = ggml_permute(ctx0, v_fa, 0, 2, 1, 3);
-
-            if (v_trans) {
-                v_fa = ggml_transpose(ctx0, v_fa);
-            }
-            if (k_fa->type == GGML_TYPE_F32) {
-                k_fa = ggml_cast(ctx0, k_fa, GGML_TYPE_F16);
-            }
-            if (v_fa->type == GGML_TYPE_F32) {
-                v_fa = ggml_cast(ctx0, v_fa, GGML_TYPE_F16);
-            }
-
-            ggml_tensor * rel_fa = ggml_reshape_4d(ctx0, rel,
+            ggml_tensor * rel_all = ggml_reshape_4d(ctx0, rel,
                     rel_extent, n_head, n_tokens/n_stream, n_stream);
-            ggml_tensor * mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
-            mask = ggml_cont(ctx0, ggml_view_4d(ctx0, mask,
-                    n_kv_flash, mask->ne[1], mask->ne[2], mask->ne[3],
-                    mask->nb[1], mask->nb[2], mask->nb[3], 0));
+            ggml_tensor * mask_all = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
 
-            cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, mask, rel_fa,
-                    1.0f/float(head_dim), rel_extent);
-            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
-            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+            const bool v_trans = v_all->nb[1] > v_all->nb[2];
 
+            // one banded call per stream, each with its own tail length; the n_stream == 1
+            // path takes no slices, so its graph is unchanged
+            ggml_tensor * out = nullptr;
+
+            for (int64_t is = 0; is < n_stream; ++is) {
+                const int64_t n_kv_flash = is_swa ? n_kv_flash_swa_s[is] : n_kv_flash_base_s[is];
+                GGML_ASSERT(n_kv_flash > 0 && n_kv_flash <= k_all->ne[2]);
+
+                ggml_tensor * q_fa   = q_all;
+                ggml_tensor * rel_fa = rel_all;
+
+                if (n_stream > 1) {
+                    q_fa = ggml_view_4d(ctx0, q_all,
+                            q_all->ne[0], q_all->ne[1], q_all->ne[2], 1,
+                            q_all->nb[1], q_all->nb[2], q_all->nb[3], is*q_all->nb[3]);
+                    rel_fa = ggml_view_4d(ctx0, rel_all,
+                            rel_all->ne[0], rel_all->ne[1], rel_all->ne[2], 1,
+                            rel_all->nb[1], rel_all->nb[2], rel_all->nb[3], is*rel_all->nb[3]);
+                }
+
+                // row-count view and stream slice fold into one view each
+                ggml_tensor * k_fa = ggml_view_4d(ctx0, k_all,
+                        k_all->ne[0], k_all->ne[1], n_kv_flash, n_stream > 1 ? 1 : k_all->ne[3],
+                        k_all->nb[1], k_all->nb[2], k_all->nb[3], is*k_all->nb[3]);
+
+                ggml_tensor * v_fa;
+                if (v_trans) {
+                    GGML_ASSERT(n_kv_flash <= v_all->ne[0]);
+                    v_fa = ggml_view_4d(ctx0, v_all,
+                            n_kv_flash, v_all->ne[1], v_all->ne[2], n_stream > 1 ? 1 : v_all->ne[3],
+                            v_all->nb[1], v_all->nb[2], v_all->nb[3], is*v_all->nb[3]);
+                } else {
+                    GGML_ASSERT(n_kv_flash <= v_all->ne[2]);
+                    v_fa = ggml_view_4d(ctx0, v_all,
+                            v_all->ne[0], v_all->ne[1], n_kv_flash, n_stream > 1 ? 1 : v_all->ne[3],
+                            v_all->nb[1], v_all->nb[2], v_all->nb[3], is*v_all->nb[3]);
+                }
+
+                q_fa = ggml_permute(ctx0, q_fa, 0, 2, 1, 3);
+                k_fa = ggml_permute(ctx0, k_fa, 0, 2, 1, 3);
+                v_fa = ggml_permute(ctx0, v_fa, 0, 2, 1, 3);
+
+                if (v_trans) {
+                    v_fa = ggml_transpose(ctx0, v_fa);
+                }
+                if (k_fa->type == GGML_TYPE_F32) {
+                    k_fa = ggml_cast(ctx0, k_fa, GGML_TYPE_F16);
+                }
+                if (v_fa->type == GGML_TYPE_F32) {
+                    v_fa = ggml_cast(ctx0, v_fa, GGML_TYPE_F16);
+                }
+
+                ggml_tensor * mask = ggml_cont(ctx0, ggml_view_4d(ctx0, mask_all,
+                        n_kv_flash, mask_all->ne[1], mask_all->ne[2], n_stream > 1 ? 1 : mask_all->ne[3],
+                        mask_all->nb[1], mask_all->nb[2], mask_all->nb[3], is*mask_all->nb[3]));
+
+                ggml_tensor * cur_s = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, mask, rel_fa,
+                        1.0f/float(head_dim), rel_extent);
+                ggml_flash_attn_ext_set_prec(cur_s, GGML_PREC_F32);
+                res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur_s, il});
+
+                // stream-major token order matches the ubatch layout
+                out = out == nullptr ? cur_s : ggml_concat(ctx0, out, cur_s, 3);
+            }
+
+            cur = out;
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
             ggml_build_forward_expand(gf, cur);
             cb(cur, "kqv_out", il);

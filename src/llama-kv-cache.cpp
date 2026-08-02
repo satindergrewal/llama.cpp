@@ -2980,6 +2980,10 @@ uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
     return result <= (uint32_t) n_kv ? result : 0;
 }
 
+uint32_t llama_kv_cache_context::get_n_stream() const {
+    return kv != nullptr ? kv->get_n_stream() : 1;
+}
+
 uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous_stream(uint32_t is) const {
     if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
         // reserve context: report the whole cache as position-contiguous so the worst-case

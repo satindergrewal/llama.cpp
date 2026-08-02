@@ -384,6 +384,7 @@ public:
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_pos_contiguous() const;
     uint32_t get_n_kv_pos_contiguous_stream(uint32_t is) const;
+    uint32_t get_n_stream() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
