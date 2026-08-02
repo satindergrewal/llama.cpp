@@ -10,6 +10,12 @@
 #include "speculative.h"
 #include "server-common.h"
 
+// DS4P_REVALIDATE (P0-2) payload hashing.
+// xxHash by Yann Collet (BSD-2), vendored in-tree at examples/gguf-hash/deps/xxhash;
+// engine-side re-validation technique credit: Entrpi/ds4 (warm-record memcmp before reuse).
+#define XXH_INLINE_ALL
+#include "../../examples/gguf-hash/deps/xxhash/xxhash.h"
+
 using json = nlohmann::ordered_json;
 
 //
@@ -1560,6 +1566,12 @@ json server_task_result_metrics::to_json() {
         { "n_decode_total",                  n_decode_total },
         { "n_busy_slots_total",              n_busy_slots_total },
 
+        { "n_reval_saves",                   n_reval_saves },
+        { "n_reval_loads",                   n_reval_loads },
+        { "n_reval_hash_fail",               n_reval_hash_fail },
+        { "n_reval_identity_fail",           n_reval_identity_fail },
+        { "n_reval_cell_mismatch",           n_reval_cell_mismatch },
+
         { "slots",                           slots_data },
     };
 }
@@ -1636,6 +1648,56 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+bool server_prompt_cache::revalidate_enabled() {
+    static const bool enabled = []() {
+        const char * s = getenv("DS4P_REVALIDATE");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return enabled;
+}
+
+std::string server_prompt_cache::build_identity(const llama_context * ctx) {
+    const llama_model * model = llama_get_model(ctx);
+
+    char desc[128];
+    llama_model_desc(model, desc, sizeof(desc));
+
+    // KV cell types + layer/head dims: the fields whose mismatch would make a restored
+    // state wrong even when the token claim matches. n_ctx is deliberately excluded
+    // (a state is position-addressed, not ctx-size-addressed).
+    return std::string(desc)
+        + "|l"  + std::to_string(llama_model_n_layer(model))
+        + "|hd" + std::to_string(llama_model_n_embd_head_v(model));
+}
+
+void server_prompt_cache::seal(server_prompt_cache_state & st, const std::string & identity) {
+    if (!revalidate_enabled()) {
+        return;
+    }
+
+    st.binding_hash_main = XXH3_64bits(st.data.main.data(), st.data.main.size());
+    st.binding_hash_drft = st.data.drft.empty() ? 0 : XXH3_64bits(st.data.drft.data(), st.data.drft.size());
+    st.binding_identity  = identity;
+
+    // test-only fault injection: DS4P_REVAL_FAULT=1 corrupts one payload byte AFTER hashing,
+    // so the FIRST load of this entry must fail the hash check (before any restore).
+    // This is how the reval gate proves the detector detects.
+    static const bool fault_inject = []() {
+        const char * s = getenv("DS4P_REVAL_FAULT");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    if (fault_inject && !st.data.main.empty()) {
+        st.data.main[st.data.main.size()/2] ^= 0x01;
+        SRV_WRN("%s", " - reval FAULT INJECTED (DS4P_REVAL_FAULT=1): first load of this entry must fail\n");
+    }
+
+    n_reval_saves++;
+
+    SRV_TRC(" - reval seal: main=%zu B hash=%016llx, drft=%zu B, saves=%llu\n",
+            st.data.main.size(), (unsigned long long) st.binding_hash_main,
+            st.data.drft.size(), (unsigned long long) n_reval_saves);
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1772,6 +1834,36 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+        // DS4P_REVALIDATE (P0-2): never trust a sealed entry's claim without verifying the
+        // state bytes and the identity it was sealed under. A failed check degrades to
+        // recompute (erase + false -> caller prompt_clear()), never to wrong reuse.
+        if (revalidate_enabled() && !it_best->binding_identity.empty()) {
+            const std::string identity_cur = build_identity(ctx_tgt);
+
+            if (it_best->binding_identity != identity_cur) {
+                n_reval_identity_fail++;
+                SRV_WRN(" - reval IDENTITY MISMATCH: entry '%s' vs current '%s' -> recompute (identity_fail=%llu)\n",
+                        it_best->binding_identity.c_str(), identity_cur.c_str(),
+                        (unsigned long long) n_reval_identity_fail);
+                states.erase(it_best);
+                return false;
+            }
+
+            const uint64_t h_main = XXH3_64bits(it_best->data.main.data(), it_best->data.main.size());
+            const uint64_t h_drft = it_best->data.drft.empty() ? 0 : XXH3_64bits(it_best->data.drft.data(), it_best->data.drft.size());
+
+            if (h_main != it_best->binding_hash_main || h_drft != it_best->binding_hash_drft) {
+                n_reval_hash_fail++;
+                SRV_WRN(" - reval HASH MISMATCH: payload corrupted post-seal -> recompute (hash_fail=%llu)\n",
+                        (unsigned long long) n_reval_hash_fail);
+                states.erase(it_best);
+                return false;
+            }
+
+            n_reval_loads++;
+            SRV_TRC(" - reval load OK (loads=%llu)\n", (unsigned long long) n_reval_loads);
+        }
 
         {
             auto & data = it_best->data.main;

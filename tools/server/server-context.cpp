@@ -266,6 +266,20 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        // DS4P_REVALIDATE (P0-2): save-time pairing sanity — the sequence's live KV position
+        // range must match the token record about to be bound to it. A mispaired save becomes
+        // loud HERE instead of a silent wrong-reuse later.
+        if (server_prompt_cache::revalidate_enabled()) {
+            const llama_pos pos_have = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) + 1;
+            const llama_pos pos_want = prompt.tokens.pos_next();
+            if (pos_have != pos_want) {
+                prompt_cache.n_reval_cell_mismatch++;
+                SLT_WRN(*this, "reval CELL MISMATCH at save: seq pos_max+1 = %d vs tokens pos_next = %d -> not caching (cell_mismatch=%llu)\n",
+                        (int) pos_have, (int) pos_want, (unsigned long long) prompt_cache.n_reval_cell_mismatch);
+                return false;
+            }
+        }
+
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
@@ -275,6 +289,8 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+
+        prompt_cache.seal(*cur, server_prompt_cache::build_identity(ctx_tgt));
 
         return true;
     }
@@ -2552,6 +2568,14 @@ private:
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
 
+                    if (prompt_cache) {
+                        res->n_reval_saves         = prompt_cache->n_reval_saves;
+                        res->n_reval_loads         = prompt_cache->n_reval_loads;
+                        res->n_reval_hash_fail     = prompt_cache->n_reval_hash_fail;
+                        res->n_reval_identity_fail = prompt_cache->n_reval_identity_fail;
+                        res->n_reval_cell_mismatch = prompt_cache->n_reval_cell_mismatch;
+                    }
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -4441,6 +4465,26 @@ void server_routes::init_routes() {
                     {"name",  "n_tokens_max"},
                     {"help",  "Largest observed n_tokens."},
                     {"value",  res_task->n_tokens_max}
+            }, {
+                    {"name",  "reval_saves_total"},
+                    {"help",  "Prompt-cache entries sealed with a state<->claim binding (DS4P_REVALIDATE)."},
+                    {"value",  res_task->n_reval_saves}
+            }, {
+                    {"name",  "reval_loads_total"},
+                    {"help",  "Prompt-cache loads that passed binding verification (DS4P_REVALIDATE)."},
+                    {"value",  res_task->n_reval_loads}
+            }, {
+                    {"name",  "reval_hash_fail_total"},
+                    {"help",  "Prompt-cache loads rejected on payload hash mismatch (degraded to recompute)."},
+                    {"value",  res_task->n_reval_hash_fail}
+            }, {
+                    {"name",  "reval_identity_fail_total"},
+                    {"help",  "Prompt-cache loads rejected on identity mismatch (degraded to recompute)."},
+                    {"value",  res_task->n_reval_identity_fail}
+            }, {
+                    {"name",  "reval_cell_mismatch_total"},
+                    {"help",  "Prompt-cache saves refused: live KV position range != token claim."},
+                    {"value",  res_task->n_reval_cell_mismatch}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},

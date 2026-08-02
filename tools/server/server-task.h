@@ -532,6 +532,13 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    // DS4P_REVALIDATE (P0-2) prompt-cache binding counters
+    uint64_t n_reval_saves         = 0;
+    uint64_t n_reval_loads         = 0;
+    uint64_t n_reval_hash_fail     = 0;
+    uint64_t n_reval_identity_fail = 0;
+    uint64_t n_reval_cell_mismatch = 0;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
@@ -619,6 +626,12 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // DS4P_REVALIDATE (P0-2): state<->claim binding, filled by seal() when enabled.
+    // identity.empty() == entry not sealed (verification skipped on load).
+    uint64_t    binding_hash_main = 0;
+    uint64_t    binding_hash_drft = 0;
+    std::string binding_identity;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -643,6 +656,23 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // DS4P_REVALIDATE (P0-2) exactness counters; single-threaded (queue loop) by design
+    uint64_t n_reval_saves         = 0;
+    uint64_t n_reval_loads         = 0;
+    uint64_t n_reval_hash_fail     = 0;
+    uint64_t n_reval_identity_fail = 0;
+    uint64_t n_reval_cell_mismatch = 0;
+
+    // true when the DS4P_REVALIDATE env is set to a non-zero value (read once)
+    static bool revalidate_enabled();
+
+    // identity tuple of a context: arch/model desc + KV cell types + layer/head dims.
+    // an entry sealed under one identity must never restore into another.
+    static std::string build_identity(const llama_context * ctx);
+
+    // hash the filled payloads + record the identity (call after state data is written)
+    void seal(server_prompt_cache_state & st, const std::string & identity);
 
     size_t size() const;
 
