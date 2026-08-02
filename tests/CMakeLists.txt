@@ -348,7 +348,7 @@ if (TARGET gguf-model-data)
 endif()
 
 # Special-case: test-paged-kv needs access to internal headers in src
-add_executable(test-paged-kv test-paged-kv.cpp get-model.cpp)
+add_executable(test-paged-kv test-paged-kv.cpp)
 target_link_libraries(test-paged-kv PRIVATE llama-common llama)
 target_include_directories(test-paged-kv PRIVATE ${PROJECT_SOURCE_DIR}/src)
 if (LLAMA_TESTS_INSTALL)
