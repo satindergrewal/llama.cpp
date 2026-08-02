@@ -539,6 +539,9 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_reval_identity_fail = 0;
     uint64_t n_reval_cell_mismatch = 0;
 
+    // DS4P_YIELD_QUENCH (P0-1) governor counter
+    uint64_t n_quench_seqs_total   = 0;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();

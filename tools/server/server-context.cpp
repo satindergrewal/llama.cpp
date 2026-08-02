@@ -193,6 +193,36 @@ struct server_batch {
     }
 };
 
+// DS4P_YIELD_QUENCH (P0-1): per-request speculation governor, default OFF.
+// Semantics follow the ds4 source (Entrpi/ds4, ds4.c yield-quench block): EWMA initialized
+// AT the guard (a request must prove itself bad), quench only on the CONJUNCTION of
+// steps >= minev AND ewma < guard AND debt > budget, and the quench is TERMINAL for the
+// request. The guard is a calibrated per-config parameter, never a universal constant.
+struct ds4p_quench_config {
+    bool  enabled = false;
+    float guard   = 2.16f; // break-even accepted-tokens/verify-step; MEASURE per serve config
+    int   minev   = 4;     // minimum verify steps before a quench is allowed
+    float budget  = 0.0f;  // cumulative shortfall allowed before quench (default 4*guard)
+    int   force   = 0;     // gate use: force-quench at this verify step (0 = off)
+};
+
+static const ds4p_quench_config & ds4p_quench() {
+    static const ds4p_quench_config cfg = []() {
+        ds4p_quench_config c;
+        const char * s;
+        s = getenv("DS4P_YIELD_QUENCH");  c.enabled = s && atoi(s) != 0;
+        s = getenv("DS4P_QUENCH_GUARD");  if (s) c.guard  = atof(s);
+        s = getenv("DS4P_QUENCH_MINEV");  if (s) c.minev  = atoi(s);
+        s = getenv("DS4P_QUENCH_BUDGET"); if (s) c.budget = atof(s);
+        s = getenv("DS4P_QUENCH_FORCE");  if (s) c.force  = atoi(s);
+        if (c.budget <= 0.0f) {
+            c.budget = 4.0f*c.guard;
+        }
+        return c;
+    }();
+    return cfg;
+}
+
 struct server_slot {
     int id;
 
@@ -346,6 +376,11 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // DS4P_YIELD_QUENCH (P0-1) per-request governor state
+    float quench_ewma = 0.0f; // EWMA of accepted tokens per verify step, initialized AT guard
+    float quench_debt = 0.0f; // cumulative shortfall vs guard, clamped at 0 on credit
+    bool  quenched    = false; // TERMINAL for this request
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -375,6 +410,11 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+
+        // re-arm the yield-quench governor for the next request (quench is per-request)
+        quench_ewma = ds4p_quench().guard;
+        quench_debt = 0.0f;
+        quenched    = false;
 
         task_prev = std::move(task);
         task.reset();
@@ -480,6 +520,12 @@ struct server_slot {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
+            return 0;
+        }
+
+        // DS4P_YIELD_QUENCH (P0-1): a quenched request never drafts again — this is the
+        // single choke point every draft-arming site goes through
+        if (quenched) {
             return 0;
         }
 
@@ -685,6 +731,12 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
+            if (ds4p_quench().enabled) {
+                SLT_INF(*this,
+                        "   yield-quench = %s (ewma = %.3f, guard = %.3f, debt = %.3f, steps = %d)\n",
+                        quenched ? "FIRED (terminal)" : "armed, never fired",
+                        quench_ewma, ds4p_quench().guard, quench_debt, n_draft_verif_steps);
+            }
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
@@ -860,6 +912,9 @@ struct server_metrics {
 
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
+
+    // DS4P_YIELD_QUENCH (P0-1): requests terminally quenched by the governor
+    uint64_t n_quench_seqs_total = 0;
 
     void init() {
         t_start = ggml_time_us();
@@ -2576,6 +2631,8 @@ private:
                         res->n_reval_cell_mismatch = prompt_cache->n_reval_cell_mismatch;
                     }
 
+                    res->n_quench_seqs_total = metrics.n_quench_seqs_total;
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -3949,6 +4006,30 @@ private:
             slot.n_draft_accepted += n_accepted;
             slot.n_draft_verif_steps += 1;
 
+            // DS4P_YIELD_QUENCH (P0-1): observe this verify step's yield, quench on the
+            // conjunction (ds4 semantics: currently-bad AND cumulatively-bad AND enough
+            // evidence). Terminal per request; get_n_draft_max() enforces it.
+            if (ds4p_quench().enabled && !slot.quenched) {
+                const auto & qc = ds4p_quench();
+
+                slot.quench_ewma += ((float) n_accepted - slot.quench_ewma) / 8.0f; // alpha = 1/8
+                slot.quench_debt = std::max(0.0f, slot.quench_debt + (qc.guard - (float) n_accepted));
+
+                const bool force = qc.force > 0 && slot.n_draft_verif_steps >= qc.force;
+                const bool fire  = slot.n_draft_verif_steps >= qc.minev &&
+                                   slot.quench_ewma < qc.guard &&
+                                   slot.quench_debt > qc.budget;
+
+                if (force || fire) {
+                    slot.quenched = true;
+                    metrics.n_quench_seqs_total++;
+                    SLT_INF(slot, "yield-quench FIRED%s: steps=%d ewma=%.3f guard=%.3f debt=%.3f budget=%.3f (quench_seqs=%llu)\n",
+                            force ? " (forced)" : "", slot.n_draft_verif_steps,
+                            slot.quench_ewma, qc.guard, slot.quench_debt, qc.budget,
+                            (unsigned long long) metrics.n_quench_seqs_total);
+                }
+            }
+
             if (slot.n_accepted_per_pos.empty()) {
                 slot.n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);
             }
@@ -4485,6 +4566,10 @@ void server_routes::init_routes() {
                     {"name",  "reval_cell_mismatch_total"},
                     {"help",  "Prompt-cache saves refused: live KV position range != token claim."},
                     {"value",  res_task->n_reval_cell_mismatch}
+            }, {
+                    {"name",  "quench_seqs_total"},
+                    {"help",  "Requests terminally quenched by the yield-quench governor (DS4P_YIELD_QUENCH)."},
+                    {"value",  res_task->n_quench_seqs_total}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},

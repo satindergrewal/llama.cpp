@@ -1571,6 +1571,7 @@ json server_task_result_metrics::to_json() {
         { "n_reval_hash_fail",               n_reval_hash_fail },
         { "n_reval_identity_fail",           n_reval_identity_fail },
         { "n_reval_cell_mismatch",           n_reval_cell_mismatch },
+        { "n_quench_seqs_total",             n_quench_seqs_total },
 
         { "slots",                           slots_data },
     };
