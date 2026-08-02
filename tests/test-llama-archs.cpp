@@ -82,7 +82,10 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
 static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
-    const uint32_t n_ctx = 128;
+    // INKLING gets a larger training context so multi-ubatch prefills are constructible on
+    // the synthetic (its equivalence gate needs two prompts long enough to co-queue into a
+    // joint multi-stream batch; 128 caps prompts below a single ubatch)
+    const uint32_t n_ctx = arch == LLM_ARCH_INKLING ? 8192 : 128;
 
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
