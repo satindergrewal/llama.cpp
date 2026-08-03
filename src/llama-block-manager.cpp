@@ -84,6 +84,21 @@ llama_block_manager::physical_block_ids llama_block_manager::checkout_cpu_blocks
     return new_ids;
 }
 
+void llama_block_manager::share_blocks(const physical_block_ids & shared_blocks) {
+    for (const uint32_t & id : shared_blocks) {
+        if (is_gpu(id)) {
+            gpu_registry[id].ref_count += 1;
+        } else {
+            cpu_registry[id - total_num_gpu_blocks].ref_count += 1;
+        }
+    }
+}
+
+uint32_t llama_block_manager::get_ref_count(uint32_t block) const {
+    return is_gpu(block) ? gpu_registry[block].ref_count
+                         : cpu_registry[block - total_num_gpu_blocks].ref_count;
+}
+
 void llama_block_manager::release_gpu_blocks(const physical_block_ids & freed_blocks_ids) {
     for (const uint32_t & id : freed_blocks_ids) {
         gpu_registry[id].ref_count -= 1;

@@ -41,6 +41,13 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     bool allocate(int32_t num_tokens, llama_sequence_group & group);
     void free_blocks(llama_sequence_group & group);
+
+    // P1-6 COW fork: point dst at src's blocks for the shared prefix and take a reference
+    // on each -- zero KV bytes copied, vs the static path's O(n_ctx) cell copy. The tail
+    // block is only shared when it is FULL; a partially-filled tail would be written by
+    // both sequences, so dst gets a private copy of it (boundary copy-on-fork).
+    // Returns the number of tokens dst inherits.
+    uint32_t fork_blocks(const llama_sequence_group & src, llama_sequence_group & dst);
     bool swap_in(llama_sequence_group & group);
     bool swap_out(llama_sequence_group & group);
 

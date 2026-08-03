@@ -38,6 +38,12 @@ class llama_block_manager {
     physical_block_ids checkout_gpu_blocks(uint32_t num_blocks);
     physical_block_ids checkout_cpu_blocks(uint32_t num_blocks);
 
+    // P1-6 COW: take an extra reference on blocks now shared by another sequence. The
+    // release path already decrements and only frees at zero, so sharing is symmetric.
+    void share_blocks(const physical_block_ids & shared_blocks);
+
+    uint32_t get_ref_count(uint32_t block) const;
+
     void release_gpu_blocks(const physical_block_ids & freed_blocks);
     void release_cpu_blocks(const physical_block_ids & freed_blocks);
 
