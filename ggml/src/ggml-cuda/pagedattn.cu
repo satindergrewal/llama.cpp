@@ -805,7 +805,7 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
 #define PAGED_MMA_LDV   (PAGED_MMA_KV + 8)   // pad; multiple of 8 halves for ldmatrix
 
 template <int HD>
-__global__ __launch_bounds__(128, 1)
+__global__ __launch_bounds__(128, 4)   // profile: blocks/SM was register-capped at 2
 void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
                                         const half * __restrict__ kv_cache,
                                         const int * __restrict__ block_table,
