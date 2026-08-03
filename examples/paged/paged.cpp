@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <clocale>
+#include <cmath>
 #include <string>
 #include <unordered_map>
 #include <vector>
