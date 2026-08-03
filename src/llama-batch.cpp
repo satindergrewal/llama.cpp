@@ -911,8 +911,11 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
                 }
 
                 if (ubatch.token) {
+                    // no-vocab models (synthetic fixtures) have no pieces to look up
+                    const std::string piece = vocab->get_type() != LLAMA_VOCAB_TYPE_NONE ?
+                        vocab->token_to_piece(ubatch.token[i]) : "";
                     LLAMA_LOG_DEBUG("%s:  %4d: id = %6d (%16s), pos = %4d, n_seq_id = %2d, seq_id = [%s], output = %d\n",
-                            __func__, i, ubatch.token[i], vocab->token_to_piece(ubatch.token[i]).c_str(),
+                            __func__, i, ubatch.token[i], piece.c_str(),
                             ubatch.pos[i], ubatch.n_seq_id[i], ss.str().c_str(), ubatch.output[i]);
                 } else {
                     LLAMA_LOG_DEBUG("%s:  %4d: [embd], pos = %4d, n_seq_id = %2d, seq_id = [%s], output = %d\n",

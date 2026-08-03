@@ -258,6 +258,18 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         return s != nullptr && atoi(s) != 0;
     }();
 
+    // DS4P_ANALYTIC_BAND (B4 arc-3, default OFF): drop the kq_mask tensor from the banded
+    // path. Per-stream slices are single-sequence over a contiguous monotonic KV tail, so
+    // the mask is a pure function of rel_dist and the kernels derive it from the visibility
+    // window instead. With no consumer the mask input stays unallocated (set_input guards
+    // on ->buffer, same mechanism as DFlash's KV-injection pass), deleting the mask plane +
+    // cont copy that is the banded compute-buffer floor. Gate: analytic-vs-mask A/B must be
+    // bit-identical (visible cells gain +0.0f either way).
+    static const bool banded_analytic = []() {
+        const char * s = getenv("DS4P_ANALYTIC_BAND");
+        return s != nullptr && atoi(s) != 0;
+    }();
+
     const auto banded_cache_type_supported = [](ggml_type type) {
         return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 ||
                (banded_quant_kv && type == GGML_TYPE_Q8_0);
@@ -511,12 +523,20 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
                     v_fa = ggml_cast(ctx0, v_fa, GGML_TYPE_F16);
                 }
 
-                ggml_tensor * mask = ggml_cont(ctx0, ggml_view_4d(ctx0, mask_all,
-                        n_kv_flash, mask_all->ne[1], mask_all->ne[2], n_stream > 1 ? 1 : mask_all->ne[3],
-                        mask_all->nb[1], mask_all->nb[2], mask_all->nb[3], is*mask_all->nb[3]));
+                ggml_tensor * mask = nullptr;
+                int64_t visibility_window = 0;
+                if (banded_analytic) {
+                    // causal-only base layers see the whole contiguous tail; SWA layers see
+                    // the last n_swa positions (STANDARD: visible iff pos_q - pos_k < n_swa)
+                    visibility_window = is_swa ? (int64_t) hparams.n_swa : n_kv_flash;
+                } else {
+                    mask = ggml_cont(ctx0, ggml_view_4d(ctx0, mask_all,
+                            n_kv_flash, mask_all->ne[1], mask_all->ne[2], n_stream > 1 ? 1 : mask_all->ne[3],
+                            mask_all->nb[1], mask_all->nb[2], mask_all->nb[3], is*mask_all->nb[3]));
+                }
 
                 ggml_tensor * cur_s = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, mask, rel_fa,
-                        1.0f/float(head_dim), rel_extent, 0);
+                        1.0f/float(head_dim), rel_extent, visibility_window);
                 ggml_flash_attn_ext_set_prec(cur_s, GGML_PREC_F32);
                 res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur_s, il});
 
