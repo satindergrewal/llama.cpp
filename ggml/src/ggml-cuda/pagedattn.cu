@@ -1242,11 +1242,16 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                 const char * s = getenv("DS4P_PAGED_PSPLIT");
                 return s ? atoi(s) : -1;
             }();
+            // 8 blocks/SM, MEASURED (22K, one Blackwell card): prefill ms by n_splits was
+            // 3 -> 3,413 | 6 -> 3,141 | 12 -> 3,156 | 24 -> 3,348. Flat across 6-12, turns
+            // over at 24. The original 4-blocks/SM target picked 3 and left ~8% unclaimed.
+            // Decode's knee is ~12 blocks/SM instead (d8cbc0ff) because a decode block does
+            // one token's work while a prefill block does 64 q rows over a context slice.
             int n_splits = 1;
             if (psplit_env >= 0) {
                 n_splits = std::max(1, psplit_env);
-            } else if (base_blocks < 4 * nsm) {
-                n_splits = std::min(8, (4 * nsm + base_blocks - 1) / base_blocks);
+            } else if (base_blocks < 8 * nsm) {
+                n_splits = std::min(12, (8 * nsm + base_blocks - 1) / base_blocks);
             }
 
             // cp.async staging: refuted at 5.44 warps/SM (nothing to hide behind), worth
