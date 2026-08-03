@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "llama-context.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-impl.h"
 #include "llama-paged-scheduler-impl.h"
 
@@ -17,6 +18,15 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
 
     // Get the paged kv cache
     auto * paged_kv = dynamic_cast<llama_kv_cache_paged *>(ctx->get_memory());
+    if (!paged_kv) {
+        // 3b hybrid archs: the pool lives inside the hybrid wrapper, not as the whole memory
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid_iswa *>(ctx->get_memory())) {
+            paged_kv = hyb->get_mem_attn_paged();
+            if (paged_kv) {
+                LLAMA_LOG_INFO("%s: using the hybrid wrapper's paged attention pool\n", __func__);
+            }
+        }
+    }
     if (!paged_kv) {
         LLAMA_LOG_ERROR(
             "%s: context does not have a paged KV cache. "
