@@ -70,7 +70,11 @@ __global__ void paged_attention_write_kernel(const float * __restrict__ k_new,  
     }
 }
 
-__global__ void paged_attention_decode_kernel(const float * __restrict__ q,
+// Reference kernel (kept for head_dim > 128): one block-wide reduction with barriers PER
+// KV TOKEN, serial over the context. Correct but pathological at scale -- an 8K-context
+// decode step measured ~40 s/step on Blackwell (Q4 fork-cost gate, 2026-08-04). The
+// warp-parallel kernel below replaces it for head_dim 64/128.
+__global__ void paged_attention_decode_kernel_ref(const float * __restrict__ q,
                                               const half * __restrict__ kv_cache,
                                               const int * __restrict__ block_table,
                                               const int * __restrict__ context_lens,
@@ -168,6 +172,144 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
     }
 }
 
+// Warp-parallel decode (flash-decode shape): context tokens are strided across warps, each
+// warp keeps its own online-softmax state (m, l, per-lane acc slices), the per-token dot is
+// a warp shuffle reduction, and the warps merge ONCE per query token via log-sum-exp in
+// shared memory. No __syncthreads inside the context loop -- the reference kernel's
+// per-token block barrier serialized the whole context and made big-context decode
+// unusable. Same visibility-window and rel-bias semantics as the reference.
+// Contract: blockDim.x == head_dim, head_dim in {64, 128} (acc slices fixed at <= 4).
+__global__ void paged_attention_decode_kernel(const float * __restrict__ q,
+                                              const half * __restrict__ kv_cache,
+                                              const int * __restrict__ block_table,
+                                              const int * __restrict__ context_lens,
+                                              const int * __restrict__ batch_offsets,
+                                              const int * __restrict__ batch_lens,
+                                              const size_t stride_token,
+                                              const size_t stride_head,
+                                              const size_t stride_block,
+                                              const int    n_heads_kv,
+                                              const int    block_size,
+                                              const int    max_blocks,
+                                              const float  scale,
+                                              const float * __restrict__ rel,
+                                              const int64_t rel_extent,
+                                              const int64_t visibility_window,
+                                              float * __restrict__ out) {
+    extern __shared__ float smem[];
+
+    const int head_idx = blockIdx.x;
+    const int seq_idx  = blockIdx.y;
+    const int tid      = threadIdx.x;
+    const int lane     = tid & 31;
+    const int warp_id  = tid >> 5;
+
+    const int n_heads  = gridDim.x;
+    const int head_dim = blockDim.x;
+    const int n_warps  = head_dim >> 5;       // 2 (hd 64) or 4 (hd 128)
+    const int dpl      = head_dim >> 5;       // dims per lane (lane + 32*d)
+
+    const int kv_head_idx = head_idx / (n_heads / n_heads_kv);
+
+    const int seq_start      = batch_offsets[seq_idx];
+    const int num_new_tokens = batch_lens[seq_idx];
+
+    // smem layout: q_s[head_dim] | warp_m[n_warps] | warp_l[n_warps] | warp_acc[n_warps*head_dim]
+    float * q_s      = smem;
+    float * warp_m   = q_s + head_dim;
+    float * warp_l   = warp_m + n_warps;
+    float * warp_acc = warp_l + n_warps;
+
+    for (int i = 0; i < num_new_tokens; i++) {
+        const int token_batch_idx = seq_start + i;
+
+        q_s[tid] = q[(size_t) token_batch_idx * n_heads * head_dim + (size_t) head_idx * head_dim + tid] * scale;
+        __syncthreads();
+
+        const int ctx_len = context_lens[seq_idx];
+        const int q_pos   = (ctx_len - num_new_tokens) + i;
+        const int n_tok   = q_pos + 1;
+        // analytic band: everything older than the window is invisible (matches the
+        // reference's rel_dist >= visibility_window skip)
+        const int lo = (visibility_window > 0) ? max(0, (int) (q_pos - visibility_window + 1)) : 0;
+
+        float m_i = -FLT_MAX;
+        float l_i = 0.0f;
+        float acc_i[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+        for (int token = lo + warp_id; token < n_tok; token += n_warps) {
+            const int    bid            = token / block_size;
+            const int    physical_block = block_table[seq_idx * max_blocks + bid];
+            const int    token_in_block = token % block_size;
+            const size_t base   = (size_t) token_in_block * stride_token + (size_t) physical_block * stride_block;
+            const size_t k_base = base + (size_t) kv_head_idx * stride_head;
+            const size_t v_base = base + (size_t) (n_heads_kv + kv_head_idx) * stride_head;
+
+            float part = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                if (d < dpl) {
+                    const int dim = lane + (d << 5);
+                    part += q_s[dim] * __half2float(kv_cache[k_base + dim]);
+                }
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                part += __shfl_down_sync(0xffffffffu, part, offset);
+            }
+            float qk = __shfl_sync(0xffffffffu, part, 0);
+
+            const int64_t rel_dist = (int64_t) q_pos - token;
+            if (rel != nullptr && rel_dist < rel_extent) {
+                qk += rel[((size_t) token_batch_idx * n_heads + head_idx) * rel_extent + rel_dist];
+            }
+
+            const float m_new = fmaxf(m_i, qk);
+            const float e_old = __expf(m_i - m_new);
+            const float p     = __expf(qk - m_new);
+            l_i = l_i * e_old + p;
+            #pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                if (d < dpl) {
+                    const int dim = lane + (d << 5);
+                    acc_i[d] = acc_i[d] * e_old + p * __half2float(kv_cache[v_base + dim]);
+                }
+            }
+            m_i = m_new;
+        }
+
+        if (lane == 0) {
+            warp_m[warp_id] = m_i;
+            warp_l[warp_id] = l_i;
+        }
+        #pragma unroll
+        for (int d = 0; d < 4; ++d) {
+            if (d < dpl) {
+                warp_acc[warp_id * head_dim + lane + (d << 5)] = acc_i[d];
+            }
+        }
+        __syncthreads();
+
+        // cross-warp log-sum-exp merge; a warp that saw no tokens has m = -FLT_MAX and
+        // contributes expf(-inf) = 0
+        float m_tot = -FLT_MAX;
+        for (int w = 0; w < n_warps; ++w) {
+            m_tot = fmaxf(m_tot, warp_m[w]);
+        }
+        float l_tot   = 0.0f;
+        float out_acc = 0.0f;
+        for (int w = 0; w < n_warps; ++w) {
+            const float f = __expf(warp_m[w] - m_tot);
+            l_tot   += warp_l[w] * f;
+            out_acc += warp_acc[w * head_dim + tid] * f;
+        }
+
+        const int out_idx = (size_t) token_batch_idx * n_heads * head_dim + (size_t) head_idx * head_dim + tid;
+        out[out_idx] = out_acc / (l_tot + 1e-6f);
+        __syncthreads();  // q_s / warp_acc are rewritten next iteration
+    }
+}
+
 void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // banded variant (rel_logits at src[10], 3b): rel_extent / visibility_window at
     // op_params bytes [16,24)/[24,32) -- the banded-FA layout
@@ -221,7 +363,20 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         (const int *) write_slots->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
         stride_token, stride_head, stride_block, n_heads_kv, block_size);
 
-    // Shared memory
+    if (head_dim == 64 || head_dim == 128) {
+        // warp-parallel kernel: q_s[head_dim] + warp_m/l[n_warps each] + warp_acc[n_warps*head_dim]
+        const size_t n_warps    = (size_t) head_dim / 32;
+        const size_t smem_bytes = (head_dim + 2 * n_warps + n_warps * head_dim) * sizeof(float);
+
+        paged_attention_decode_kernel<<<dim3(n_heads, n_seq), dim3(head_dim), smem_bytes, ctx.stream()>>>(
+            (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,
+            (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
+            stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
+            rel ? (const float *) rel->data : nullptr, rel_extent, visibility_window, (float *) dst->data);
+        return;
+    }
+
+    // reference kernel fallback (head_dim > 128): correct but serial over context
     const size_t n_warps    = ((size_t) head_dim + 31) / 32;
     const size_t smem_bytes = n_warps * sizeof(float);
 
@@ -229,12 +384,12 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     // https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html
     if (smem_bytes > 48 * 1024) {
         GGML_ASSERT(smem_bytes <= 96 * 1024 && "smem exceeds 96KB limit");
-        CUDA_CHECK(cudaFuncSetAttribute(paged_attention_decode_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        CUDA_CHECK(cudaFuncSetAttribute(paged_attention_decode_kernel_ref, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         (int) smem_bytes));
     }
 
     // Read kernel - Grid (n_heads_kv, n_seq), Block (head_dim)
-    paged_attention_decode_kernel<<<dim3(n_heads, n_seq), dim3(head_dim), smem_bytes, ctx.stream()>>>(
+    paged_attention_decode_kernel_ref<<<dim3(n_heads, n_seq), dim3(head_dim), smem_bytes, ctx.stream()>>>(
         (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,
         (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
         stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
