@@ -18720,8 +18720,8 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
 
     struct ggml_context * ggml_ctx = ggml_init(iparams);
 
-    std::array<struct ggml_tensor *, GGML_MAX_SRC> src_clone = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-    const char * srci_name[GGML_MAX_SRC] = {"src0", "src1", "src2", "src3", "src4", "src5", "src6", "src7", "src8", "src9"};
+    std::array<struct ggml_tensor *, GGML_MAX_SRC> src_clone = {}; // value-init: all null regardless of GGML_MAX_SRC
+    const char * srci_name[GGML_MAX_SRC] = {"src0", "src1", "src2", "src3", "src4", "src5", "src6", "src7", "src8", "src9", "src10", "src11"};
 
     std::map<ggml_tensor *, ggml_tensor *> cloned_tensors;
     std::vector<void *> cloned_mallocs;
