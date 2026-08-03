@@ -1939,6 +1939,18 @@ private:
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
+        // 4d: paged serving registers the request with the engine; prefill scheduling,
+        // chunking and KV allocation all happen inside the scheduler from here on
+        if (paged_sched) {
+            const llama_tokens toks = slot.task->tokens.get_text_tokens();
+            if (!llama_paged_scheduler_add_request(paged_sched, toks.data(), (int32_t) toks.size(), slot.id)) {
+                SLT_ERR(slot, "%s", "paged scheduler rejected the request\n");
+                return false;
+            }
+            slot.t_start_process_prompt = ggml_time_us();
+            SLT_INF(slot, "paged: request registered (%zu tokens)\n", toks.size());
+        }
+
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
     }
@@ -2879,7 +2891,106 @@ private:
     };
 #endif
 
+    // 4d (DESIGN-P28 increments 1+2): the continuous-batching drive loop -- the
+    // examples/paged loop transplanted onto the server's slot bookkeeping. Replaces the
+    // whole static batch-assembly path when the scheduler owns serving.
+    void update_slots_paged() {
+        llama_batch pbatch = {};
+
+        const bool success = llama_paged_scheduler_prepare_batch(paged_sched, &pbatch);
+        if (!success || pbatch.n_tokens == 0) {
+            return; // nothing admitted/decodable this tick
+        }
+
+        if (llama_decode(ctx_tgt, pbatch) != 0) {
+            SRV_ERR("%s", "paged: llama_decode failed\n");
+            return;
+        }
+        llama_synchronize(ctx_tgt);
+
+        const llama_paged_batch_info * info = llama_paged_scheduler_get_batch_info(paged_sched);
+        GGML_ASSERT(info != nullptr);
+
+        std::vector<llama_token> sampled;
+        std::vector<int8_t>      stops;
+        sampled.reserve(info->n_seq);
+        stops.reserve(info->n_seq);
+
+        for (int32_t i = 0; i < info->n_seq; ++i) {
+            const int32_t request_id = pbatch.seq_id[info->batch_offsets[i]][0];
+
+            server_slot * slot = nullptr;
+            for (auto & s : slots) {
+                if (s.id == request_id && s.is_processing()) { slot = &s; break; }
+            }
+            if (slot == nullptr) {
+                SRV_WRN("paged: no processing slot for request %d, stopping it\n", request_id);
+                sampled.push_back(0);
+                stops.push_back(1);
+                continue;
+            }
+
+            const int32_t tok_idx = info->batch_offsets[i] + info->batch_lens[i] - 1;
+
+            const llama_token id = common_sampler_sample(slot->smpl.get(), ctx_tgt, tok_idx);
+            common_sampler_accept(slot->smpl.get(), id, true);
+
+            const int64_t t_now = ggml_time_us();
+            slot->n_decoded += 1;
+            if (slot->n_decoded == 1) {
+                slot->t_start_generation   = t_now;
+                slot->t_print_last         = t_now;
+                slot->n_decoded_last       = 0;
+                slot->t_prompt_processing  = (slot->t_start_generation - slot->t_start_process_prompt) / 1e3;
+                metrics.on_prompt_eval(*slot);
+            }
+            slot->t_token_generation = std::max<int64_t>(1, t_now - slot->t_start_generation) / 1e3;
+
+            completion_token_output result;
+            result.tok          = id;
+            const bool special_ok = params_base.special ||
+                slot->task->params.sampling.preserved_tokens.count(result.tok) > 0;
+            result.text_to_send = common_token_to_piece(ctx_tgt, result.tok, special_ok);
+            result.prob         = 1.0f;
+
+            if (slot->task->params.sampling.n_probs > 0) {
+                populate_token_probs(*slot, result, slot->task->params.post_sampling_probs, params_base.special, tok_idx);
+            }
+
+            const bool cont = process_token(result, *slot);
+            if (!cont) {
+                slot->print_timings();
+                send_final_response(*slot);
+                metrics.on_prediction(*slot);
+                slot->release();
+            }
+
+            sampled.push_back(id);
+            stops.push_back(cont ? 0 : 1);
+        }
+
+        llama_paged_scheduler_update(paged_sched, &pbatch, sampled.data(), stops.data());
+    }
+
     void update_slots() {
+        // 4d: the scheduler owns batching entirely in paged mode
+        if (paged_sched) {
+            update_slots_paged();
+
+            // self-drive like the static path: as long as any slot is processing, keep
+            // the decode loop ticking (without this the engine only advances on external
+            // task events and generation crawls to client-timeout)
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    SRV_DBG("%s", "paged: posting NEXT_RESPONSE\n");
+                    server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
+                    task.id = queue_tasks.get_new_id();
+                    queue_tasks.post(std::move(task));
+                    break;
+                }
+            }
+            return;
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();

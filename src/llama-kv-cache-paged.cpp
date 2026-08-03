@@ -362,10 +362,16 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch(llama_batch_allocr & b
             break;
         }
 
-        auto ctx = std::make_unique<llama_kv_cache_paged_context>(this, std::move(ubatches));
-
         // Do not use balloc's internal batch. It does not carry any paged metadata.
-        GGML_ASSERT(last_paged_info && "no paged batch info set before init_batch was called.");
+        // No batch info = nothing scheduled this decode (e.g. load-time probe decodes
+        // before a scheduler exists). Fail the prepare gracefully instead of aborting --
+        // callers treat it as decode-failure, and the 4d server loop always sets info.
+        if (last_paged_info == nullptr) {
+            LLAMA_LOG_WARN("%s: no paged batch info set (no scheduler drove this decode) -> failed prepare\n", __func__);
+            break;
+        }
+
+        auto ctx = std::make_unique<llama_kv_cache_paged_context>(this, std::move(ubatches));
         ctx->set_batch_data(*last_paged_info);
         return ctx;
     } while (false);
@@ -378,10 +384,12 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch_with_ubatches(std::vec
         return std::make_unique<llama_kv_cache_paged_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
-    auto ctx = std::make_unique<llama_kv_cache_paged_context>(this, std::move(ubatches));
+    if (last_paged_info == nullptr) {
+        LLAMA_LOG_WARN("%s: no paged batch info set -> failed prepare\n", __func__);
+        return std::make_unique<llama_kv_cache_paged_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
 
-    // same ordering contract as init_batch: the scheduler must have set the batch info first
-    GGML_ASSERT(last_paged_info && "no paged batch info set before init_batch_with_ubatches was called.");
+    auto ctx = std::make_unique<llama_kv_cache_paged_context>(this, std::move(ubatches));
     ctx->set_batch_data(*last_paged_info);
     return ctx;
 }
