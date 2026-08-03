@@ -1835,6 +1835,17 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    // P1-5: on a RAM miss, probe the disk bank; an admitted entry joins `states` and is
+    // used exactly like a RAM hit (P0-2 identity checked inside probe; entry arrives
+    // unsealed). Tail beyond the stored prefix replays through the normal prompt path.
+    if (it_best == states.end() && server_kv_bank::instance().active()) {
+        server_prompt_cache_state banked;
+        if (server_kv_bank::instance().probe(tokens_new, build_identity(ctx_tgt), banked)) {
+            states.push_back(std::move(banked));
+            it_best = std::prev(states.end());
+        }
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 

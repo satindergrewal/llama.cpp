@@ -7,12 +7,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <dirent.h>
 
 // v0 file format (little-endian):
 //   magic   "KVBK"                       4 B
 //   version u32 = 1                      4 B
 //   id_len  u32, identity bytes          (P0-2 binding_identity, "" = unsealed entry)
-//   n_tok   u64                          (prompt token count; token ids follow in v1+)
+//   n_tok   u64, token ids (i32 each)    (prompt tokens -- the probe's LCP key)
 //   main_sz u64, main bytes              (llama_state_seq payload, target)
 //   drft_sz u64, drft bytes              (draft payload, may be 0)
 // File name: kvbk-<fnv1a64 of identity+sizes+n_tok>.kv (content-addressing proper lands
@@ -79,6 +80,11 @@ void server_kv_bank::spill(const server_prompt_cache_state & entry) {
     ok = ok && fwrite(&id_len, sizeof(id_len), 1, f) == 1;
     ok = ok && (id_len == 0 || fwrite(ident.data(), 1, id_len, f) == id_len);
     ok = ok && fwrite(&n_tok, sizeof(n_tok), 1, f) == 1;
+    {
+        const llama_tokens toks = entry.prompt.tokens.get_text_tokens();
+        ok = ok && (uint64_t) toks.size() == n_tok;
+        ok = ok && (n_tok == 0 || fwrite(toks.data(), sizeof(llama_token), (size_t) n_tok, f) == (size_t) n_tok);
+    }
     ok = ok && fwrite(&main_sz, sizeof(main_sz), 1, f) == 1;
     ok = ok && fwrite(entry.data.main.data(), 1, (size_t) main_sz, f) == (size_t) main_sz;
     ok = ok && fwrite(&drft_sz, sizeof(drft_sz), 1, f) == 1;
@@ -98,4 +104,125 @@ void server_kv_bank::spill(const server_prompt_cache_state & entry) {
     SRV_INF(" - kv-bank: spilled evicted entry -> %s (%.3f MiB, n_tok = %llu, total spills = %llu)\n",
             path, (main_sz + drft_sz) / (1024.0 * 1024.0),
             (unsigned long long) n_tok, (unsigned long long) n_spilled);
+}
+
+// ---- probe/admit (increment 2) ----
+
+// read one bank file's header + tokens; leaves fp positioned at main_sz on success
+static bool bank_read_head(FILE * f, std::string & ident, std::vector<llama_token> & toks) {
+    char magic[4];
+    uint32_t ver = 0, id_len = 0;
+    uint64_t n_tok = 0;
+
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "KVBK", 4) != 0) return false;
+    if (fread(&ver, sizeof(ver), 1, f) != 1 || ver != 1)             return false;
+    if (fread(&id_len, sizeof(id_len), 1, f) != 1)                   return false;
+
+    ident.resize(id_len);
+    if (id_len && fread(&ident[0], 1, id_len, f) != id_len)          return false;
+    if (fread(&n_tok, sizeof(n_tok), 1, f) != 1)                     return false;
+    if (n_tok > (1ull << 32))                                        return false; // sanity
+
+    toks.resize((size_t) n_tok);
+    if (n_tok && fread(toks.data(), sizeof(llama_token), (size_t) n_tok, f) != (size_t) n_tok) return false;
+
+    return true;
+}
+
+bool server_kv_bank::probe(const server_tokens & tokens_new, const std::string & identity_cur,
+                           server_prompt_cache_state & out) {
+    if (!active()) {
+        return false;
+    }
+
+    DIR * d = opendir(dir.c_str());
+    if (d == nullptr) {
+        return false;
+    }
+
+    // pick the file whose stored tokens share the longest prefix with the incoming prompt,
+    // subject to the salvage floor (>= 1/8 of the new prompt, per the design)
+    std::string best_path;
+    size_t      best_lcp = 0;
+
+    const llama_tokens new_toks = tokens_new.get_text_tokens();
+    const size_t floor_lcp = new_toks.size() / 8;
+
+    for (dirent * e = readdir(d); e != nullptr; e = readdir(d)) {
+        const std::string name = e->d_name;
+        if (name.size() < 4 || name.compare(name.size() - 3, 3, ".kv") != 0) {
+            continue;
+        }
+
+        const std::string path = dir + "/" + name;
+        FILE * f = fopen(path.c_str(), "rb");
+        if (f == nullptr) continue;
+
+        std::string ident;
+        std::vector<llama_token> toks;
+        const bool head_ok = bank_read_head(f, ident, toks);
+        fclose(f);
+
+        if (!head_ok) continue;
+        if (!ident.empty() && !identity_cur.empty() && ident != identity_cur) {
+            continue; // never feed a state from a different model/build
+        }
+
+        size_t lcp = 0;
+        while (lcp < toks.size() && lcp < new_toks.size() && toks[lcp] == new_toks[lcp]) {
+            lcp++;
+        }
+
+        if (lcp > best_lcp) {
+            best_lcp  = lcp;
+            best_path = path;
+        }
+    }
+    closedir(d);
+
+    if (best_path.empty() || best_lcp < floor_lcp || best_lcp == 0) {
+        n_probe_miss++;
+        return false;
+    }
+
+    // rebuild the entry
+    FILE * f = fopen(best_path.c_str(), "rb");
+    if (f == nullptr) { n_probe_miss++; return false; }
+
+    std::string ident;
+    std::vector<llama_token> toks;
+    if (!bank_read_head(f, ident, toks)) { fclose(f); n_probe_miss++; return false; }
+
+    uint64_t main_sz = 0, drft_sz = 0;
+    bool ok = fread(&main_sz, sizeof(main_sz), 1, f) == 1;
+    if (ok) {
+        out.data.main.resize((size_t) main_sz);
+        ok = main_sz == 0 || fread(out.data.main.data(), 1, (size_t) main_sz, f) == (size_t) main_sz;
+    }
+    if (ok && fread(&drft_sz, sizeof(drft_sz), 1, f) == 1 && drft_sz > 0) {
+        out.data.drft.resize((size_t) drft_sz);
+        ok = fread(out.data.drft.data(), 1, (size_t) drft_sz, f) == (size_t) drft_sz;
+    }
+    fclose(f);
+
+    if (!ok) {
+        SRV_WRN(" - kv-bank: short read on %s, ignoring\n", best_path.c_str());
+        out.data.main.clear();
+        out.data.drft.clear();
+        n_probe_miss++;
+        return false;
+    }
+
+    out.prompt.tokens.insert(toks); // default-constructed; copy-assign is deleted by design
+
+    // identity was checked against identity_cur above; the v1 file carries no payload
+    // hashes, so admit UNSEALED (empty identity = reval skipped) rather than sealed with
+    // zero hashes, which P0-2's hash check would rightly fail
+    out.binding_identity.clear();
+
+    n_admitted++;
+    SRV_INF(" - kv-bank: admitted %s (lcp = %zu of %zu new tokens, %.3f MiB, admits = %llu)\n",
+            best_path.c_str(), best_lcp, new_toks.size(),
+            (main_sz + drft_sz) / (1024.0 * 1024.0), (unsigned long long) n_admitted);
+    return true;
 }
