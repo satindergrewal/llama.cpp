@@ -362,7 +362,7 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
 // Per-query online-softmax state lives in registers (m, l, acc slice per lane), so Q_TILE
 // is bounded by register pressure: 8 queries x 4 dims-per-lane = 32 acc registers.
 // Cross-warp merge is the same log-sum-exp as the decode kernel, done per query.
-#define PAGED_Q_TILE 8
+#define PAGED_Q_TILE 16
 
 __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ q,
                                                      const half * __restrict__ kv_cache,
@@ -421,7 +421,7 @@ __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ 
     const int ctx_len   = context_lens[seq_idx];
     const int first_pos = ctx_len - num_new_tokens;   // logical pos of query 0 of the batch
 
-    float m_i[PAGED_Q_TILE], l_i[PAGED_Q_TILE], acc_i[PAGED_Q_TILE][4];
+    float m_i[PAGED_Q_TILE], l_i[PAGED_Q_TILE], acc_i[PAGED_Q_TILE][4];  // Q_TILE x dpl acc registers
     #pragma unroll
     for (int i = 0; i < PAGED_Q_TILE; ++i) {
         m_i[i] = -FLT_MAX; l_i[i] = 0.0f;
