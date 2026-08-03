@@ -221,7 +221,9 @@
 
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
-#define GGML_MAX_SRC            10
+// 12 (was 10): paged_attn uses src[0..9]; the banded variant adds rel_logits at src[10]
+// (see ggml_paged_attn_banded); 11th slot spare for symmetry/alignment
+#define GGML_MAX_SRC            12
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
@@ -2995,6 +2997,31 @@ extern "C" {
                                                   float                 scale,
                                                   int                   block_size,
                                                   int                   max_blocks);
+
+    // paged attention with the banded relative-position bias (3b: paged hybrid archs).
+    // Same op as ggml_paged_attn with rel_logits at src[10]; rel_extent and
+    // visibility_window live at op_params bytes [16,24) and [24,32) (the banded FA layout).
+    //   score += rel_logits[rel_dist] iff 0 <= rel_dist < rel_extent (rel_dist is LOGICAL,
+    //   from context positions -- block scattering does not affect it)
+    //   visibility_window > 0: analytic band, cell visible iff 0 <= rel_dist < window
+    // rel_logits == NULL degrades to exactly ggml_paged_attn.
+    GGML_API struct ggml_tensor * ggml_paged_attn_banded(struct ggml_context * ctx,
+                                                  struct ggml_tensor  * q,
+                                                  struct ggml_tensor  * k_new,
+                                                  struct ggml_tensor  * v_new,
+                                                  struct ggml_tensor  * k_cache,
+                                                  struct ggml_tensor  * v_cache,
+                                                  struct ggml_tensor  * block_table,
+                                                  struct ggml_tensor  * write_slots,
+                                                  struct ggml_tensor  * context_lens,
+                                                  struct ggml_tensor  * batch_offsets,
+                                                  struct ggml_tensor  * batch_lens,
+                                                  struct ggml_tensor  * rel_logits,
+                                                  float                 scale,
+                                                  int                   block_size,
+                                                  int                   max_blocks,
+                                                  int64_t               rel_extent,
+                                                  int64_t               visibility_window);
 
 #ifdef  __cplusplus
 }

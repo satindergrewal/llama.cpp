@@ -12104,6 +12104,9 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
         return;
     }
 
+    // banded variant (rel_logits at src[10], 3b): inner-loop port pending
+    GGML_ASSERT(dst->src[10] == NULL && "paged banded attention is not implemented on CPU yet");
+
     static bool log_warning = false;
     if (!log_warning) {
         log_warning = true;

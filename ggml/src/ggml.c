@@ -8258,3 +8258,44 @@ struct ggml_tensor * ggml_paged_attn(
 
     return result;
 }
+
+struct ggml_tensor * ggml_paged_attn_banded(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * q,
+    struct ggml_tensor  * k_new,
+    struct ggml_tensor  * v_new,
+    struct ggml_tensor  * k_cache,
+    struct ggml_tensor  * v_cache,
+    struct ggml_tensor  * block_table,
+    struct ggml_tensor  * write_slots,
+    struct ggml_tensor  * context_lens,
+    struct ggml_tensor  * batch_offsets,
+    struct ggml_tensor  * batch_lens,
+    struct ggml_tensor  * rel_logits,
+    float                 scale,
+    int                   block_size,
+    int                   max_blocks,
+    int64_t               rel_extent,
+    int64_t               visibility_window) {
+
+    struct ggml_tensor * result = ggml_paged_attn(ctx, q, k_new, v_new, k_cache, v_cache,
+            block_table, write_slots, context_lens, batch_offsets, batch_lens,
+            scale, block_size, max_blocks);
+
+    if (rel_logits) {
+        GGML_ASSERT(rel_logits->type == GGML_TYPE_F32 ||
+                    rel_logits->type == GGML_TYPE_F16 ||
+                    rel_logits->type == GGML_TYPE_BF16);
+        GGML_ASSERT(rel_extent > 0);
+        GGML_ASSERT(rel_logits->ne[0] == rel_extent);
+    }
+    GGML_ASSERT(visibility_window >= 0);
+
+    result->src[10] = rel_logits;
+    // bytes [16,24) and [24,32) -- the banded FA layout (scale/block_size/max_blocks
+    // occupy bytes [0,12) above)
+    memcpy(&result->op_params[4], &rel_extent,        sizeof(rel_extent));
+    memcpy(&result->op_params[6], &visibility_window, sizeof(visibility_window));
+
+    return result;
+}

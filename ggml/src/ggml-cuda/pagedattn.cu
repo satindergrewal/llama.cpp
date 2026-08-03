@@ -149,6 +149,9 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
 }
 
 void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // banded variant (rel_logits at src[10], 3b): inner-loop port pending
+    GGML_ASSERT(dst->src[10] == nullptr && "paged banded attention is not implemented on CUDA yet");
+
     const ggml_tensor * q             = dst->src[0];
     const ggml_tensor * k_new         = dst->src[1];
     const ggml_tensor * v_new         = dst->src[2];
