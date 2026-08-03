@@ -131,8 +131,23 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
             return std::make_unique<llama_memory_hybrid_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        return std::make_unique<llama_memory_hybrid_iswa_context>(
+        // 3b: when the paged pool is active AND its scheduler has set batch info, carry the
+        // paged context alongside (same ubatches -- the recurrent split constraints win).
+        // Dark until scheduler driving lands: has_paged_batch_info() is false without it,
+        // so this cannot trip the init ordering assert.
+        llama_memory_context_ptr paged_ctx;
+        if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
+            paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches); // copy: hybrid ctx owns the originals
+        }
+
+        auto ctx = std::make_unique<llama_memory_hybrid_iswa_context>(
                 this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+
+        if (paged_ctx) {
+            ctx->set_attn_paged_ctx(std::move(paged_ctx));
+        }
+
+        return ctx;
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -293,4 +308,8 @@ const llama_kv_cache_iswa_context * llama_memory_hybrid_iswa_context::get_attn()
 
 const llama_memory_recurrent_context * llama_memory_hybrid_iswa_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
+}
+
+const llama_kv_cache_paged_context * llama_memory_hybrid_iswa_context::get_attn_paged() const {
+    return static_cast<const llama_kv_cache_paged_context *>(ctx_attn_paged.get());
 }

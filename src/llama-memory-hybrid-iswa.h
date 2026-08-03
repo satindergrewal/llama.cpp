@@ -142,6 +142,10 @@ public:
     const llama_kv_cache_iswa_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
 
+    // 3b: the paged attention context when the wrapper's paged pool is active AND the
+    // scheduler has set batch info for it; nullptr otherwise (static path unaffected)
+    const llama_kv_cache_paged_context * get_attn_paged() const;
+
 private:
     // the index of the next ubatch to process
     size_t i_next = 0;
@@ -151,5 +155,12 @@ private:
     const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;
 
+    // 3b: set post-construction by the wrapper's init_batch when the paged pool is active
+    // and scheduler batch info is present; see set_attn_paged_ctx
+    llama_memory_context_ptr ctx_attn_paged;
+
     const llama_memory_status status;
+
+public:
+    void set_attn_paged_ctx(llama_memory_context_ptr ctx) { ctx_attn_paged = std::move(ctx); }
 };

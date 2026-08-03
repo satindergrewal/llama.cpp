@@ -57,6 +57,10 @@ class llama_kv_cache_paged : public llama_memory_i {
     // ubatches to both members, so it cannot let this cache consume balloc itself.
     llama_memory_context_ptr init_batch_with_ubatches(std::vector<llama_ubatch> ubatches);
 
+    // whether the scheduler has set batch info for the current batch (the init_batch
+    // ordering precondition); lets callers route conditionally instead of tripping the assert
+    bool has_paged_batch_info() const { return last_paged_info != nullptr; }
+
     llama_memory_context_ptr init_full() override;
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
