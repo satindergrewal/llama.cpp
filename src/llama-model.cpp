@@ -2231,8 +2231,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         // hand ownership to the wrapper. Pool spans all layers for now; the
                         // attn-only filter refinement comes with the graph path.
                         if (cparams.kv_paged && paged_hybrid_dev) {
-                            LLAMA_LOG_WARN("%s: DS4P_PAGED_HYBRID bring-up: constructing paged attention pool "
-                                    "for a hybrid arch; the paged hybrid graph path is NOT implemented yet\n", __func__);
+                            LLAMA_LOG_INFO("%s: DS4P_PAGED_HYBRID: constructing the hybrid paged attention pool "
+                                    "(graph branch + scheduler discovery landed 2026-08-04; hybrid DECODE gate pending)\n", __func__);
 
                             const uint32_t pg_head_dim   = hparams.n_embd_head_v();
                             const uint32_t pg_n_head     = hparams.n_head_kv();
