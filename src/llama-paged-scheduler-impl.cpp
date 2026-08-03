@@ -432,10 +432,14 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
         GGML_ASSERT(group && "Make sure the candidates are not nullptr.");
 
         const bool    is_prefill = group->n_decoded == 0;
-        const int32_t new_tokens = is_prefill ? group->n_prompt : 1;
+        // P1-6: a forked group arrives with n_past > 0 (prefix inherited by reference), so
+        // prefill must feed only the REMAINDER. Without this the child re-reads from
+        // logical_seq[0] while writing at n_past.. -- wrong tokens at wrong positions.
+        const int32_t n_prefill_done = is_prefill ? (int32_t) group->n_past : 0;
+        const int32_t new_tokens = is_prefill ? (int32_t) group->n_prompt - n_prefill_done : 1;
 
         if (is_prefill) {
-            GGML_ASSERT(group->logical_seq.size() >= (size_t) new_tokens && "logical_seq too small for prefill");
+            GGML_ASSERT(group->logical_seq.size() >= (size_t) (n_prefill_done + new_tokens) && "logical_seq too small for prefill");
         } else {
             GGML_ASSERT(!group->logical_seq.empty() && "logical_seq empty during decode");
         }
@@ -443,7 +447,8 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
         for (int token_idx = 0; token_idx < new_tokens; ++token_idx) {
             int32_t batch_start_id = token_offset + token_idx;
 
-            batch.token[batch_start_id] = is_prefill ? group->logical_seq[token_idx] : group->logical_seq.back();
+            batch.token[batch_start_id] = is_prefill ? group->logical_seq[n_prefill_done + token_idx]
+                                                     : group->logical_seq.back();
             batch.pos[batch_start_id]   = group->n_past + token_idx;  // n_past starts at 0
 
             batch.n_seq_id[batch_start_id]  = 1;

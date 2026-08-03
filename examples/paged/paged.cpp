@@ -220,6 +220,23 @@ int main(int argc, char ** argv) {
 
             int32_t     last_token_in_batch = info->batch_offsets[i] + info->batch_lens[i] - 1;
             llama_token next_token          = common_sampler_sample(sampler, ctx, last_token_in_batch);
+
+            // fork-gate discriminator: dump the raw logit of the sampled token and the
+            // runner-up gap, so a KV defect (large delta) can be told from a near-tie flip
+            if (fork_gate) {
+                const float * lg = llama_get_logits_ith(ctx, last_token_in_batch);
+                if (lg) {
+                    const int n_v = llama_vocab_n_tokens(vocab);
+                    int   best = 0, second = 0;
+                    float bv = -INFINITY, sv = -INFINITY;
+                    for (int t = 0; t < n_v; ++t) {
+                        if (lg[t] > bv) { sv = bv; second = best; bv = lg[t]; best = t; }
+                        else if (lg[t] > sv) { sv = lg[t]; second = t; }
+                    }
+                    LOG_INF("FORKPROBE req %d step %d: top=%d (%.6f) runner=%d (%.6f) gap=%.6f\n",
+                            request_id, (int) accumulated_responses[request_id].size(), best, bv, second, sv, bv - sv);
+                }
+            }
             common_sampler_accept(sampler, next_token, /*accept_grammar=*/true);
             sampled_tokens.push_back(next_token);
             accumulated_responses[request_id] += common_token_to_piece(ctx, next_token);
