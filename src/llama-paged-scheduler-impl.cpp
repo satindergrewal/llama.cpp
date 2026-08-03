@@ -69,7 +69,11 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
 
     const bool deadlock = check_deadlock(n_candidates, n_swapped, n_waiting);
     const bool livelock = check_livelock(n_swapped, prev_n_swapped);  // updates n_livelock_steps
-    if (deadlock || livelock) {
+    // a stall verdict is only terminal when NOTHING can make progress: with live
+    // candidates, a stuck swapped request must not starve the runnable ones (the
+    // true-starved P2-8 arm ticked DEADLOCK forever -- 5M detector lines -- while
+    // runnable groups sat idle behind one unswappable victim)
+    if ((deadlock || livelock) && n_candidates == 0) {
         return llama_scheduler_status::DEADLOCK;
     }
 
