@@ -138,11 +138,26 @@ int main(int argc, char ** argv) {
 
     if (fork_gate) {
         // long enough that the shared prefix spans whole blocks (block_size 16)
-        const std::string base =
+        std::string base =
             "You are a careful research assistant with access to a large archive of "
             "geographic and historical reference material. Follow the standing instructions "
             "precisely and answer concisely. Question: what is the tallest mountain in the "
             "world?";
+
+        // Q4 fork-COST arm: pad the shared prefix to ~N tokens so the independent control
+        // pays real prefill per child while the fork arm inherits by reference. Padding is
+        // PREPENDED context so the question (and thus the answers) stays at the tail.
+        if (const char * s = getenv("LLAMA_PAGED_FORK_PREFIX_TOKENS")) {
+            const int target = atoi(s);
+            const std::string filler =
+                "Archive note: the reference shelf holds maps, surveys, gazetteers and "
+                "expedition logs collected over many decades of fieldwork. ";
+            std::string pad;
+            while ((int) common_tokenize(ctx, pad + base, true).size() < target) {
+                pad += filler;
+            }
+            base = pad + base;
+        }
         const std::string tail_a = " Answer A:";
         const std::string tail_b = " Answer B:";
 
