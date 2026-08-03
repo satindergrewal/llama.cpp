@@ -273,6 +273,9 @@ add_test(NAME test-flash-attn-bias COMMAND test-flash-attn-bias)
 
 add_executable(test-paged-banded test-paged-banded.cpp)
 target_link_libraries(test-paged-banded PRIVATE ggml)
+
+add_executable(test-paged-vs-cpu test-paged-vs-cpu.cpp)
+target_link_libraries(test-paged-vs-cpu PRIVATE ggml)
 add_test(NAME test-paged-banded COMMAND test-paged-banded)
 
 add_executable(test-flash-attn-generic-hash test-flash-attn-generic-hash.cpp)
