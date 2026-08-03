@@ -1675,6 +1675,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "number of physical CPU blocks for paged KV cache (default: 1)",
         [](common_params & params, int value) {
             params.n_cpu_blocks = value;
+            // explicit wins: the auto-fitter silently re-sized an explicit 40-block pool
+            // to 7719 (fill-free-VRAM), defeating every pool-pressure test and taking
+            // 20 GiB beside a co-tenant (caught by the P2-8 evict/preempt arm)
+            params.fit_params = false;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
@@ -1682,6 +1686,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "number of physical GPU blocks for paged KV cache (default: 1)",
         [](common_params & params, int value) {
             params.n_gpu_blocks = value;
+            params.fit_params   = false;  // explicit wins over the auto-fitter
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
