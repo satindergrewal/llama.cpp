@@ -25,7 +25,13 @@ class llama_paged_scheduler_impl {
     llama_sequence_group *         get_group_from_id(int32_t request_id) const;
     const llama_paged_batch_info * get_curr_batch_info() const;
 
+    // hybrid archs keep recurrent state next to the paged pool; a fork cannot rewind
+    // that state to the fork point, so forking must degrade to a full-prefill request
+    void set_hybrid(bool v) { is_hybrid = v; }
+
   private:
+    bool is_hybrid = false;
+
     void insert_sorted_by_arrival_time(llama_sequence_group_ptr new_group, llama_sequence_group_list & list);
 
     bool check_deadlock(uint32_t n_candidates, uint32_t n_swapped, uint32_t n_waiting) const;

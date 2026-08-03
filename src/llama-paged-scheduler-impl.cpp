@@ -96,6 +96,16 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group) {
 }
 
 bool llama_paged_scheduler_impl::queue_forked_request(llama_sequence_group group, int32_t parent_request_id) {
+    // hybrid archs: the recurrent members hold per-seq state that cannot be rewound to
+    // the fork point -- inherited attention KV without matching recurrent state is wrong
+    // (and measured as a segfault on the fixture). Degrade loudly to a full prefill.
+    if (is_hybrid) {
+        LLAMA_LOG_WARN("%s: request %d: fork unsupported on hybrid archs (recurrent state "
+                       "cannot rewind); queueing as a normal request\n",
+                       __func__, group.request_id);
+        return queue_request(std::move(group));
+    }
+
     auto it = id_to_group.find(parent_request_id);
     if (it == id_to_group.end() || it->second == nullptr) {
         LLAMA_LOG_ERROR("%s: parent request %d not found; queueing as a normal request\n",

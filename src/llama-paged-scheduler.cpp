@@ -17,13 +17,15 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
     }
 
     // Get the paged kv cache
-    auto * paged_kv = dynamic_cast<llama_kv_cache_paged *>(ctx->get_memory());
+    bool   is_hybrid = false;
+    auto * paged_kv  = dynamic_cast<llama_kv_cache_paged *>(ctx->get_memory());
     if (!paged_kv) {
         // 3b hybrid archs: the pool lives inside the hybrid wrapper, not as the whole memory
         if (auto * hyb = dynamic_cast<llama_memory_hybrid_iswa *>(ctx->get_memory())) {
             paged_kv = hyb->get_mem_attn_paged();
             if (paged_kv) {
                 LLAMA_LOG_INFO("%s: using the hybrid wrapper's paged attention pool\n", __func__);
+                is_hybrid = true;
             }
         }
     }
@@ -44,7 +46,9 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
     GGML_ASSERT(n_batch == ctx->n_ubatch() && "kv_paged requires n_batch == n_ubatch.");
 
     try {
-        return new llama_paged_scheduler(n_ctx, block_sz, n_batch, paged_kv);
+        auto * sched = new llama_paged_scheduler(n_ctx, block_sz, n_batch, paged_kv);
+        sched->impl.set_hybrid(is_hybrid);
+        return sched;
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: Error when creating llama_paged_scheduler: %s\n", __func__, e.what());
         return nullptr;
