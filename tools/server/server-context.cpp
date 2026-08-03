@@ -1948,6 +1948,10 @@ private:
                 return false;
             }
             slot.t_start_process_prompt = ggml_time_us();
+            // the scheduler owns prefill, so the classic DONE_PROMPT site that zeroes the
+            // generation counter never runs for paged slots; a reused slot would otherwise
+            // inherit the previous task's n_decoded and hit "stopped by limit" early
+            slot.n_decoded = 0;
             SLT_INF(slot, "paged: request registered (%zu tokens)\n", toks.size());
         }
 
@@ -2925,6 +2929,7 @@ private:
             }
             if (slot == nullptr) {
                 SRV_WRN("paged: no processing slot for request %d, stopping it\n", request_id);
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), request_id, -1, -1);
                 sampled.push_back(0);
                 stops.push_back(1);
                 continue;
@@ -2963,6 +2968,11 @@ private:
                 send_final_response(*slot);
                 metrics.on_prediction(*slot);
                 slot->release();
+                // hybrid archs keep a static attn+recr cache alongside the paged pool and
+                // the scheduler frees only paged blocks; without clearing the static side a
+                // later request reusing this seq id fails batch validation (non-zero start
+                // pos). On flat paged this only erases position bookkeeping.
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), request_id, -1, -1);
             }
 
             sampled.push_back(id);
