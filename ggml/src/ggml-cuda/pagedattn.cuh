@@ -25,6 +25,10 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
                                               const int    block_size,
                                               const int    max_blocks,
                                               const float  scale,
+                                              // banded (3b): rel_logits [rel_extent, n_heads, n_tokens] F32 or nullptr
+                                              const float * __restrict__ rel,
+                                              const int64_t rel_extent,
+                                              const int64_t visibility_window,
                                               float * __restrict__ out);
 
 void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
