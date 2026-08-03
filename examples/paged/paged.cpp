@@ -303,7 +303,11 @@ int main(int argc, char ** argv) {
 
         llama_paged_scheduler_update(scheduler, &batch, sampled_tokens.data(), stop_flags.data());
 
-        if (!fork_pending_a.empty()) {
+        // chunked prefill: the first update() may be a mid-prompt chunk, so "one loop
+        // iteration passed" no longer implies the parent prefilled -- gate the fork on an
+        // actually-sampled parent token (the scheduler ALSO caps inheritance at the
+        // parent's n_past now, so a too-early fork degrades instead of corrupting)
+        if (!fork_pending_a.empty() && !accumulated_responses[0].empty()) {
             // parent has decoded at least one token -> its prefix blocks exist
             if (fork_deferred_indep) {
                 llama_paged_scheduler_add_request(scheduler, fork_pending_a.data(), fork_pending_a.size(), 1);

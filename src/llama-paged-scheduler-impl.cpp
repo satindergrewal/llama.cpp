@@ -112,6 +112,12 @@ bool llama_paged_scheduler_impl::queue_forked_request(llama_sequence_group group
     while (n_shared < n_cmp && parent.logical_seq[n_shared] == group.logical_seq[n_shared]) {
         n_shared++;
     }
+    // chunked prefill: KV blocks are allocated for the WHOLE prompt at admission but only
+    // written up to n_past. A mid-prefill parent's token LCP can exceed its actual KV
+    // progress, and sharing those allocated-but-unwritten blocks hands the child garbage
+    // (measured: plausible-but-wrong children, 2-3 logit shifts, CPU and CUDA alike).
+    // Inherit only what the parent has actually computed.
+    n_shared = std::min(n_shared, (size_t) parent.n_past);
     if (n_shared == 0) {
         LLAMA_LOG_WARN("%s: request %d shares no prefix with %d; queueing normally\n",
                        __func__, group.request_id, parent_request_id);
