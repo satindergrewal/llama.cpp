@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-kv-bank.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -1764,6 +1765,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            server_kv_bank::instance().spill(states.front());
             states.pop_front();
         }
     }
@@ -1913,6 +1915,7 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            server_kv_bank::instance().spill(states.front());
             states.pop_front();
         }
     }
@@ -1928,6 +1931,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            server_kv_bank::instance().spill(states.front());
             states.pop_front();
         }
     }
