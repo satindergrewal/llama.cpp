@@ -20,6 +20,9 @@ class server_kv_bank {
 
     bool active() const { return !dir.empty(); }
 
+    // flags override env (env stays as the bring-up path); called once at server init
+    void configure(const std::string & dir_in, int32_t cap_mib);
+
     // best-effort spill of an entry about to be evicted; never throws, never blocks
     // serving on failure (log + drop, per the design)
     void spill(const server_prompt_cache_state & entry);

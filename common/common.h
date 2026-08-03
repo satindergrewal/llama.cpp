@@ -631,6 +631,9 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    std::string kv_bank_dir;             // P1-5 disk KV bank behind the RAM prompt cache ("" = disabled)
+    int32_t     kv_bank_cap_mib = 0;     // bank size cap in MiB (0 = uncapped)
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

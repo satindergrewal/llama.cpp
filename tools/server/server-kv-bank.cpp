@@ -23,6 +23,19 @@
 // File name: kvbk-<fnv1a64 of identity+sizes+n_tok>.kv (content-addressing proper lands
 // with the probe side; this name is collision-safe enough for the spill witness).
 
+void server_kv_bank::configure(const std::string & dir_in, int32_t cap_mib) {
+    if (!dir_in.empty()) {
+        dir = dir_in;
+    }
+    if (cap_mib > 0) {
+        cap_bytes = (uint64_t) cap_mib * 1024ull * 1024ull;
+    }
+    if (active()) {
+        SRV_INF(" - kv-bank: enabled, dir = %s, cap = %s\n", dir.c_str(),
+                cap_bytes ? (std::to_string(cap_bytes / (1024*1024)) + " MiB").c_str() : "uncapped");
+    }
+}
+
 server_kv_bank & server_kv_bank::instance() {
     static server_kv_bank bank;
     return bank;

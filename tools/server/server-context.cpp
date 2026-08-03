@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
+#include "server-kv-bank.h"
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -1466,6 +1467,7 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            server_kv_bank::instance().configure(params_base.kv_bank_dir, params_base.kv_bank_cap_mib);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
