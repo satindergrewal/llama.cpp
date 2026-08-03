@@ -2907,7 +2907,31 @@ private:
         }
 
         if (llama_decode(ctx_tgt, pbatch) != 0) {
-            SRV_ERR("%s", "paged: llama_decode failed\n");
+            // storm breaker: returning here leaves the scheduler un-updated, so the next
+            // tick rebuilds the IDENTICAL failing batch -- one bad batch became an
+            // infinite decode-fail loop (880K+ log lines) that also ballooned the CUDA
+            // pool to a full card. Cancel every request in the failing batch instead:
+            // error the slots, stop the groups, and let the scheduler tear them down.
+            SRV_ERR("%s", "paged: llama_decode failed -- cancelling the batch's requests\n");
+            const llama_paged_batch_info * fail_info = llama_paged_scheduler_get_batch_info(paged_sched);
+            if (fail_info != nullptr) {
+                std::vector<llama_token> fail_sampled(fail_info->n_seq, 0);
+                std::vector<int8_t>      fail_stops(fail_info->n_seq, 1);
+                for (int32_t i = 0; i < fail_info->n_seq; ++i) {
+                    const int32_t rid = pbatch.seq_id[fail_info->batch_offsets[i]][0];
+                    for (auto & s : slots) {
+                        if (s.id == rid && s.is_processing()) {
+                            send_error(*s.task, "paged decode failed", ERROR_TYPE_SERVER);
+                            s.release();
+                            break;
+                        }
+                    }
+                }
+                llama_paged_scheduler_update(paged_sched, &pbatch, fail_sampled.data(), fail_stops.data());
+                for (int32_t i = 0; i < fail_info->n_seq; ++i) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), pbatch.seq_id[fail_info->batch_offsets[i]][0], -1, -1);
+                }
+            }
             return;
         }
         llama_synchronize(ctx_tgt);

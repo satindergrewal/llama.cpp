@@ -22,6 +22,10 @@ struct llama_sequence_group {
     uint32_t n_decoded = 0;
     uint32_t n_past    = 0;
 
+    // finish() idempotence: teardown may run eagerly at update-time AND from the
+    // running-list sweep; the second call must no-op (double free_blocks otherwise)
+    bool torn_down = false;
+
     std::vector<llama_token> logical_seq;
     llama_block_ids          block_table;
 };

@@ -186,6 +186,12 @@ void llama_paged_scheduler_impl::set_waiting(llama_sequence_group_ptr group_ptr)
 void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
     GGML_ASSERT(kv_cache_manager && "kv_cache_manager is nullptr.");
     GGML_ASSERT(group.status == llama_sequence_group_status::FINISHED && "Request was not marked as finished.");
+    // idempotent: teardown runs eagerly at update-time and again from the running-list
+    // sweep that removes the group from the list
+    if (group.torn_down) {
+        return;
+    }
+    group.torn_down = true;
     // We prioritize user CB, otherwise we log by default
     if (on_finish_cb) {
         // TODO perhaps just have the callback take sequence_group and user_data
@@ -196,7 +202,13 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
     }
     kv_cache_manager->free_blocks(group);
     group.status = llama_sequence_group_status::FINISHED;
-    id_to_group.erase(group.request_id);
+    // erase only OUR mapping: a new request may already have reused this id (the server
+    // reuses slot ids), and erasing its entry orphans the new request -- the exact
+    // "positions are decreasing" storm the P2-8 queue-not-reject arm caught
+    auto it = id_to_group.find(group.request_id);
+    if (it != id_to_group.end() && it->second == &group) {
+        id_to_group.erase(it);
+    }
 }
 
 // Try to swap a running sequence out to CPU.
@@ -602,6 +614,13 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
         // Default stop flags are n_seq_max
         if (stop_flags[i] || group->n_past >= n_seq_max_ctx) {
             group->status = llama_sequence_group_status::FINISHED;
+            // eager teardown: free blocks and release the id NOW. Waiting for the next
+            // running-list sweep leaves a one-step window where the server relaunches on
+            // this id, queue_request overwrites the map entry, and the late sweep then
+            // erased the NEW request's mapping -- orphaning it mid-flight (the storm's
+            // injection point). finish() is idempotent; the sweep still removes the
+            // group from the running list.
+            finish(*group);
         }
     }
 }
