@@ -21,6 +21,21 @@ static __device__ __forceinline__ float fattn_banded_load(
     }
 }
 
+// Element-indexed variant: quantized rows cannot be addressed as base + d*nb0 (elements
+// live inside blocks), so this takes the row base and the element index. Q8_0 pays a
+// redundant per-element scale load for now - correctness first; per-block hoisting is a
+// later optimization and the 2x-smaller K row is itself a bandwidth win.
+static __device__ __forceinline__ float fattn_banded_load_el(
+        const char * row, const int64_t d, const uint64_t nb0, const int type) {
+    if (type == GGML_TYPE_Q8_0) {
+        const block_q8_0 * b = (const block_q8_0 *) row;
+        const int64_t ibq = d / QK8_0;
+        const int64_t iqs = d % QK8_0;
+        return __half2float(b[ibq].d) * (float) b[ibq].qs[iqs];
+    }
+    return fattn_banded_load(row + uint64_t(d)*nb0, type);
+}
+
 template<int D, int WARPS_PER_BLOCK>
 static __global__ void flash_attn_ext_banded_f32(
         const char * __restrict__ q,
@@ -96,7 +111,7 @@ static __global__ void flash_attn_ext_banded_f32(
 #pragma unroll
         for (int j = 0; j < values_per_lane; ++j) {
             const int d = lane + j*WARP_SIZE;
-            dot += q_reg[j] * fattn_banded_load(k_row + uint64_t(d)*k_nb0, type_k);
+            dot += q_reg[j] * fattn_banded_load_el(k_row, d, k_nb0, type_k);
         }
         dot = warp_reduce_sum(dot);
 
@@ -154,6 +169,13 @@ static bool fattn_banded_type_supported(ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
 }
 
+// K additionally supports Q8_0 via the element-indexed block load; V and rel stay
+// float-family (quantized V without flash attention is refused server-side anyway, and
+// rel logits are always computed tensors).
+static bool fattn_banded_type_k_supported(ggml_type type) {
+    return fattn_banded_type_supported(type) || type == GGML_TYPE_Q8_0;
+}
+
 bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * dst) {
     GGML_UNUSED(device);
 #if defined(GGML_USE_MUSA)
@@ -172,7 +194,7 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     if (!q || !k || !v || !rel || q->type != GGML_TYPE_F32) {
         return false;
     }
-    if (!fattn_banded_type_supported(k->type) ||
+    if (!fattn_banded_type_k_supported(k->type) ||
         !fattn_banded_type_supported(v->type) ||
         !fattn_banded_type_supported(rel->type)) {
         return false;
@@ -186,8 +208,17 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     if (q->ne[3] != k->ne[3] || q->ne[3] != v->ne[3]) {
         return false;
     }
-    if (q->nb[0] != sizeof(float) || k->nb[0] != ggml_type_size(k->type) ||
+    // element-stride contiguity; for a block-quantized K the element stride is the block
+    // size over its element count, and the element-indexed loader walks blocks directly
+    if (q->nb[0] != sizeof(float) ||
         v->nb[0] != ggml_type_size(v->type) || rel->nb[0] != ggml_type_size(rel->type)) {
+        return false;
+    }
+    if (ggml_is_quantized(k->type)) {
+        if (k->ne[0] % ggml_blck_size(k->type) != 0 || k->nb[0] != ggml_type_size(k->type)) {
+            return false;
+        }
+    } else if (k->nb[0] != ggml_type_size(k->type)) {
         return false;
     }
     if (rel->ne[0] <= 0 || rel->ne[1] != q->ne[2] || rel->ne[2] != q->ne[1] ||

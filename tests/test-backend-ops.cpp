@@ -6937,17 +6937,18 @@ struct test_flash_attn_ext_banded : public test_case {
     const int64_t n_kv;
     const int64_t rel_extent;
     const int mask_kind; // 0: none, 1: causal, 2: causal sliding window with dist < rel_extent
-    const ggml_type kv_type;
+    const ggml_type k_type;
+    const ggml_type v_type; // may differ from k_type (e.g. Q8_0 K with F16 V)
     const ggml_type rel_type;
     const bool strided;
     const int64_t n_stream; // ne[3] > 1: multi-sequence streams (per-stream banded attention)
 
     std::string vars() override {
-        return VARS_TO_STR11(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided, n_stream);
+        return VARS_TO_STR12(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, k_type, v_type, rel_type, strided, n_stream);
     }
 
     double max_nmse_err() override {
-        if (kv_type == GGML_TYPE_F32 && rel_type == GGML_TYPE_F32) {
+        if (k_type == GGML_TYPE_F32 && v_type == GGML_TYPE_F32 && rel_type == GGML_TYPE_F32) {
             return 2e-6;
         }
         // fp16 VKQ accumulation error grows with the KV length (plus periodic accumulator
@@ -6964,10 +6965,11 @@ struct test_flash_attn_ext_banded : public test_case {
             int64_t d, int64_t n_head, int64_t n_head_kv,
             int64_t n_q, int64_t n_kv, int64_t rel_extent,
             int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided = false,
-            int64_t n_stream = 1)
+            int64_t n_stream = 1, ggml_type v_type_arg = GGML_TYPE_COUNT)
         : d(d), n_head(n_head), n_head_kv(n_head_kv), n_q(n_q), n_kv(n_kv),
-          rel_extent(rel_extent), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type), strided(strided),
-          n_stream(n_stream) {}
+          rel_extent(rel_extent), mask_kind(mask_kind), k_type(kv_type),
+          v_type(v_type_arg == GGML_TYPE_COUNT ? kv_type : v_type_arg),
+          rel_type(rel_type), strided(strided), n_stream(n_stream) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t ns = n_stream;
@@ -6978,15 +6980,15 @@ struct test_flash_attn_ext_banded : public test_case {
         ggml_tensor * r;
         if (strided) {
             // gaps between rows/heads force the kernels to use the 64-bit byte strides
-            ggml_tensor * kb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, ns);
-            ggml_tensor * vb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, ns);
+            ggml_tensor * kb = ggml_new_tensor_4d(ctx, k_type, 2*d, n_kv, n_head_kv, ns);
+            ggml_tensor * vb = ggml_new_tensor_4d(ctx, v_type, 2*d, n_kv, n_head_kv, ns);
             ggml_tensor * rb = ggml_new_tensor_4d(ctx, rel_type, 2*rel_extent, n_head, n_q, ns);
             k = ggml_view_4d(ctx, kb, d, n_kv, n_head_kv, ns, kb->nb[1], kb->nb[2], kb->nb[3], 0);
             v = ggml_view_4d(ctx, vb, d, n_kv, n_head_kv, ns, vb->nb[1], vb->nb[2], vb->nb[3], 0);
             r = ggml_view_4d(ctx, rb, rel_extent, n_head, n_q, ns, rb->nb[1], rb->nb[2], rb->nb[3], 0);
         } else {
-            k = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, ns);
-            v = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, ns);
+            k = ggml_new_tensor_4d(ctx, k_type, d, n_kv, n_head_kv, ns);
+            v = ggml_new_tensor_4d(ctx, v_type, d, n_kv, n_head_kv, ns);
             r = ggml_new_tensor_4d(ctx, rel_type, rel_extent, n_head, n_q, ns);
         }
         ggml_set_name(q, "q");
@@ -9710,6 +9712,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2, 16, 64,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16, false, 2));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64,   8, 2, GGML_TYPE_F16,  GGML_TYPE_F32, false, 4));
     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 2, 1,  8,  8,   8, 1, GGML_TYPE_F32,  GGML_TYPE_F32, true,  2));
+    // Q8_0 K with F16 V: the quantized-K banded path (B4 arc-2). Q8_0 V is deliberately
+    // unsupported; a single kv_type would make these cases skip instead of testing K.
+    test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2, 16, 64,   8, 1, GGML_TYPE_Q8_0, GGML_TYPE_F16, false, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64,   8, 2, GGML_TYPE_Q8_0, GGML_TYPE_F32, false, 2, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 8192, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, false, 1, GGML_TYPE_F16));
     // production-scale n_kv straddling the observed ~16.4-16.9K garbage threshold
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
