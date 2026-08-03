@@ -87,7 +87,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     // joint multi-stream batch; 128 caps prompts below a single ubatch)
     const uint32_t n_ctx = arch == LLM_ARCH_INKLING ? 8192 : 128;
 
-    uint32_t n_vocab = 128;
+    uint32_t n_vocab = 260; // 3 specials + 256 byte tokens + 1 filler (SPM byte-fallback needs full coverage)
     uint32_t n_embd  = 256;
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
@@ -229,7 +229,35 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
-    ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
+    {
+        // minimal SPM byte vocab so /completion + sampling work on fixtures (hybrid DECODE
+        // gate needs it). 128 entries = the embedding dim: unk/bos/eos + bytes 0x00..0x7C.
+        std::vector<std::string> toks(n_vocab);
+        std::vector<float>       scores(n_vocab, 0.0f);
+        std::vector<int32_t>     ttypes(n_vocab);
+        toks[0] = "<unk>"; ttypes[0] = 2 /*UNKNOWN*/;
+        toks[1] = "<s>";   ttypes[1] = 3 /*CONTROL*/;
+        toks[2] = "</s>";  ttypes[2] = 3 /*CONTROL*/;
+        for (uint32_t i = 3; i < n_vocab; ++i) {
+            char buf[16];
+            if (i - 3 < 256) {
+                snprintf(buf, sizeof(buf), "<0x%02X>", i - 3);
+                ttypes[i] = 6 /*BYTE*/;
+            } else {
+                snprintf(buf, sizeof(buf), "<x%u>", i);  // filler for wide-vocab archs
+                ttypes[i] = 1 /*NORMAL*/;
+            }
+            toks[i] = buf;
+        }
+        ms.add_kv(LLM_KV_TOKENIZER_MODEL,      "llama");
+        ms.add_kv(LLM_KV_TOKENIZER_LIST,       toks);
+        ms.add_kv(LLM_KV_TOKENIZER_SCORES,     scores);
+        ms.add_kv(LLM_KV_TOKENIZER_TOKEN_TYPE, ttypes);
+        ms.add_kv(LLM_KV_TOKENIZER_BOS_ID,     uint32_t(1));
+        ms.add_kv(LLM_KV_TOKENIZER_EOS_ID,     uint32_t(2));
+        ms.add_kv(LLM_KV_TOKENIZER_UNK_ID,     uint32_t(0));
+        ms.add_kv(LLM_KV_TOKENIZER_ADD_BOS,    true);
+    }
     // ms.add_kv(LLM_KV_DENSE_2_FEAT_OUT,     n_embd);
     // ms.add_kv(LLM_KV_DENSE_3_FEAT_IN,      n_embd);
 
