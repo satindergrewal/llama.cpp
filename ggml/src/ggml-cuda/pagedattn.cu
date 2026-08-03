@@ -802,7 +802,7 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
 #define PAGED_MMA_WARPS 4
 #define PAGED_MMA_M     16
 #define PAGED_MMA_N     16
-#define PAGED_MMA_KV    16   // keys staged per round (64 measured worse: smem cost occupancy)
+#define PAGED_MMA_KV    32   // keys staged per round (64 measured worse: smem cost occupancy)
 #define PAGED_MMA_LDV   (PAGED_MMA_KV + 8)   // pad; multiple of 8 halves for ldmatrix
 
 template <int HD>
