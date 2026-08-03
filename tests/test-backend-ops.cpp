@@ -6940,9 +6940,10 @@ struct test_flash_attn_ext_banded : public test_case {
     const ggml_type kv_type;
     const ggml_type rel_type;
     const bool strided;
+    const int64_t n_stream; // ne[3] > 1: multi-sequence streams (per-stream banded attention)
 
     std::string vars() override {
-        return VARS_TO_STR10(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided);
+        return VARS_TO_STR11(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided, n_stream);
     }
 
     double max_nmse_err() override {
@@ -6956,33 +6957,37 @@ struct test_flash_attn_ext_banded : public test_case {
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return 4*n_head*n_q*n_kv*d;
+        return 4*n_head*n_q*n_kv*d*n_stream;
     }
 
     test_flash_attn_ext_banded(
             int64_t d, int64_t n_head, int64_t n_head_kv,
             int64_t n_q, int64_t n_kv, int64_t rel_extent,
-            int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided = false)
+            int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided = false,
+            int64_t n_stream = 1)
         : d(d), n_head(n_head), n_head_kv(n_head_kv), n_q(n_q), n_kv(n_kv),
-          rel_extent(rel_extent), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type), strided(strided) {}
+          rel_extent(rel_extent), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type), strided(strided),
+          n_stream(n_stream) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, 1);
+        const int64_t ns = n_stream;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, ns);
         ggml_tensor * k;
         ggml_tensor * v;
         ggml_tensor * r;
         if (strided) {
             // gaps between rows/heads force the kernels to use the 64-bit byte strides
-            ggml_tensor * kb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, 1);
-            ggml_tensor * vb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, 1);
-            ggml_tensor * rb = ggml_new_tensor_4d(ctx, rel_type, 2*rel_extent, n_head, n_q, 1);
-            k = ggml_view_4d(ctx, kb, d, n_kv, n_head_kv, 1, kb->nb[1], kb->nb[2], kb->nb[3], 0);
-            v = ggml_view_4d(ctx, vb, d, n_kv, n_head_kv, 1, vb->nb[1], vb->nb[2], vb->nb[3], 0);
-            r = ggml_view_4d(ctx, rb, rel_extent, n_head, n_q, 1, rb->nb[1], rb->nb[2], rb->nb[3], 0);
+            ggml_tensor * kb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, ns);
+            ggml_tensor * vb = ggml_new_tensor_4d(ctx, kv_type, 2*d, n_kv, n_head_kv, ns);
+            ggml_tensor * rb = ggml_new_tensor_4d(ctx, rel_type, 2*rel_extent, n_head, n_q, ns);
+            k = ggml_view_4d(ctx, kb, d, n_kv, n_head_kv, ns, kb->nb[1], kb->nb[2], kb->nb[3], 0);
+            v = ggml_view_4d(ctx, vb, d, n_kv, n_head_kv, ns, vb->nb[1], vb->nb[2], vb->nb[3], 0);
+            r = ggml_view_4d(ctx, rb, rel_extent, n_head, n_q, ns, rb->nb[1], rb->nb[2], rb->nb[3], 0);
         } else {
-            k = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
-            v = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, 1);
-            r = ggml_new_tensor_4d(ctx, rel_type, rel_extent, n_head, n_q, 1);
+            k = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, ns);
+            v = ggml_new_tensor_4d(ctx, kv_type, d, n_kv, n_head_kv, ns);
+            r = ggml_new_tensor_4d(ctx, rel_type, rel_extent, n_head, n_q, ns);
         }
         ggml_set_name(q, "q");
         ggml_set_name(k, "k");
@@ -6991,7 +6996,7 @@ struct test_flash_attn_ext_banded : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask_kind != 0) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, ns);
             ggml_set_name(m, "m");
         }
 
@@ -7004,12 +7009,16 @@ struct test_flash_attn_ext_banded : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
-                std::vector<ggml_fp16_t> data(n_q*n_kv);
-                for (int64_t iq = 0; iq < n_q; ++iq) {
-                    for (int64_t ik = 0; ik < n_kv; ++ik) {
-                        const int64_t rel_dist = iq + (n_kv - n_q) - ik;
-                        const bool visible = rel_dist >= 0 && (mask_kind == 1 || rel_dist < rel_extent);
-                        data[iq*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                // same causal band per stream; per-stream VALUES still differ because q/k/v
+                // are random per stream, which is what catches cross-stream index mixups
+                std::vector<ggml_fp16_t> data(n_stream*n_q*n_kv);
+                for (int64_t is = 0; is < n_stream; ++is) {
+                    for (int64_t iq = 0; iq < n_q; ++iq) {
+                        for (int64_t ik = 0; ik < n_kv; ++ik) {
+                            const int64_t rel_dist = iq + (n_kv - n_q) - ik;
+                            const bool visible = rel_dist >= 0 && (mask_kind == 1 || rel_dist < rel_extent);
+                            data[is*n_q*n_kv + iq*n_kv + ik] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                        }
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
@@ -9696,6 +9705,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64,   8, 2, GGML_TYPE_BF16, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 1, 64, 64, 512, 1, GGML_TYPE_F16,  GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 17, 33,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16, true));
+    // multi-stream (ne[3] > 1): the per-stream banded serving path; catches cross-stream
+    // index/broadcast mixups the single-stream cases cannot see
+    test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2, 16, 64,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16, false, 2));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64,   8, 2, GGML_TYPE_F16,  GGML_TYPE_F32, false, 4));
+    test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 2, 1,  8,  8,   8, 1, GGML_TYPE_F32,  GGML_TYPE_F32, true,  2));
     // production-scale n_kv straddling the observed ~16.4-16.9K garbage threshold
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
