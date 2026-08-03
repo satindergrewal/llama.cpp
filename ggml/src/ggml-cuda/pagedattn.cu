@@ -806,7 +806,10 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
 #define PAGED_MMA_LDV   (PAGED_MMA_KV + 8)   // pad; multiple of 8 halves for ldmatrix
 
 template <int HD>
-__global__ __launch_bounds__(128, 4)   // profile: blocks/SM was register-capped at 2
+__global__ __launch_bounds__(128, 4)   // 5 MEASURED WORSE (3,942 vs 3,113): the re-profile
+                                      // says smem allows a 5th block and registers refuse it,
+                                      // but forcing it spills more than the warps return.
+                                      // Getting past 4 needs a STRUCTURAL register cut.
 void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
                                         const half * __restrict__ kv_cache,
                                         const int * __restrict__ block_table,
