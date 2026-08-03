@@ -5538,7 +5538,8 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
         struct ggml_tensor  * mask,
         struct ggml_tensor  * rel_logits,
         float                 scale,
-        int64_t               rel_extent) {
+        int64_t               rel_extent,
+        int64_t               visibility_window) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(q->ne[3] == k->ne[3]);
@@ -5563,12 +5564,19 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
         GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);
     }
 
+    // the analytic band replaces the mask tensor entirely; both at once is ambiguous
+    GGML_ASSERT(visibility_window >= 0);
+    GGML_ASSERT(visibility_window == 0 || mask == NULL);
+
     int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, 0.0f, 0.0f };
     ggml_set_op_params(result, params, sizeof(params));
-    memcpy(result->op_params + 16, &rel_extent, sizeof(rel_extent));
+    // op_params is int32_t[16] (64 bytes): index 4 = byte 16, index 6 = byte 24;
+    // the previous `op_params + 16` (int32 arithmetic = byte 64) wrote past the array into flags
+    memcpy(&result->op_params[4], &rel_extent,        sizeof(rel_extent));
+    memcpy(&result->op_params[6], &visibility_window, sizeof(visibility_window));
 
     result->op     = GGML_OP_FLASH_ATTN_EXT_BANDED;
     result->src[0] = q;

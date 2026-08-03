@@ -2454,6 +2454,9 @@ extern "C" {
     // flash attention with an additive banded relative-position bias, applied after scale, no dense bias tensor:
     //   rel_logits: [rel_extent, n_head, n_batch, ne3]; rel_dist = q_idx + (n_kv - n_batch) - kv_idx
     //   score += rel_logits[rel_dist, head, q_idx, batch] iff 0 <= rel_dist < rel_extent
+    //   visibility_window > 0 selects the analytic band: mask must be NULL and a cell is visible
+    //   iff 0 <= rel_dist < visibility_window (causal + sliding window without a mask tensor);
+    //   visibility_window == 0 keeps the explicit-mask semantics (mask may still be NULL = no mask)
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_banded(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2462,7 +2465,8 @@ extern "C" {
             struct ggml_tensor  * mask,
             struct ggml_tensor  * rel_logits,
             float                 scale,
-            int64_t               rel_extent);
+            int64_t               rel_extent,
+            int64_t               visibility_window);
 
     // sparse flash attention over the indexer-selected top-k keys only ("DSA"):
     //   topk_idx: [top_k, n_batch, 1, 1] I32; row i lists the kv positions selected for query token i

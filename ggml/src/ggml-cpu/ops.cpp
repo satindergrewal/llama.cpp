@@ -8601,6 +8601,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
 
+    // analytic band (banded FA only; op_params are zero-initialized for every other op):
+    // a cell is visible iff 0 <= rel_dist < visibility_window, no mask tensor involved
+    int64_t visibility_window = 0;
+    memcpy(&visibility_window, &dst->op_params[6], sizeof(visibility_window));
+
     if (logit_softcap != 0) {
         scale /= logit_softcap;
     }
@@ -8665,6 +8670,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
+            }
+
+            // analytic band: skip invisible cells before paying for the dot product;
+            // same FA4 tail-alignment convention as the rel_logits gate below
+            if (visibility_window > 0) {
+                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+                if (rel_dist < 0 || rel_dist >= visibility_window) {
+                    continue;
+                }
             }
 
             float s; // KQ value

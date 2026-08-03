@@ -54,6 +54,7 @@ static __global__ void flash_attn_ext_banded_f32(
         int64_t n_head_kv,
         int64_t n_batch,
         int64_t rel_extent,
+        int64_t visibility_window,
         int64_t mask_ne2,
         int64_t mask_ne3,
         uint64_t q_nb1,
@@ -129,6 +130,11 @@ static __global__ void flash_attn_ext_banded_f32(
                     uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
                     uint64_t(ib % mask_ne3)*m_nb3;
                 score += __half2float(*(const half *) mask_value);
+            }
+            // analytic band: no mask tensor; a cell is visible iff 0 <= rel_dist < window
+            // (the rel_logits gate above keeps its own independent rel_extent bound)
+            if (visibility_window > 0 && (rel_dist < 0 || rel_dist >= visibility_window)) {
+                score = -INFINITY;
             }
         }
         score = __shfl_sync(0xffffffff, score, 0, WARP_SIZE);
@@ -239,8 +245,14 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     const ggml_tensor * m   = dst->src[3];
     const ggml_tensor * rel = dst->src[5];
 
-    // route F16/BF16 K/V to the MMA kernel; keep this FP32 kernel for mixed types and strided rel
-    if (k->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F32 &&
+    // analytic band: the visibility comes from op_params, not a mask tensor
+    int64_t visibility_window = 0;
+    memcpy(&visibility_window, &dst->op_params[6], sizeof(visibility_window));
+
+    // route F16/BF16 K/V to the MMA kernel; keep this FP32 kernel for mixed types and strided rel.
+    // the MMA path derives visibility from the mask tensor only, so the analytic band must not take it
+    if (visibility_window == 0 &&
+        k->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F32 &&
         rel->type == GGML_TYPE_F32 && ggml_is_contiguous(rel) &&
         // MMA ABI indexes rel by Q's batch: a singleton rel batch must take the stride-aware fallback
         rel->ne[3] == q->ne[3] && rel->ne[0] <= (1 << 20)) {
@@ -263,7 +275,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
         (const char *) q->data, (const char *) k->data, (const char *) v->data, \
         m ? (const char *) m->data : nullptr, (const char *) rel->data, (float *) dst->data, \
         scale, k->type, v->type, rel->type, q->ne[1], k->ne[1], q->ne[2], k->ne[2], q->ne[3], \
-        rel_extent, m ? m->ne[2] : 1, m ? m->ne[3] : 1, \
+        rel_extent, visibility_window, m ? m->ne[2] : 1, m ? m->ne[3] : 1, \
         q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
         v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \

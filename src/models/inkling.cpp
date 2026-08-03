@@ -516,7 +516,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
                         mask_all->nb[1], mask_all->nb[2], mask_all->nb[3], is*mask_all->nb[3]));
 
                 ggml_tensor * cur_s = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, mask, rel_fa,
-                        1.0f/float(head_dim), rel_extent);
+                        1.0f/float(head_dim), rel_extent, 0);
                 ggml_flash_attn_ext_set_prec(cur_s, GGML_PREC_F32);
                 res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur_s, il});
 

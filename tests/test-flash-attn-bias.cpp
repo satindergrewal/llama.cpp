@@ -170,7 +170,7 @@ static run_result run_graph(
     ggml_tensor * out;
     ggml_tensor * bias = nullptr;
     if (!dense) {
-        out = ggml_flash_attn_ext_banded(ctx.get(), q, k, v, m, r, 1.0f/float(c.d), c.extent);
+        out = ggml_flash_attn_ext_banded(ctx.get(), q, k, v, m, r, 1.0f/float(c.d), c.extent, 0);
     } else {
         bias = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, c.nkv, c.nq, c.hq, c.n_batch);
         ggml_set_name(bias, "dense_bias");
@@ -360,7 +360,7 @@ static bool overflow_kernel_test(ggml_backend_t backend, const char * backend_ki
     ggml_tensor * r = ggml_view_4d(ctx.get(), r_storage, c.extent, c.hq, c.nq, 1,
         c.extent*sizeof(float), rel_nb2, rel_nb2*c.nq, 0);
     ggml_tensor * out = ggml_flash_attn_ext_banded(
-        ctx.get(), q, k, v, m, r, 1.0f/float(c.d), c.extent);
+        ctx.get(), q, k, v, m, r, 1.0f/float(c.d), c.extent, 0);
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
     GGML_ASSERT(buffer);
 
