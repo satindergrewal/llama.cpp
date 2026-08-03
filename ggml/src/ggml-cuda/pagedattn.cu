@@ -398,6 +398,40 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
     ((size_t) (PAGED_WMMA_M * ((head_dim) + 8) + 2 * PAGED_WMMA_N * ((head_dim) + 8)) * sizeof(half) \
      + (size_t) PAGED_WMMA_M * PAGED_WMMA_N * sizeof(float))
 
+#include <mma.h>
+namespace wmma = nvcuda::wmma;
+
+// stage 2: QK^T for one 16x16 (query-tile x key-tile) pair, accumulated over head_dim in
+// 16-wide chunks. q_h is [M][ld] row-major half; k_h is [N][ld] row-major half, and K^T is
+// obtained WITHOUT a transpose copy by reading k_h as a col_major b-fragment: with base
+// &k_h[0][c*16] and leading dimension ld, element [k][n] resolves to k_h[n][c*16+k],
+// which is exactly K^T for that chunk. Scores land in an f32 accumulator (the whole point:
+// the score tile lives in fragments, not in per-lane registers).
+// One warp owns the tile; the caller supplies smem already staged.
+__device__ __forceinline__ void paged_wmma_qk(const half * __restrict__ q_h,
+                                              const half * __restrict__ k_h,
+                                              const int    ld,          // head_dim + pad
+                                              const int    head_dim,
+                                              const float  scale,
+                                              float * __restrict__ scores_out) {  // [M*N] row-major
+    wmma::fragment<wmma::accumulator, PAGED_WMMA_M, PAGED_WMMA_N, PAGED_WMMA_K, float> frag_acc;
+    wmma::fill_fragment(frag_acc, 0.0f);
+
+    for (int c = 0; c < head_dim; c += PAGED_WMMA_K) {
+        wmma::fragment<wmma::matrix_a, PAGED_WMMA_M, PAGED_WMMA_N, PAGED_WMMA_K, half, wmma::row_major> frag_q;
+        wmma::fragment<wmma::matrix_b, PAGED_WMMA_M, PAGED_WMMA_N, PAGED_WMMA_K, half, wmma::col_major> frag_k;
+        wmma::load_matrix_sync(frag_q, q_h + c, ld);
+        wmma::load_matrix_sync(frag_k, k_h + c, ld);
+        wmma::mma_sync(frag_acc, frag_q, frag_k, frag_acc);
+    }
+
+    #pragma unroll
+    for (int i = 0; i < frag_acc.num_elements; ++i) {
+        frag_acc.x[i] *= scale;   // fold the 1/sqrt(d) here, as the f32 path does at load
+    }
+    wmma::store_matrix_sync(scores_out, frag_acc, PAGED_WMMA_N, wmma::mem_row_major);
+}
+
 
 __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ q,
                                                      const half * __restrict__ kv_cache,
