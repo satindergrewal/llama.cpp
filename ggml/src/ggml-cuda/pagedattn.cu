@@ -889,12 +889,23 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
     float m_r[2] = { -FLT_MAX, -FLT_MAX };
     float l_r[2] = { 0.0f, 0.0f };
 
+    // Analytic band: everything older than the window is invisible, so SKIP it instead of
+    // masking it. The old grid-per-token kernel does this (its `lo`), and without it a
+    // banded model would do the full O(n^2) and throw ~95% away -- a silent regression the
+    // unbanded wall cannot see. Block-level bound = the block's SMALLEST q position;
+    // per-row edges are still handled by the mask below.
+    int lo_blk = 0;
+    if (visibility_window > 0) {
+        lo_blk = max(0, first_pos + q_base - (int) visibility_window + 1);
+        lo_blk = (lo_blk / PAGED_MMA_N) * PAGED_MMA_N;   // keep tiles aligned
+    }
+
     // split-K: this block owns keys [kt_lo, kt_hi); partials merged by the combine kernel.
     // The span is rounded to the mma tile so no split straddles a tile.
     const int span  = (n_splits > 1)
-                    ? ((n_tok + n_splits - 1) / n_splits + PAGED_MMA_N - 1) / PAGED_MMA_N * PAGED_MMA_N
+                    ? ((n_tok - lo_blk + n_splits - 1) / n_splits + PAGED_MMA_N - 1) / PAGED_MMA_N * PAGED_MMA_N
                     : n_tok;
-    const int kt_lo = (n_splits > 1) ? split_idx * span : 0;
+    const int kt_lo = (n_splits > 1) ? lo_blk + split_idx * span : lo_blk;
     const int kt_hi = (n_splits > 1) ? min(n_tok, kt_lo + span) : n_tok;
 
     for (int kt0 = kt_lo; kt0 < kt_hi; kt0 += PAGED_MMA_KV) {
@@ -1184,10 +1195,14 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             const char * s = getenv("DS4P_PAGED_QTILE");
             return s && atoi(s) != 0;
         }();
-        // DS4P_PAGED_QTILE=2 -> the WMMA fragment path (dark: only when asked for)
+        // Prefill kernel selection. 3 = the register-held mma path and now the DEFAULT:
+        // 12.8x over the grid-per-token path (3,426 vs 43,726 ms at 22K), equivalence
+        // max_abs 4.067e-05, byte-identical generation, P2-8 arms 3/3. 0 restores the
+        // original grid-per-token prefill, 1 the f32 tile path, 2 the wmma path.
+        // Unsupported head_dims fall through to 0 on their own.
         static const int qtile_mode = []() {
             const char * s = getenv("DS4P_PAGED_QTILE");
-            return s ? atoi(s) : 0;
+            return s ? atoi(s) : 3;
         }();
         if (qtile_mode == 3 && n_tokens_total > n_seq && (head_dim == 64 || head_dim == 128)) {
             const int    rows_blk  = PAGED_MMA_WARPS * PAGED_MMA_M;
