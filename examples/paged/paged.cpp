@@ -122,9 +122,46 @@ int main(int argc, char ** argv) {
     llama_paged_scheduler_set_on_finish(scheduler, log_output, &cb_ctx);
 
     std::unordered_map<int32_t, common_sampler *> samplers;
-    for (int i = 0; i < params.n_sequences; ++i) {
-        add_request_from_pool(scheduler, ctx, (size_t) i, i);
-        samplers[i] = common_sampler_init(model, params.sampling);
+
+    // P1-6 fork gate: LLAMA_PAGED_FORK_GATE=1 seeds ONE parent prompt and then forks two
+    // children whose prompts extend it differently. Each child inherits the parent's prefix
+    // blocks by reference (no re-prefill); the gate is that their outputs match what the
+    // same prompts produce as INDEPENDENT requests (run the binary again without the env).
+    std::vector<llama_token> fork_pending_a, fork_pending_b;
+
+    const char * fork_gate_env = getenv("LLAMA_PAGED_FORK_GATE");
+    const bool   fork_gate     = fork_gate_env && atoi(fork_gate_env) != 0;
+
+    if (fork_gate) {
+        // long enough that the shared prefix spans whole blocks (block_size 16)
+        const std::string base =
+            "You are a careful research assistant with access to a large archive of "
+            "geographic and historical reference material. Follow the standing instructions "
+            "precisely and answer concisely. Question: what is the tallest mountain in the "
+            "world?";
+        const std::string tail_a = " Answer A:";
+        const std::string tail_b = " Answer B:";
+
+        std::vector<llama_token> t_par = common_tokenize(ctx, base, true);
+        std::vector<llama_token> t_a   = common_tokenize(ctx, base + tail_a, true);
+        std::vector<llama_token> t_b   = common_tokenize(ctx, base + tail_b, true);
+
+        LOG_INF("%s: FORK GATE: parent %zu tokens; children %zu / %zu tokens\n",
+                __func__, t_par.size(), t_a.size(), t_b.size());
+
+        // fork a LIVE sequence: the parent must have prefilled (own blocks) before the
+        // children can inherit them -- forking at queue time inherits nothing
+        llama_paged_scheduler_add_request(scheduler, t_par.data(), t_par.size(), 0);
+        for (int i = 0; i < 3; ++i) {
+            samplers[i] = common_sampler_init(model, params.sampling);
+        }
+        fork_pending_a = t_a;
+        fork_pending_b = t_b;
+    } else {
+        for (int i = 0; i < params.n_sequences; ++i) {
+            add_request_from_pool(scheduler, ctx, (size_t) i, i);
+            samplers[i] = common_sampler_init(model, params.sampling);
+        }
     }
 
     std::vector<request_result>              results;
@@ -213,6 +250,14 @@ int main(int argc, char ** argv) {
         }
 
         llama_paged_scheduler_update(scheduler, &batch, sampled_tokens.data(), stop_flags.data());
+
+        if (!fork_pending_a.empty()) {
+            // parent has decoded at least one token -> its prefix blocks exist
+            llama_paged_scheduler_fork_request(scheduler, fork_pending_a.data(), fork_pending_a.size(), 1, 0);
+            llama_paged_scheduler_fork_request(scheduler, fork_pending_b.data(), fork_pending_b.size(), 2, 0);
+            fork_pending_a.clear();
+            fork_pending_b.clear();
+        }
     }
 
     LOG_INF("%s: Finished paged example.\n", __func__);

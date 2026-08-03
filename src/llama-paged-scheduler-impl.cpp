@@ -105,29 +105,31 @@ bool llama_paged_scheduler_impl::queue_forked_request(llama_sequence_group group
 
     const llama_sequence_group & parent = *it->second;
 
-    // the fork only makes sense while the parent's prefix is a true prefix of the child's
-    const size_t n_shared = std::min(parent.logical_seq.size(), group.logical_seq.size());
-    bool prefix_ok = true;
-    for (size_t i = 0; i < n_shared; ++i) {
-        if (parent.logical_seq[i] != group.logical_seq[i]) { prefix_ok = false; break; }
+    // fork at the COMMON PREFIX: the parent's logical_seq grows with its own generated
+    // tokens, so requiring a full prefix match would reject every live fork
+    size_t n_shared = 0;
+    const size_t n_cmp = std::min(parent.logical_seq.size(), group.logical_seq.size());
+    while (n_shared < n_cmp && parent.logical_seq[n_shared] == group.logical_seq[n_shared]) {
+        n_shared++;
     }
-    if (!prefix_ok || n_shared == 0) {
-        LLAMA_LOG_WARN("%s: request %d is not a prefix-fork of %d; queueing normally\n",
+    if (n_shared == 0) {
+        LLAMA_LOG_WARN("%s: request %d shares no prefix with %d; queueing normally\n",
                        __func__, group.request_id, parent_request_id);
         return queue_request(std::move(group));
     }
 
     const std::vector<llama_token> full_seq = group.logical_seq;
 
-    const uint32_t n_inherited = kv_cache_manager->fork_blocks(parent, group);
+    const uint32_t n_inherited = kv_cache_manager->fork_blocks(parent, group, (uint32_t) n_shared);
 
     // logical_seq must stay the FULL prompt; fork_blocks trimmed it to the inherited span
     group.logical_seq = full_seq;
     group.n_prompt    = (uint32_t) full_seq.size();
     group.n_past      = n_inherited;
 
-    LLAMA_LOG_INFO("%s: request %d forked from %d: %u of %zu prompt tokens inherited (no re-prefill)\n",
-                   __func__, group.request_id, parent_request_id, n_inherited, full_seq.size());
+    LLAMA_LOG_INFO("%s: request %d forked from %d: common prefix %zu, %u tokens inherited by reference "
+                   "(no re-prefill) of %zu prompt tokens\n",
+                   __func__, group.request_id, parent_request_id, n_shared, n_inherited, full_seq.size());
 
     return queue_request(std::move(group));
 }

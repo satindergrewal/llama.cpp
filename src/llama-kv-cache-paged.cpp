@@ -220,15 +220,21 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
     return true;
 }
 
-uint32_t llama_kv_cache_paged::fork_blocks(const llama_sequence_group & src, llama_sequence_group & dst) {
-    const uint32_t n_src_tokens = (uint32_t) src.logical_seq.size();
+uint32_t llama_kv_cache_paged::fork_blocks(const llama_sequence_group & src, llama_sequence_group & dst,
+                                           uint32_t n_shared_tokens) {
+    // only the agreed prefix may be inherited -- the parent's own generated tail diverges
+    const uint32_t n_src_tokens = std::min<uint32_t>(n_shared_tokens, (uint32_t) src.logical_seq.size());
     if (n_src_tokens == 0 || src.block_table.empty()) {
         return 0;
     }
 
-    const uint32_t tail_fill    = n_src_tokens % block_size;       // 0 => tail block is full
-    const uint32_t n_full_blocks = tail_fill == 0 ? (uint32_t) src.block_table.size()
-                                                  : (uint32_t) src.block_table.size() - 1;
+    // blocks are inherited from the SHARED span only -- deriving the count from the
+    // parent's block_table would hand over the parent's own generated tokens too
+    const uint32_t tail_fill     = n_src_tokens % block_size;
+    uint32_t       n_full_blocks = n_src_tokens / block_size;
+    if (n_full_blocks > (uint32_t) src.block_table.size()) {
+        n_full_blocks = (uint32_t) src.block_table.size();
+    }
 
     dst.block_table.clear();
     dst.block_table.insert(dst.block_table.end(), src.block_table.begin(),
@@ -237,27 +243,18 @@ uint32_t llama_kv_cache_paged::fork_blocks(const llama_sequence_group & src, lla
 
     uint32_t n_inherited = n_full_blocks * block_size;
 
-    if (tail_fill != 0) {
-        // private copy of the partially-filled tail so later writes cannot collide
-        llama_block_ids one = block_manager.checkout_gpu_blocks(1);
-        if (one.empty()) {
-            one = block_manager.checkout_cpu_blocks(1);
-        }
-        if (!one.empty()) {
-            const llama_block_ids src_tail = { src.block_table[n_full_blocks] };
-            do_block_copy(src_tail, one, block_manager.is_gpu(one[0]));
-            dst.block_table.push_back(one[0]);
-            n_inherited += tail_fill;
-        }
-    }
+    // NOTE: the partially-filled tail block is NOT inherited. Copying it across the
+    // gpu/cpu id spaces is fiddly (and was a real out-of-bounds bug), while the cost of
+    // NOT inheriting it is at most block_size-1 re-prefilled tokens -- nothing against a
+    // 100K prefix. Deleted rather than fixed.
 
-    dst.logical_seq.assign(src.logical_seq.begin(), src.logical_seq.begin() + n_inherited);
+    dst.logical_seq.assign(src.logical_seq.begin(), src.logical_seq.begin() + std::min<size_t>(n_inherited, src.logical_seq.size()));
     dst.n_past   = n_inherited;
     dst.n_prompt = n_inherited;
 
-    LLAMA_LOG_INFO("%s: forked request %d -> %d: %u blocks shared (refcounted), %s tail, %u tokens inherited\n",
-                   __func__, src.request_id, dst.request_id, n_full_blocks,
-                   tail_fill ? "copied" : "no partial", n_inherited);
+    LLAMA_LOG_INFO("%s: forked request %d -> %d: %u blocks shared by reference, %u tokens inherited "
+                   "(partial tail of %u tokens re-prefilled)\n",
+                   __func__, src.request_id, dst.request_id, n_full_blocks, n_inherited, tail_fill);
 
     return n_inherited;
 }
