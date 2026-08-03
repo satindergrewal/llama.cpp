@@ -227,6 +227,13 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < info->n_seq; ++i) {
             int32_t request_id = batch.seq_id[info->batch_offsets[i]][0];
 
+            // chunked prefill: mid-prompt chunk emitted no logits -- skip sampling
+            if (info->prefill_pending && info->prefill_pending[i]) {
+                sampled_tokens.push_back(0);
+                stop_flags.push_back(0);
+                continue;
+            }
+
             auto it = samplers.find(request_id);
             if (it == samplers.end()) {
                 samplers[request_id] = common_sampler_init(model, params.sampling);

@@ -2923,6 +2923,13 @@ private:
         for (int32_t i = 0; i < info->n_seq; ++i) {
             const int32_t request_id = pbatch.seq_id[info->batch_offsets[i]][0];
 
+            // chunked prefill: mid-prompt chunk, no logits were emitted -- nothing to sample
+            if (info->prefill_pending && info->prefill_pending[i]) {
+                sampled.push_back(0);
+                stops.push_back(0);
+                continue;
+            }
+
             server_slot * slot = nullptr;
             for (auto & s : slots) {
                 if (s.id == request_id && s.is_processing()) { slot = &s; break; }

@@ -318,7 +318,13 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
         GGML_ASSERT(group && "the waiting group is nullptr.");
 
         const int32_t tokens_needed = group->n_prompt + 1;
-        if (tokens_needed > remaining_token_budget) {
+        // chunked prefill: a prompt longer than the remaining batch budget is still
+        // admitted -- its KV blocks are allocated in full here, but the COMPUTE is
+        // streamed in batch-sized chunks by populate_batch_from. (Prompts > n_batch
+        // previously never admitted and waited forever; caught by the Q4 fork-cost
+        // gate 2026-08-04.) Budget floor of 1 keeps candidate count <= n_batch so the
+        // chunker can always give every candidate at least one token.
+        if (remaining_token_budget < 1) {
             break;
         }
 
@@ -330,7 +336,7 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
             break;
         }
         candidates.push_back(group);
-        remaining_token_budget -= tokens_needed;
+        remaining_token_budget -= std::min(tokens_needed, remaining_token_budget);
         llama_sequence_group_ptr group_ptr = std::move(*it);
         LLAMA_LOG_DEBUG("%s: (start) request_id=%d sent for processing.\n", __func__, group_ptr->request_id);
         set_running(std::move(group_ptr));
@@ -376,6 +382,7 @@ void llama_paged_scheduler_impl::clear_batch(llama_batch & batch) {
     delete[] curr_info.context_lens;
     delete[] curr_info.batch_offsets;
     delete[] curr_info.batch_lens;
+    delete[] curr_info.prefill_pending;
     curr_info = {};  // reset to defaults
 
     if (batch.n_tokens == 0) {
@@ -399,10 +406,31 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
 
     LLAMA_LOG_DEBUG("%s: Creating batch from candidates (%d requests). n_batch=%d\n", __func__, batch_size, n_batch);
 
-    // Calculating required sizes
+    // Chunked prefill: compute each candidate's token share for THIS step. Decode groups
+    // take 1; prefill groups take their remaining prompt clamped so that every candidate
+    // after them still gets at least one token (admission guarantees batch_size <= n_batch).
+    // The fill loop below MUST consume exactly these shares.
+    std::vector<int32_t> chunk_tokens(batch_size);
+    {
+        int32_t budget = (int32_t) n_batch;
+        for (int32_t i = 0; i < batch_size; ++i) {
+            llama_sequence_group * group = candidates[i];
+            GGML_ASSERT(group && "candidate request is nullptr.");
+            const int32_t reserve_after = batch_size - 1 - i;  // 1 token each for the rest
+            if (group->n_decoded > 0) {
+                chunk_tokens[i] = 1;
+            } else {
+                const int32_t remaining_prompt = (int32_t) group->n_prompt - (int32_t) group->n_past;
+                GGML_ASSERT(remaining_prompt > 0 && "prefill candidate with no prompt remainder");
+                chunk_tokens[i] = std::min(remaining_prompt, budget - reserve_after);
+            }
+            GGML_ASSERT(chunk_tokens[i] >= 1 && "chunker starved a candidate");
+            budget -= chunk_tokens[i];
+            total_tokens += chunk_tokens[i];
+        }
+    }
+
     for (const auto & group : candidates) {
-        GGML_ASSERT(group && "candidate request is nullptr.");
-        total_tokens += (group->n_decoded > 0) ? 1 : group->n_prompt;
         max_blocks = std::max(max_blocks, (int32_t) group->block_table.size());
     }
 
@@ -418,11 +446,12 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
     curr_info.n_tokens         = total_tokens;
     curr_info.n_blocks_per_seq = max_blocks;
 
-    curr_info.write_slots   = new int32_t[total_tokens];
-    curr_info.block_table   = new int32_t[batch_size * max_blocks];
-    curr_info.context_lens  = new int32_t[batch_size];
-    curr_info.batch_offsets = new int32_t[batch_size];
-    curr_info.batch_lens    = new int32_t[batch_size];
+    curr_info.write_slots     = new int32_t[total_tokens];
+    curr_info.block_table     = new int32_t[batch_size * max_blocks];
+    curr_info.context_lens    = new int32_t[batch_size];
+    curr_info.batch_offsets   = new int32_t[batch_size];
+    curr_info.batch_lens      = new int32_t[batch_size];
+    curr_info.prefill_pending = new int32_t[batch_size];
     LLAMA_LOG_DEBUG("%s: created llama_batch: n_seq=%d, n_tokens=%d, n_blocks_per_seq=%d\n", __func__, curr_info.n_seq,
                     batch.n_tokens, curr_info.n_blocks_per_seq);
 
@@ -435,8 +464,11 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
         // P1-6: a forked group arrives with n_past > 0 (prefix inherited by reference), so
         // prefill must feed only the REMAINDER. Without this the child re-reads from
         // logical_seq[0] while writing at n_past.. -- wrong tokens at wrong positions.
+        // Chunked prefill: the chunker above may have clamped the remainder to the batch
+        // budget; mid-prompt chunks emit no logits and must not be sampled.
         const int32_t n_prefill_done = is_prefill ? (int32_t) group->n_past : 0;
-        const int32_t new_tokens = is_prefill ? (int32_t) group->n_prompt - n_prefill_done : 1;
+        const int32_t new_tokens     = chunk_tokens[seq_id];
+        const bool    mid_prefill    = is_prefill && (n_prefill_done + new_tokens < (int32_t) group->n_prompt);
 
         if (is_prefill) {
             GGML_ASSERT(group->logical_seq.size() >= (size_t) (n_prefill_done + new_tokens) && "logical_seq too small for prefill");
@@ -454,7 +486,8 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
             batch.n_seq_id[batch_start_id]  = 1;
             batch.seq_id[batch_start_id][0] = group->request_id;
 
-            batch.logits[batch_start_id] = (token_idx == (new_tokens - 1));  // only the last token
+            // only the last token, and never for a mid-prompt chunk
+            batch.logits[batch_start_id] = !mid_prefill && (token_idx == (new_tokens - 1));
 
             int32_t token_pos                     = group->n_past + token_idx;
             curr_info.write_slots[batch_start_id] = calculate_global_slot_index(token_pos, group->block_table);
@@ -470,9 +503,10 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
             curr_info.block_table[flattened_id] = need_padding ? -1 : group->block_table[block];
         }
 
-        curr_info.context_lens[seq_id]  = group->n_past + new_tokens;
-        curr_info.batch_offsets[seq_id] = token_offset;
-        curr_info.batch_lens[seq_id]    = new_tokens;
+        curr_info.context_lens[seq_id]    = group->n_past + new_tokens;
+        curr_info.batch_offsets[seq_id]   = token_offset;
+        curr_info.batch_lens[seq_id]      = new_tokens;
+        curr_info.prefill_pending[seq_id] = mid_prefill ? 1 : 0;
         token_offset += new_tokens;
     }
 }
@@ -496,6 +530,19 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
 
         llama_sequence_group * group = it->second;
         GGML_ASSERT(group && "group is nullptr.");
+
+        // chunked prefill: a mid-prompt chunk advances the prefill cursor and nothing
+        // else -- no sampled token exists for it (new_tokens[i] is a caller dummy),
+        // n_decoded must stay 0 so the next step still takes the prefill path
+        if (curr_info.prefill_pending && curr_info.prefill_pending[i]) {
+            kv_cache_manager->set_seq_max_pos(group->request_id,
+                                              batch.pos[token_offset + curr_info.batch_lens[i] - 1]);
+            if (kv_cache_manager->seq_pos_min(group->request_id) == -1) {
+                kv_cache_manager->set_seq_min_pos(group->request_id, batch.pos[token_offset]);
+            }
+            group->n_past += curr_info.batch_lens[i];
+            continue;
+        }
 
         // TTFT
         if (group->n_decoded == 0) {

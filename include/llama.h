@@ -288,6 +288,9 @@ extern "C" {
         int32_t * context_lens   = NULL;  // [n_seq]
         int32_t * batch_offsets  = NULL;  // [n_seq]
         int32_t * batch_lens     = NULL;  // [n_seq]
+        // chunked prefill: 1 = this seq's slice is a mid-prompt chunk that emits no
+        // logits; the caller must NOT sample it this step (its sampled slot is ignored)
+        int32_t * prefill_pending = NULL; // [n_seq]
     } llama_paged_batch_info;
 
     enum llama_model_kv_override_type {
