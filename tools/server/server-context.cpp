@@ -2917,6 +2917,7 @@ private:
 
         std::vector<llama_token> sampled;
         std::vector<int8_t>      stops;
+        std::vector<int32_t>     finished_seqs;
         sampled.reserve(info->n_seq);
         stops.reserve(info->n_seq);
 
@@ -2936,7 +2937,7 @@ private:
             }
             if (slot == nullptr) {
                 SRV_WRN("paged: no processing slot for request %d, stopping it\n", request_id);
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), request_id, -1, -1);
+                finished_seqs.push_back(request_id);
                 sampled.push_back(0);
                 stops.push_back(1);
                 continue;
@@ -2975,11 +2976,7 @@ private:
                 send_final_response(*slot);
                 metrics.on_prediction(*slot);
                 slot->release();
-                // hybrid archs keep a static attn+recr cache alongside the paged pool and
-                // the scheduler frees only paged blocks; without clearing the static side a
-                // later request reusing this seq id fails batch validation (non-zero start
-                // pos). On flat paged this only erases position bookkeeping.
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), request_id, -1, -1);
+                finished_seqs.push_back(request_id);
             }
 
             sampled.push_back(id);
@@ -2987,6 +2984,17 @@ private:
         }
 
         llama_paged_scheduler_update(paged_sched, &pbatch, sampled.data(), stops.data());
+
+        // clear finished sequences AFTER the scheduler's update: update() writes this
+        // batch's positions back into the memory's per-seq bookkeeping, so clearing
+        // before it re-creates stale position state for the dead seq and the next
+        // request reusing that id fails llama_batch validation ("positions are
+        // decreasing" storm, caught by the P2-8 finale gate). Hybrid archs also need
+        // the static attn+recr side cleared here (the scheduler frees only paged
+        // blocks); on flat paged this erases position bookkeeping only.
+        for (const int32_t seq : finished_seqs) {
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq, -1, -1);
+        }
     }
 
     void update_slots() {
