@@ -4,6 +4,7 @@
 
 #include "../llama-kv-cache-iswa.h"
 #include "../llama-kv-cache.h"
+#include "../llama-kv-cache-paged.h"
 #include "../llama-memory-hybrid-iswa.h"
 #include "../llama-memory-recurrent.h"
 
@@ -435,7 +436,42 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         const int64_t n_stream = (is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask())->ne[3];
         GGML_ASSERT(n_tokens % n_stream == 0);
 
-        if (use_banded_flash(il)) {
+        // 4c-1: paged hybrid serving -- when the wrapper carries a live paged attention
+        // pool (scheduler-driven), the banded path runs over the block table instead of
+        // the static per-stream tail. ggml_paged_attn_banded fuses the KV write, so the
+        // cpy_k/cpy_v stores and the mask/stream slicing below are all skipped; visibility
+        // is implicit-causal for base layers (window 0) and n_swa for SWA layers.
+        const auto * paged_ctx = inp_hybrid->mctx ? inp_hybrid->mctx->get_attn_paged() : nullptr;
+        if (paged_ctx != nullptr && use_banded_flash(il)) {
+            GGML_ASSERT(q->type == GGML_TYPE_F32);
+
+            auto * inp_paged = build_attn_inp_kv_paged(paged_ctx);
+
+            ggml_tensor * kv_cache_l = paged_ctx->get_k(il); // interleaved KV tensor (K+V heads; src[3] contract)
+            GGML_ASSERT(kv_cache_l != nullptr);
+
+            // rel logits keep the [rel_extent, n_head, n_tokens] contiguous F32 layout the
+            // paged banded kernel indexes (same convention as the static path's per-stream views)
+            ggml_tensor * rel_p = ggml_cont(ctx0, rel);
+
+            ggml_tensor * cur_p = ggml_paged_attn_banded(ctx0,
+                    q, k, v, kv_cache_l, kv_cache_l,
+                    inp_paged->paged_block_table, inp_paged->paged_write_slots,
+                    inp_paged->paged_context_lens, inp_paged->paged_batch_offsets,
+                    inp_paged->paged_batch_lens, rel_p,
+                    1.0f/float(head_dim), (int) cparams.block_size, (int) inp_paged->paged_block_table->ne[0],
+                    rel_extent, is_swa ? (int64_t) hparams.n_swa : 0);
+
+            cur = ggml_reshape_2d(ctx0, cur_p, cur_p->ne[0]*cur_p->ne[1], cur_p->ne[2]);
+            ggml_build_forward_expand(gf, cur);
+            cb(cur, "kqv_out_paged", il);
+
+            auto * v_rot_p = is_swa ? inp_attn->self_v_rot_swa : inp_attn->self_v_rot;
+            if (v_rot_p) {
+                cur = llama_mul_mat_hadamard(ctx0, cur, v_rot_p);
+            }
+            cur = build_lora_mm(layer.wo, cur);
+        } else if (use_banded_flash(il)) {
             GGML_ASSERT(q->type == GGML_TYPE_F32);
             auto * k_rot = is_swa ? inp_attn->self_k_rot_swa : inp_attn->self_k_rot;
             auto * v_rot = is_swa ? inp_attn->self_v_rot_swa : inp_attn->self_v_rot;
