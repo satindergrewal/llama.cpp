@@ -335,6 +335,16 @@ void llama_paged_scheduler_impl::process_swapped_list(llama_sequence_group_raw_l
             // We respect FCFS, so we stop here to prevent a younger swapped request from jumping ahead.
             break;
         }
+        // the victim was usually evicted BECAUSE its growth allocation failed: after the
+        // round-trip its table still lacks the block for the next position, and promoting
+        // it unchecked batches pos n_past against a too-short table (measured: peers at 13
+        // blocks, swap-returned group at 12, OOB at pos 192). Same growth rule as the
+        // running list -- no capacity, no promotion.
+        if (group->n_past + 1 > group->block_table.size() * block_size) {
+            if (!kv_cache_manager->allocate(1, *group)) {
+                break;  // stays swapped; FCFS holds
+            }
+        }
         candidates.push_back(group);
         llama_sequence_group_ptr group_ptr = std::move(*it);
         LLAMA_LOG_DEBUG("%s: (swapped_in) request_id=%d back in for processing.\n", __func__, group_ptr->request_id);
@@ -432,13 +442,34 @@ void llama_paged_scheduler_impl::clear_batch(llama_batch & batch) {
     batch.n_tokens = 0;
 }
 
-void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_raw_list & candidates,
+void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_list & candidates,
                                                      llama_batch &                         batch) {
     if (candidates.empty()) {
         LLAMA_LOG_DEBUG("%s: No candidates for this step.\n", __func__);
         batch.n_tokens = 0;
         return;
     }
+    // a candidate collected early in the sweep can be EVICTED by a later group's growth
+    // allocation (evict() pops running.back()): its table then holds CPU block ids and
+    // batching it aborts on the id check ("block_table_id OOB", swap wall 2026-08-04).
+    // Only groups still RUNNING may enter the batch.
+    llama_sequence_group_raw_list live;
+    live.reserve(candidates.size());
+    for (auto * g : candidates) {
+        if (g->status == llama_sequence_group_status::RUNNING) {
+            live.push_back(g);
+        } else {
+            LLAMA_LOG_DEBUG("%s: request %d evicted mid-sweep (status %d), dropped from batch\n",
+                            __func__, g->request_id, (int) g->status);
+        }
+    }
+    candidates.swap(live);
+    if (candidates.empty()) {
+        LLAMA_LOG_DEBUG("%s: all candidates evicted mid-sweep.\n", __func__);
+        batch.n_tokens = 0;
+        return;
+    }
+
     int32_t total_tokens = 0;
     int32_t batch_size   = candidates.size();
     int32_t max_blocks   = 0;
