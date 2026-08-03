@@ -801,7 +801,8 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
 #define PAGED_MMA_WARPS 4
 #define PAGED_MMA_M     16
 #define PAGED_MMA_N     16
-#define PAGED_MMA_LDV   24   // 16 keys + pad; multiple of 8 halves for ldmatrix
+#define PAGED_MMA_KV    16   // keys staged per round (64 measured worse: smem cost occupancy)
+#define PAGED_MMA_LDV   (PAGED_MMA_KV + 8)   // pad; multiple of 8 halves for ldmatrix
 
 template <int HD>
 __global__ __launch_bounds__(128, 1)
@@ -831,9 +832,11 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
     constexpr int ld  = HD + 8;             // q/k row pitch in halves
 
     extern __shared__ char smem_raw[];
-    half * q_h = (half *) smem_raw;                       // [64][ld]
-    half * k_h = q_h + PAGED_MMA_WARPS * PAGED_MMA_M * ld; // [16][ld]
-    half * v_t = k_h + PAGED_MMA_N * ld;                   // [HD][PAGED_MMA_LDV] transposed
+    // q_h is dead once the Q fragments are in registers, so K/V OVERLAY it:
+    // smem = max(q, k+v) instead of q+k+v, which buys blocks per SM.
+    half * q_h = (half *) smem_raw;                        // [64][ld], live until q_frag loaded
+    half * k_h = (half *) smem_raw;                        // [PAGED_MMA_KV][ld]
+    half * v_t = k_h + PAGED_MMA_KV * ld;                  // [HD][PAGED_MMA_LDV] transposed
 
     const int lane    = threadIdx.x;                 // mma.cuh indexes by threadIdx.x
     const int warp_id = threadIdx.y;
@@ -879,11 +882,11 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
     float m_r[2] = { -FLT_MAX, -FLT_MAX };
     float l_r[2] = { 0.0f, 0.0f };
 
-    for (int kt = 0; kt < n_tok; kt += PAGED_MMA_N) {
+    for (int kt0 = 0; kt0 < n_tok; kt0 += PAGED_MMA_KV) {
         __syncthreads();
-        for (int e = tid; e < PAGED_MMA_N * HD; e += nthr) {
+        for (int e = tid; e < PAGED_MMA_KV * HD; e += nthr) {
             const int j = e / HD, d = e % HD;
-            const int tok = kt + j;
+            const int tok = kt0 + j;
             half kv_k = __float2half(0.0f), kv_v = __float2half(0.0f);
             if (tok < n_tok) {
                 const int pb   = block_table[seq_idx * max_blocks + tok / block_size];
@@ -891,10 +894,15 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
                 kv_k = kv_cache[b + (size_t) kv_head * stride_head + d];
                 kv_v = kv_cache[b + (size_t)(n_heads_kv + kv_head) * stride_head + d];
             }
-            k_h[j * ld + d]           = kv_k;
+            k_h[j * ld + d]            = kv_k;
             v_t[d * PAGED_MMA_LDV + j] = kv_v;   // transposed store: B operand for P x V
         }
         __syncthreads();
+
+        // sub-tiles run back to back with NO barriers: all state is in registers
+        for (int sub = 0; sub < PAGED_MMA_KV / PAGED_MMA_N; ++sub) {
+        const int kt = kt0 + sub * PAGED_MMA_N;
+        if (kt >= n_tok) { break; }   // uniform across the block
 
         tile_acc s_frag;
 #pragma unroll
@@ -902,7 +910,7 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
             tile_ab k_frag;
-            load_ldmatrix(k_frag, (const half2 *) (k_h + c * 16), ld / 2);
+            load_ldmatrix(k_frag, (const half2 *) (k_h + (size_t) sub * PAGED_MMA_N * ld + c * 16), ld / 2);
             mma(s_frag, q_frag[c], k_frag);
         }
 
@@ -967,9 +975,11 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
 #pragma unroll
             for (int l = 0; l < tile_acc::ne; ++l) { o_frag[c].x[l] *= resc[(l / 2) % 2]; }
             tile_ab v_frag;
-            load_ldmatrix(v_frag, (const half2 *) (v_t + (size_t) c * 16 * PAGED_MMA_LDV), PAGED_MMA_LDV / 2);
+            load_ldmatrix(v_frag, (const half2 *) (v_t + (size_t) c * 16 * PAGED_MMA_LDV + sub * PAGED_MMA_N),
+                          PAGED_MMA_LDV / 2);
             mma(o_frag[c], p_frag, v_frag);
         }
+        }   // sub
     }
 
 #pragma unroll
@@ -1110,8 +1120,8 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             const int    rows_blk  = PAGED_MMA_WARPS * PAGED_MMA_M;
             const int    n_q_tiles = (n_tokens_total + rows_blk - 1) / rows_blk;
             const int    ld        = head_dim + 8;
-            const size_t smem_m    = (size_t) (rows_blk * ld + PAGED_MMA_N * ld
-                                             + head_dim * PAGED_MMA_LDV) * sizeof(half);
+            const size_t smem_m    = sizeof(half) * (size_t) std::max(rows_blk * ld,
+                                         PAGED_MMA_KV * ld + head_dim * PAGED_MMA_LDV);
             if (smem_m > 48 * 1024) {
                 GGML_ASSERT(smem_m <= 96 * 1024 && "mma prefill smem exceeds 96KB");
                 if (head_dim == 64) {
