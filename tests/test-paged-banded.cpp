@@ -28,8 +28,10 @@ static float val_k(int tok, int h, int d)  { return 0.25f * cosf(0.3f*tok + 0.9f
 static float val_v(int tok, int h, int d)  { return 0.25f * sinf(0.5f*tok + 0.4f*h + 0.13f*d + 1.0f); }
 static float val_r(int e, int h, int tok)  { return 0.50f * cosf(0.8f*e + 0.6f*h + 0.21f*tok); }
 
-int main() {
-    const int D    = 64;  // head_dim
+// head_dim is a PARAMETER, not a constant: the CUDA mma prefill instantiates 64 and 128
+// separately, and 128 is what every real model uses (qwen3, GLM, llama). Testing only 64
+// meant the shipping instantiation had no equivalence coverage at all.
+static int run_cases(const int D, ggml_backend_t backend) {
     const int H    = 4;   // query heads
     const int HKV  = 2;   // kv heads (GQA 2:1)
     const int N    = 24;  // tokens, spans two blocks
@@ -37,12 +39,6 @@ int main() {
     const int BS   = 16;  // block_size
     const int NB   = 2;   // blocks
     const float scale = 1.0f / sqrtf((float) D);
-
-    // best available backend: CUDA on the box, CPU on the Mac build (both paths get covered
-    // by running the binary on each machine)
-    ggml_backend_t backend = ggml_backend_init_best();
-    GGML_ASSERT(backend);
-    printf("backend: %s\n", ggml_backend_name(backend));
 
     int n_fail = 0;
 
@@ -183,6 +179,23 @@ int main() {
 
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
+    }
+
+    return n_fail;
+}
+
+int main() {
+    // best available backend: CUDA on the box, CPU on the Mac build (both paths get covered
+    // by running the binary on each machine)
+    ggml_backend_t backend = ggml_backend_init_best();
+    GGML_ASSERT(backend);
+    printf("backend: %s\n", ggml_backend_name(backend));
+
+    int n_fail = 0;
+    const int dims[] = { 64, 128 };
+    for (int i = 0; i < 2; ++i) {
+        printf("== head_dim %d ==\n", dims[i]);
+        n_fail += run_cases(dims[i], backend);
     }
 
     ggml_backend_free(backend);
