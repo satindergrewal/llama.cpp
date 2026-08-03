@@ -659,7 +659,8 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
     const int q_cnt     = min(PAGED_WMMA_M, n_new - q_base);
     const int first_pos = context_lens[seq_idx] - n_new;
 
-    for (int e = tid; e < PAGED_WMMA_M * ld; e += 32) {
+    const int nthr = blockDim.x;                  // multi-warp: staging + softmax are block-wide
+    for (int e = tid; e < PAGED_WMMA_M * ld; e += nthr) {
         const int i = e / ld, d = e % ld;
         q_h[e]   = (i < q_cnt && d < head_dim)
                  ? __float2half(q[(size_t)(seq_start + q_base + i) * n_heads * head_dim
@@ -667,12 +668,12 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
                  : __float2half(0.0f);
         o_acc[e] = 0.0f;
     }
-    for (int i = tid; i < PAGED_WMMA_M; i += 32) { m_s[i] = -FLT_MAX; l_s[i] = 0.0f; }
-    __syncwarp();
+    for (int i = tid; i < PAGED_WMMA_M; i += nthr) { m_s[i] = -FLT_MAX; l_s[i] = 0.0f; }
+    __syncthreads();
 
     const int n_tok = first_pos + q_base + q_cnt;   // last query in the tile bounds the walk
     for (int kt = 0; kt < n_tok; kt += PAGED_WMMA_N) {
-        for (int e = tid; e < PAGED_WMMA_N * ld; e += 32) {
+        for (int e = tid; e < PAGED_WMMA_N * ld; e += nthr) {
             const int j = e / ld, d = e % ld;
             const int tok = kt + j;
             half kv_k = __float2half(0.0f), kv_v = __float2half(0.0f);
@@ -684,13 +685,15 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
             }
             k_h[e] = kv_k; v_h[e] = kv_v;
         }
-        __syncwarp();
+        __syncthreads();
 
-        paged_wmma_qk(q_h, k_h, ld, head_dim, scale, sc);
-        __syncwarp();
+        if (tid < 32) {                           // wmma is warp-wide: warp 0 owns the matmul
+            paged_wmma_qk(q_h, k_h, ld, head_dim, scale, sc);
+        }
+        __syncthreads();
 
         // mask + band + rel bias, then the online softmax row by row
-        for (int i = tid; i < PAGED_WMMA_M; i += 32) {
+        for (int i = tid; i < PAGED_WMMA_M; i += nthr) {
             const int q_pos = first_pos + q_base + i;
             float rmax = -FLT_MAX;
             for (int j = 0; j < PAGED_WMMA_N; ++j) {
@@ -719,13 +722,15 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
             l_s[i] = l_s[i] * resc + row_l;
             m_s[i] = m_new;
         }
-        __syncwarp();
+        __syncthreads();
 
-        paged_wmma_pv(p_h, v_h, ld, head_dim, o_acc, ld);
-        __syncwarp();
+        if (tid < 32) {
+            paged_wmma_pv(p_h, v_h, ld, head_dim, o_acc, ld);
+        }
+        __syncthreads();
     }
 
-    for (int e = tid; e < q_cnt * head_dim; e += 32) {
+    for (int e = tid; e < q_cnt * head_dim; e += nthr) {
         const int i = e / head_dim, d = e % head_dim;
         out[(size_t)(seq_start + q_base + i) * n_heads * head_dim
             + (size_t) head_idx * head_dim + d] = o_acc[i * ld + d] / (l_s[i] + 1e-6f);
@@ -859,7 +864,9 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                 CUDA_CHECK(cudaFuncSetAttribute(paged_attention_prefill_wmma_kernel,
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_w));
             }
-            paged_attention_prefill_wmma_kernel<<<dim3(n_heads, n_seq, n_q_tiles), dim3(32), smem_w, ctx.stream()>>>(
+            // 4 warps: staging + the per-row softmax rescale are block-wide, the fragment
+            // ops stay warp-0 (wmma is warp-scoped). The 32-thread shape measured 87.8 s.
+            paged_attention_prefill_wmma_kernel<<<dim3(n_heads, n_seq, n_q_tiles), dim3(128), smem_w, ctx.stream()>>>(
                 (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,
                 (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
                 stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
