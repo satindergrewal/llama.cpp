@@ -418,6 +418,16 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
     // The fill loop below MUST consume exactly these shares.
     std::vector<int32_t> chunk_tokens(batch_size);
     {
+        // P1-7a: a live decode shares its batch (= its GPU graph) with any prefill chunk,
+        // so each decode step costs the CHUNK's compute. With full-budget chunks a live
+        // slot's tpot inflated 84.7% during a 5K prefill (interleave gate, 2026-08-04);
+        // capping the quantum while decodes are live bounds the stall per step.
+        bool has_live_decode = false;
+        for (int32_t i = 0; i < batch_size; ++i) {
+            has_live_decode |= candidates[i]->n_decoded > 0;
+        }
+        const int32_t prefill_quantum = has_live_decode ? 64 : (int32_t) n_batch;
+
         int32_t budget = (int32_t) n_batch;
         for (int32_t i = 0; i < batch_size; ++i) {
             llama_sequence_group * group = candidates[i];
@@ -428,7 +438,7 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
             } else {
                 const int32_t remaining_prompt = (int32_t) group->n_prompt - (int32_t) group->n_past;
                 GGML_ASSERT(remaining_prompt > 0 && "prefill candidate with no prompt remainder");
-                chunk_tokens[i] = std::min(remaining_prompt, budget - reserve_after);
+                chunk_tokens[i] = std::min(std::min(remaining_prompt, budget - reserve_after), prefill_quantum);
             }
             GGML_ASSERT(chunk_tokens[i] >= 1 && "chunker starved a candidate");
             budget -= chunk_tokens[i];
