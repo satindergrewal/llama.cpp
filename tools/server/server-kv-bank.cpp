@@ -24,6 +24,11 @@
 // with the probe side; this name is collision-safe enough for the spill witness).
 
 void server_kv_bank::configure(const std::string & dir_in, int32_t cap_mib) {
+    if (dir_in == "-") {
+        // --no-kv-bank: force-disable regardless of env
+        dir.clear();
+        return;
+    }
     if (!dir_in.empty()) {
         dir = dir_in;
     }

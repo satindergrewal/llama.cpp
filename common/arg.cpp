@@ -1633,6 +1633,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--no-kv-bank"},
+        "disable the disk KV bank even if LLAMA_ARG_KV_BANK / DS4P_KV_BANK is set",
+        [](common_params & params) {
+            params.kv_bank_dir = "-";  // sentinel: configure() treats it as force-disable
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--kv-bank"}, "DIR",
         "spill evicted prompt-cache states to a disk bank in DIR and admit them back by "
         "longest token prefix on cache miss (default: disabled)",
