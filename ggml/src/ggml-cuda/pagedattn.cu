@@ -260,17 +260,14 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
             const int span = (n_tok - lo + n_splits - 1) / n_splits;
             split_lo = lo + split_idx * span;
             split_hi = min(n_tok, split_lo + span);
-            if (split_lo >= split_hi) {   // empty slice: emit a null partial
-                if (out_m != nullptr && tid == 0) {
-                    const size_t pidx = ((size_t) token_batch_idx * n_heads + head_idx) * n_splits + split_idx;
+            if (split_lo >= split_hi) {   // empty slice: emit a null partial and stop
+                const size_t pidx = ((size_t) token_batch_idx * n_heads + head_idx) * n_splits + split_idx;
+                if (tid == 0) {
                     out_m[pidx] = -FLT_MAX;
                     out_l[pidx] = 0.0f;
                 }
-                if (out_m != nullptr) {
-                    const size_t aidx = (((size_t) token_batch_idx * n_heads + head_idx) * n_splits + split_idx) * head_dim;
-                    out[aidx + tid] = 0.0f;
-                }
-                continue;
+                out[pidx * head_dim + tid] = 0.0f;
+                return;
             }
         }
 
