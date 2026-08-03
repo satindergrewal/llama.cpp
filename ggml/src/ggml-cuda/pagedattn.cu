@@ -1204,6 +1204,19 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             const char * s = getenv("DS4P_PAGED_QTILE");
             return s ? atoi(s) : 3;
         }();
+        // A silent fallback to a 12.8x-slower prefill is the same class as the flag that
+        // switches off the guard that would have computed it: say so once, at -lv 4.
+        if (qtile_mode == 3 && n_tokens_total > n_seq && head_dim != 64 && head_dim != 128) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                GGML_LOG_DEBUG("%s: head_dim %d has no mma prefill instantiation (only 64/128) "
+                               "-> falling back to the grid-per-token prefill, which is ~12.8x "
+                               "slower at 22K. Add an instantiation for this head_dim.\n",
+                               __func__, head_dim);
+            }
+        }
+
         if (qtile_mode == 3 && n_tokens_total > n_seq && (head_dim == 64 || head_dim == 128)) {
             const int    rows_blk  = PAGED_MMA_WARPS * PAGED_MMA_M;
             const int    n_q_tiles = (n_tokens_total + rows_blk - 1) / rows_blk;
