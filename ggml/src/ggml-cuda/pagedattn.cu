@@ -432,6 +432,33 @@ __device__ __forceinline__ void paged_wmma_qk(const half * __restrict__ q_h,
     wmma::store_matrix_sync(scores_out, frag_acc, PAGED_WMMA_N, wmma::mem_row_major);
 }
 
+// stage 3a: P x V for one tile. After the online softmax turns the score tile into
+// probabilities, P (M x N_keys, half) times V (N_keys x head_dim, half) accumulates into
+// the output fragment -- one f32 accumulator per 16-wide slice of head_dim. Both operands
+// are row_major here: the K dimension of the product is N_keys (the tile's keys), which is
+// V's leading axis, so no transpose is needed on this side either.
+// out_acc is [M][ld_out] f32 and is ACCUMULATED into, because a query tile walks many key
+// tiles and the online-softmax rescaling is applied by the caller between tiles.
+__device__ __forceinline__ void paged_wmma_pv(const half * __restrict__ p_h,     // [M][N] row-major
+                                              const half * __restrict__ v_h,     // [N][ld_v] row-major
+                                              const int    ld_v,
+                                              const int    head_dim,
+                                              float * __restrict__ out_acc,      // [M][ld_out]
+                                              const int    ld_out) {
+    for (int c = 0; c < head_dim; c += PAGED_WMMA_N) {
+        wmma::fragment<wmma::accumulator, PAGED_WMMA_M, PAGED_WMMA_N, PAGED_WMMA_K, float> frag_out;
+        wmma::load_matrix_sync(frag_out, out_acc + c, ld_out, wmma::mem_row_major);
+
+        wmma::fragment<wmma::matrix_a, PAGED_WMMA_M, PAGED_WMMA_N, PAGED_WMMA_K, half, wmma::row_major> frag_p;
+        wmma::fragment<wmma::matrix_b, PAGED_WMMA_M, PAGED_WMMA_N, PAGED_WMMA_K, half, wmma::row_major> frag_v;
+        wmma::load_matrix_sync(frag_p, p_h, PAGED_WMMA_N);
+        wmma::load_matrix_sync(frag_v, v_h + c, ld_v);
+        wmma::mma_sync(frag_out, frag_p, frag_v, frag_out);
+
+        wmma::store_matrix_sync(out_acc + c, frag_out, ld_out, wmma::mem_row_major);
+    }
+}
+
 
 __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ q,
                                                      const half * __restrict__ kv_cache,
