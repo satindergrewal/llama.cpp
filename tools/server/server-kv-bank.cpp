@@ -8,6 +8,10 @@
 #include <cstring>
 #include <functional>
 #include <dirent.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <algorithm>
+#include <vector>
 
 // v0 file format (little-endian):
 //   magic   "KVBK"                       4 B
@@ -28,6 +32,50 @@ server_kv_bank::server_kv_bank() {
     const char * s = getenv("DS4P_KV_BANK");
     if (s != nullptr && s[0] != '\0') {
         dir = s;
+    }
+    const char * cap = getenv("DS4P_KV_BANK_CAP_MIB");
+    if (cap != nullptr) {
+        cap_bytes = (uint64_t) atoll(cap) * 1024ull * 1024ull;
+    }
+}
+
+// size-capped LRU by mtime: after each spill, drop the least-recently-touched files until
+// the bank fits the cap. mtime is refreshed on admit (utimes-free: rewrite is overkill, a
+// read does not bump mtime -- admit calls touch() below). Best-effort like everything here.
+void server_kv_bank::enforce_cap() {
+    if (cap_bytes == 0) {
+        return; // uncapped
+    }
+
+    struct file_info { std::string path; time_t mtime; uint64_t size; };
+    std::vector<file_info> files;
+    uint64_t total = 0;
+
+    DIR * d = opendir(dir.c_str());
+    if (d == nullptr) return;
+    for (dirent * e = readdir(d); e != nullptr; e = readdir(d)) {
+        const std::string name = e->d_name;
+        if (name.size() < 4 || name.compare(name.size() - 3, 3, ".kv") != 0) continue;
+        const std::string path = dir + "/" + name;
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) continue;
+        files.push_back({path, st.st_mtime, (uint64_t) st.st_size});
+        total += (uint64_t) st.st_size;
+    }
+    closedir(d);
+
+    if (total <= cap_bytes) return;
+
+    std::sort(files.begin(), files.end(),
+              [](const file_info & a, const file_info & b) { return a.mtime < b.mtime; });
+
+    for (const auto & fi : files) {
+        if (total <= cap_bytes) break;
+        if (remove(fi.path.c_str()) == 0) {
+            total -= fi.size;
+            SRV_INF(" - kv-bank: cap %.0f MiB exceeded, evicted %s (%.3f MiB)\n",
+                    cap_bytes / (1024.0 * 1024.0), fi.path.c_str(), fi.size / (1024.0 * 1024.0));
+        }
     }
 }
 
@@ -104,6 +152,8 @@ void server_kv_bank::spill(const server_prompt_cache_state & entry) {
     SRV_INF(" - kv-bank: spilled evicted entry -> %s (%.3f MiB, n_tok = %llu, total spills = %llu)\n",
             path, (main_sz + drft_sz) / (1024.0 * 1024.0),
             (unsigned long long) n_tok, (unsigned long long) n_spilled);
+
+    enforce_cap();
 }
 
 // ---- probe/admit (increment 2) ----
@@ -219,6 +269,14 @@ bool server_kv_bank::probe(const server_tokens & tokens_new, const std::string &
     // hashes, so admit UNSEALED (empty identity = reval skipped) rather than sealed with
     // zero hashes, which P0-2's hash check would rightly fail
     out.binding_identity.clear();
+
+    // LRU touch: reads do not bump mtime, so refresh it explicitly
+    {
+        struct stat st;
+        if (stat(best_path.c_str(), &st) == 0) {
+            utimes(best_path.c_str(), nullptr);
+        }
+    }
 
     n_admitted++;
     SRV_INF(" - kv-bank: admitted %s (lcp = %zu of %zu new tokens, %.3f MiB, admits = %llu)\n",

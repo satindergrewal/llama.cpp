@@ -34,7 +34,10 @@ class server_kv_bank {
   private:
     server_kv_bank();
 
-    std::string dir;      // empty = disabled
+    void enforce_cap();
+
+    std::string dir;       // empty = disabled
+    uint64_t    cap_bytes = 0; // DS4P_KV_BANK_CAP_MIB; 0 = uncapped
     uint64_t    n_spilled = 0;
     uint64_t    n_admitted = 0;
     uint64_t    n_probe_miss = 0;
