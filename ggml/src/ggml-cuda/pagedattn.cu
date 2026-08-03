@@ -612,10 +612,13 @@ __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ 
     }
 }
 
-// stage 3b: the fragment prefill kernel -- one warp owns a 16-query tile and walks the key
-// tiles, doing both matmuls on tensor cores with a standard flash-attention online softmax
-// between them. Q/K/V are staged as half in smem (wmma needs half operands); the score tile
-// and the output accumulator stay f32. Dark: only DS4P_PAGED_QTILE=2 dispatches here.
+// per-warp key tiles: each warp owns its OWN key tile stream and its OWN online-softmax
+// state (m, l, o_acc) -- the split-K insight applied to prefill: any partition of the keys
+// is valid if each partition keeps its own state and the final merge is log-sum-exp. All
+// four warps run their own wmma matmuls concurrently (wmma is warp-scoped), so nothing
+// idles: the 4-warp/warp0-only shape measured 31,915 ms with 3 warps parked through both
+// matmuls. NO block barrier inside the key loop -- each warp is fully independent until
+// the merge. Q/K/V staged half; scores + accumulators f32. Dark: DS4P_PAGED_QTILE=2 only.
 __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q,
                                                     const half * __restrict__ kv_cache,
                                                     const int * __restrict__ block_table,
@@ -635,12 +638,23 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
                                                     const int    head_dim,
                                                     float * __restrict__ out) {
     extern __shared__ char smem_raw[];
-    const int ld  = head_dim + 8;                 // pad against bank conflicts
-    half  * q_h   = (half *)  smem_raw;
-    half  * k_h   = q_h   + PAGED_WMMA_M * ld;
-    half  * v_h   = k_h   + PAGED_WMMA_N * ld;
-    half  * p_h   = v_h   + PAGED_WMMA_N * ld;
-    float * sc    = (float *) (p_h + PAGED_WMMA_M * PAGED_WMMA_N);
+    const int ld      = head_dim + 8;
+    const int tid     = threadIdx.x;
+    const int lane    = tid & 31;
+    const int warp_id = tid >> 5;
+    const int n_warps = blockDim.x >> 5;          // 4
+
+    // layout: q_h[M*ld] | per-warp { k_h[N*ld] v_h[N*ld] p_h[M*N] } half |
+    //         per-warp { sc[M*N] o_acc[M*ld] m[M] l[M] } f32
+    half * q_h = (half *) smem_raw;
+    half * kw  = q_h + PAGED_WMMA_M * ld;
+    const size_t half_per_warp = (size_t) 2 * PAGED_WMMA_N * ld + PAGED_WMMA_M * PAGED_WMMA_N;
+    half  * k_h = kw + warp_id * half_per_warp;
+    half  * v_h = k_h + PAGED_WMMA_N * ld;
+    half  * p_h = v_h + PAGED_WMMA_N * ld;
+    float * fbase = (float *) (kw + n_warps * half_per_warp);
+    const size_t f_per_warp = (size_t) PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld + 2 * PAGED_WMMA_M;
+    float * sc    = fbase + warp_id * f_per_warp;
     float * o_acc = sc + PAGED_WMMA_M * PAGED_WMMA_N;
     float * m_s   = o_acc + PAGED_WMMA_M * ld;
     float * l_s   = m_s + PAGED_WMMA_M;
@@ -648,7 +662,6 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
     const int head_idx = blockIdx.x;
     const int seq_idx  = blockIdx.y;
     const int q_tile   = blockIdx.z;
-    const int tid      = threadIdx.x;             // one warp
     const int n_heads  = gridDim.x;
     const int kv_head  = head_idx / (n_heads / n_heads_kv);
 
@@ -659,21 +672,21 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
     const int q_cnt     = min(PAGED_WMMA_M, n_new - q_base);
     const int first_pos = context_lens[seq_idx] - n_new;
 
-    const int nthr = blockDim.x;                  // multi-warp: staging + softmax are block-wide
-    for (int e = tid; e < PAGED_WMMA_M * ld; e += nthr) {
+    for (int e = tid; e < PAGED_WMMA_M * ld; e += blockDim.x) {
         const int i = e / ld, d = e % ld;
-        q_h[e]   = (i < q_cnt && d < head_dim)
-                 ? __float2half(q[(size_t)(seq_start + q_base + i) * n_heads * head_dim
-                                  + (size_t) head_idx * head_dim + d])
-                 : __float2half(0.0f);
-        o_acc[e] = 0.0f;
+        q_h[e] = (i < q_cnt && d < head_dim)
+               ? __float2half(q[(size_t)(seq_start + q_base + i) * n_heads * head_dim
+                                + (size_t) head_idx * head_dim + d])
+               : __float2half(0.0f);
     }
-    for (int i = tid; i < PAGED_WMMA_M; i += nthr) { m_s[i] = -FLT_MAX; l_s[i] = 0.0f; }
-    __syncthreads();
+    for (int e = lane; e < PAGED_WMMA_M * ld; e += 32) { o_acc[e] = 0.0f; }
+    for (int i = lane; i < PAGED_WMMA_M; i += 32) { m_s[i] = -FLT_MAX; l_s[i] = 0.0f; }
+    __syncthreads();                              // q_h ready for every warp
 
-    const int n_tok = first_pos + q_base + q_cnt;   // last query in the tile bounds the walk
-    for (int kt = 0; kt < n_tok; kt += PAGED_WMMA_N) {
-        for (int e = tid; e < PAGED_WMMA_N * ld; e += nthr) {
+    const int n_tok = first_pos + q_base + q_cnt;
+    // warp w takes key tiles w, w+n_warps, w+2*n_warps, ... -- independent streams
+    for (int kt = warp_id * PAGED_WMMA_N; kt < n_tok; kt += n_warps * PAGED_WMMA_N) {
+        for (int e = lane; e < PAGED_WMMA_N * ld; e += 32) {
             const int j = e / ld, d = e % ld;
             const int tok = kt + j;
             half kv_k = __float2half(0.0f), kv_v = __float2half(0.0f);
@@ -685,15 +698,12 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
             }
             k_h[e] = kv_k; v_h[e] = kv_v;
         }
-        __syncthreads();
+        __syncwarp();
 
-        if (tid < 32) {                           // wmma is warp-wide: warp 0 owns the matmul
-            paged_wmma_qk(q_h, k_h, ld, head_dim, scale, sc);
-        }
-        __syncthreads();
+        paged_wmma_qk(q_h, k_h, ld, head_dim, scale, sc);
+        __syncwarp();
 
-        // mask + band + rel bias, then the online softmax row by row
-        for (int i = tid; i < PAGED_WMMA_M; i += nthr) {
+        for (int i = lane; i < PAGED_WMMA_M; i += 32) {
             const int q_pos = first_pos + q_base + i;
             float rmax = -FLT_MAX;
             for (int j = 0; j < PAGED_WMMA_N; ++j) {
@@ -710,30 +720,51 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
                 rmax = fmaxf(rmax, v);
             }
             const float m_new = fmaxf(m_s[i], rmax);
-            const float resc  = (m_s[i] == -FLT_MAX) ? 0.0f : __expf(m_s[i] - m_new);
+            if (m_new == -FLT_MAX) {              // fully masked tile for this row
+                for (int j = 0; j < PAGED_WMMA_N; ++j) { p_h[i * PAGED_WMMA_N + j] = __float2half(0.0f); }
+                continue;
+            }
+            const float resc = (m_s[i] == -FLT_MAX) ? 0.0f : __expf(m_s[i] - m_new);
             float row_l = 0.0f;
             for (int j = 0; j < PAGED_WMMA_N; ++j) {
-                const float v = sc[i * PAGED_WMMA_N + j];
+                const float v  = sc[i * PAGED_WMMA_N + j];
                 const float pv = (v == -FLT_MAX) ? 0.0f : __expf(v - m_new);
                 p_h[i * PAGED_WMMA_N + j] = __float2half(pv);
                 row_l += pv;
             }
-            for (int d = 0; d < head_dim; ++d) { o_acc[i * ld + d] *= resc; }  // rescale BEFORE pv
+            for (int d = 0; d < head_dim; ++d) { o_acc[i * ld + d] *= resc; }
             l_s[i] = l_s[i] * resc + row_l;
             m_s[i] = m_new;
         }
-        __syncthreads();
+        __syncwarp();
 
-        if (tid < 32) {
-            paged_wmma_pv(p_h, v_h, ld, head_dim, o_acc, ld);
-        }
-        __syncthreads();
+        paged_wmma_pv(p_h, v_h, ld, head_dim, o_acc, ld);
+        __syncwarp();
     }
+    __syncthreads();                              // all warps done: merge their states
 
-    for (int e = tid; e < q_cnt * head_dim; e += nthr) {
-        const int i = e / head_dim, d = e % head_dim;
-        out[(size_t)(seq_start + q_base + i) * n_heads * head_dim
-            + (size_t) head_idx * head_dim + d] = o_acc[i * ld + d] / (l_s[i] + 1e-6f);
+    // log-sum-exp merge of the n_warps per-warp states, then write. warp 0's smem
+    // region is reused as the merge target; rows spread over the whole block.
+    for (int i = tid; i < q_cnt; i += blockDim.x) {
+        float m_tot = -FLT_MAX;
+        for (int w = 0; w < n_warps; ++w) { m_tot = fmaxf(m_tot, fbase[w * f_per_warp + PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld + i]); }
+        if (m_tot == -FLT_MAX) { continue; }
+        float l_tot = 0.0f;
+        for (int w = 0; w < n_warps; ++w) {
+            const float mw = fbase[w * f_per_warp + PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld + i];
+            const float lw = fbase[w * f_per_warp + PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld + PAGED_WMMA_M + i];
+            l_tot += (mw == -FLT_MAX) ? 0.0f : lw * __expf(mw - m_tot);
+        }
+        for (int d = 0; d < head_dim; ++d) {
+            float o = 0.0f;
+            for (int w = 0; w < n_warps; ++w) {
+                const float mw = fbase[w * f_per_warp + PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld + i];
+                if (mw == -FLT_MAX) { continue; }
+                o += fbase[w * f_per_warp + PAGED_WMMA_M * PAGED_WMMA_N + i * ld + d] * __expf(mw - m_tot);
+            }
+            out[(size_t)(seq_start + q_base + i) * n_heads * head_dim
+                + (size_t) head_idx * head_dim + d] = o / (l_tot + 1e-6f);
+        }
     }
 }
 
@@ -855,10 +886,11 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         if (qtile_mode == 2 && n_tokens_total > n_seq) {
             const int    n_q_tiles = (n_tokens_total + PAGED_WMMA_M - 1) / PAGED_WMMA_M;
             const int    ld        = head_dim + 8;
-            const size_t smem_w    = (size_t) (PAGED_WMMA_M * ld + 2 * PAGED_WMMA_N * ld
-                                             + PAGED_WMMA_M * PAGED_WMMA_N) * sizeof(half)
-                                   + (size_t) (PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld
-                                             + 2 * PAGED_WMMA_M) * sizeof(float);
+            // per-warp regions: q_h shared + 4x { k,v,p half } + 4x { sc,o_acc,m,l f32 }
+            const size_t smem_w    = (size_t) PAGED_WMMA_M * ld * sizeof(half)
+                                   + 4 * ((size_t) (2 * PAGED_WMMA_N * ld + PAGED_WMMA_M * PAGED_WMMA_N) * sizeof(half)
+                                        + (size_t) (PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld
+                                                  + 2 * PAGED_WMMA_M) * sizeof(float));
             if (smem_w > 48 * 1024) {
                 GGML_ASSERT(smem_w <= 96 * 1024 && "wmma prefill smem exceeds 96KB");
                 CUDA_CHECK(cudaFuncSetAttribute(paged_attention_prefill_wmma_kernel,
