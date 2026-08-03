@@ -1659,6 +1659,15 @@ extern "C" {
     LLAMA_API void llama_paged_scheduler_free(struct llama_paged_scheduler * sched);
 
     // Queueing and stepping.
+    // P1-6: queue a request as a copy-on-write FORK of a live one -- the shared prefix is
+    // inherited by block reference (no re-prefill, 1x prefix memory for N agents). Falls
+    // back to a normal queue if the parent is gone or the prompt is not a real extension.
+    LLAMA_API bool llama_paged_scheduler_fork_request(struct llama_paged_scheduler * sched,
+                                                     const llama_token *            tokens,
+                                                     int32_t                        n_tokens,
+                                                     int32_t                        request_id,
+                                                     int32_t                        parent_request_id);
+
     LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * sched,
                                                      const llama_token *            tokens,
                                                      int32_t                        n_tokens,
