@@ -419,14 +419,26 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
     std::vector<int32_t> chunk_tokens(batch_size);
     {
         // P1-7a: a live decode shares its batch (= its GPU graph) with any prefill chunk,
-        // so each decode step costs the CHUNK's compute. With full-budget chunks a live
-        // slot's tpot inflated 84.7% during a 5K prefill (interleave gate, 2026-08-04);
-        // capping the quantum while decodes are live bounds the stall per step.
+        // so each decode step costs the CHUNK's compute -- but SMALLER quanta add more
+        // steps, and each shape-changing step pays a fixed graph-rebuild cost. Measured
+        // (5K prefill beside a live decode, box GPU): quantum 512 = +84.7% live tpot,
+        // quantum 64 = +126.8% AND slower prefill -- a U-curve dominated by per-step
+        // fixed cost. Default keeps full-budget chunks; DS4P_PREFILL_QUANTUM exposes the
+        // knob for measurement. The real <10% fix is stream overlap or shape-stable
+        // chunking for graph reuse (parked with data in the P1-7a witness).
         bool has_live_decode = false;
         for (int32_t i = 0; i < batch_size; ++i) {
             has_live_decode |= candidates[i]->n_decoded > 0;
         }
-        const int32_t prefill_quantum = has_live_decode ? 64 : (int32_t) n_batch;
+        int32_t prefill_quantum = (int32_t) n_batch;
+        if (has_live_decode) {
+            if (const char * s = getenv("DS4P_PREFILL_QUANTUM")) {
+                const int q = atoi(s);
+                if (q > 0) {
+                    prefill_quantum = q;
+                }
+            }
+        }
 
         int32_t budget = (int32_t) n_batch;
         for (int32_t i = 0; i < batch_size; ++i) {
