@@ -235,12 +235,15 @@ void llama_paged_scheduler_impl::swap_out_or_recompute(llama_sequence_group_ptr 
         return;
     }
 
-    // There was not enough CPU memory to swap the request (recomputation)
+    // There was not enough CPU memory to swap the request (recomputation).
+    // KEEP logical_seq whole: it holds prompt + already-GENERATED tokens, and chunked
+    // prefill replays the full sequence from n_past=0 -- truncating to n_prompt silently
+    // discarded the generated tail and restarted the request from its prompt.
     kv_cache_manager->free_blocks(*group_ptr);
     kv_cache_manager->seq_rm(rid, -1, -1);
     group_ptr->n_past    = 0;
     group_ptr->n_decoded = 0;
-    group_ptr->logical_seq.resize(group_ptr->n_prompt);
+    group_ptr->n_prompt  = (uint32_t) group_ptr->logical_seq.size();
 
     LLAMA_LOG_DEBUG("%s: (recomputation) request_id=%d was sent for recomputation.\n", __func__, rid);
     set_waiting(std::move(group_ptr));
