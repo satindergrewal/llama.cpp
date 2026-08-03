@@ -48,7 +48,7 @@ public:
 
     // 3b (DS4P_PAGED_HYBRID): hand ownership of a constructed+init'd paged attention pool
     // to this wrapper. Built by create_memory, where the backends are in scope (same shape
-    // as the flat-arch paged path). Inert until the paged hybrid graph path lands.
+    // as the flat-arch paged path). The graph path reads it via the context's get_attn_paged.
     void set_attn_paged(llama_kv_cache_paged * paged);
 
     llama_kv_cache_paged * get_mem_attn_paged() const;

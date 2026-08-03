@@ -231,7 +231,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
     {
         // minimal SPM byte vocab so /completion + sampling work on fixtures (hybrid DECODE
-        // gate needs it). 128 entries = the embedding dim: unk/bos/eos + bytes 0x00..0x7C.
+        // gate needs it): unk/bos/eos + full byte coverage 0x00..0xFF, filler beyond.
         std::vector<std::string> toks(n_vocab);
         std::vector<float>       scores(n_vocab, 0.0f);
         std::vector<int32_t>     ttypes(n_vocab);
