@@ -444,37 +444,43 @@ __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ 
         const size_t v_base = base + (size_t) (n_heads_kv + kv_head_idx) * stride_head;
 
         // load this KV token's lane slice ONCE, reuse across all queries in the tile
-        float k_l[4], v_l[4];
+        float v_l[4];
         #pragma unroll
         for (int d = 0; d < 4; ++d) {
             if (d < dpl) {
-                const int dim = lane + (d << 5);
-                k_l[d] = __half2float(kv_cache[k_base + dim]);
-                v_l[d] = __half2float(kv_cache[v_base + dim]);
+                v_l[d] = __half2float(kv_cache[v_base + lane + (d << 5)]);
             }
         }
 
-        for (int i = 0; i < q_cnt; ++i) {
+        // SCORE BLOCK (M7 phase 2b): the previous mapping did one warp-shuffle reduction
+        // per (query, key) pair -- Q_TILE reductions per KV token, which measured as the
+        // bottleneck (1.40x only). Here lane i<q_cnt owns query i and computes its FULL
+        // dot product over head_dim serially from shared memory: q_cnt scores computed in
+        // parallel across lanes, ZERO shuffles. Then every lane reads the whole score
+        // vector from smem and does the V accumulation with the original dim mapping.
+        float * scores = warp_acc + (size_t) n_warps * PAGED_Q_TILE * head_dim
+                       + (size_t) warp_id * PAGED_Q_TILE;   // per-warp score scratch
+        if (lane < q_cnt) {
+            const int i     = lane;
             const int q_pos = first_pos + q_base + i;
-            if (token > q_pos) { continue; }                       // causal
             const int64_t rel_dist = (int64_t) q_pos - token;
-            if (visibility_window > 0 && rel_dist >= visibility_window) { continue; }
-
-            float part = 0.0f;
-            #pragma unroll
-            for (int d = 0; d < 4; ++d) {
-                if (d < dpl) { part += q_s[i * head_dim + lane + (d << 5)] * k_l[d]; }
+            float sc = -FLT_MAX;
+            if (token <= q_pos && !(visibility_window > 0 && rel_dist >= visibility_window)) {
+                sc = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    sc += q_s[i * head_dim + d] * __half2float(kv_cache[k_base + d]);
+                }
+                if (rel != nullptr && rel_dist < rel_extent) {
+                    sc += rel[((size_t) (seq_start + q_base + i) * n_heads + head_idx) * rel_extent + rel_dist];
+                }
             }
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                part += __shfl_down_sync(0xffffffffu, part, offset);
-            }
-            float qk = __shfl_sync(0xffffffffu, part, 0);
+            scores[i] = sc;
+        }
+        __syncwarp();
 
-            if (rel != nullptr && rel_dist < rel_extent) {
-                qk += rel[((size_t) (seq_start + q_base + i) * n_heads + head_idx) * rel_extent + rel_dist];
-            }
-
+        for (int i = 0; i < q_cnt; ++i) {
+            const float qk = scores[i];
+            if (qk == -FLT_MAX) { continue; }                      // masked out
             const float m_new = fmaxf(m_i[i], qk);
             const float e_old = __expf(m_i[i] - m_new);
             const float p     = __expf(qk - m_new);
@@ -485,6 +491,7 @@ __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ 
             }
             m_i[i] = m_new;
         }
+        __syncwarp();
     }
 
     // per-query cross-warp merge
@@ -631,7 +638,8 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             const size_t n_warps_t  = (size_t) head_dim / 32;
             const size_t smem_tiled = (PAGED_Q_TILE * head_dim
                                      + 2 * n_warps_t * PAGED_Q_TILE
-                                     + n_warps_t * PAGED_Q_TILE * head_dim) * sizeof(float);
+                                     + n_warps_t * PAGED_Q_TILE * head_dim
+                                     + n_warps_t * PAGED_Q_TILE) * sizeof(float);  // + score scratch
             if (smem_tiled > 48 * 1024) {
                 CUDA_CHECK(cudaFuncSetAttribute(paged_attention_prefill_tiled_kernel,
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_tiled));
