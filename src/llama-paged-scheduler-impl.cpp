@@ -342,7 +342,18 @@ void llama_paged_scheduler_impl::process_swapped_list(llama_sequence_group_raw_l
         // running list -- no capacity, no promotion.
         if (group->n_past + 1 > group->block_table.size() * block_size) {
             if (!kv_cache_manager->allocate(1, *group)) {
-                break;  // stays swapped; FCFS holds
+                // the group is ALREADY swapped in (its table now holds GPU ids). Leaving it
+                // in `swapped` would re-enter swap_in next tick and do_block_copy would
+                // treat GPU ids as CPU ids: id - num_gpu_blocks UNDERFLOWS into a wild
+                // offset ("tensor read out of bounds"). Restore consistency by swapping it
+                // back out; if even that fails, recompute it.
+                if (!kv_cache_manager->swap_out(*group)) {
+                    llama_sequence_group_ptr back = std::move(*it);
+                    it = swapped.erase(it);
+                    swap_out_or_recompute(std::move(back));
+                    continue;
+                }
+                break;  // stays swapped, table CPU-consistent; FCFS holds
             }
         }
         candidates.push_back(group);
