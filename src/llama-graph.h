@@ -1224,6 +1224,11 @@ struct llm_graph_context {
 
     llm_graph_input_attn_kv_paged * build_attn_inp_kv_paged() const;
 
+    // 3b (paged hybrid): same input construction from an explicitly supplied paged context
+    // (e.g. the hybrid wrapper's paged child) instead of casting this->mctx. The no-arg
+    // overload above delegates here.
+    llm_graph_input_attn_kv_paged * build_attn_inp_kv_paged(const llama_kv_cache_paged_context * mctx_paged) const;
+
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv_paged * inp,
             ggml_tensor * wo,

@@ -3284,7 +3284,11 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
 }
 
 llm_graph_input_attn_kv_paged * llm_graph_context::build_attn_inp_kv_paged() const {
-    const auto * mctx_paged = static_cast<const llama_kv_cache_paged_context*>(mctx);
+    return build_attn_inp_kv_paged(static_cast<const llama_kv_cache_paged_context*>(mctx));
+}
+
+llm_graph_input_attn_kv_paged * llm_graph_context::build_attn_inp_kv_paged(const llama_kv_cache_paged_context * mctx_paged) const {
+    GGML_ASSERT(mctx_paged != nullptr);
 
     auto inp = std::make_unique<llm_graph_input_attn_kv_paged>(hparams, cparams, mctx_paged);
 
