@@ -83,6 +83,11 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
                                               const int    block_size,
                                               const int    max_blocks,
                                               const float  scale,
+                                              // banded (3b): rel_logits [rel_extent, n_heads, n_tokens] F32 or nullptr;
+                                              // rel_dist = q_pos - token is LOGICAL, block scattering cannot affect it
+                                              const float * __restrict__ rel,
+                                              const int64_t rel_extent,
+                                              const int64_t visibility_window,
                                               float * __restrict__ out) {
     extern __shared__ float smem[];
 
@@ -117,6 +122,15 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
             const int end_token      = min(start_token + block_size, q_pos + 1);
 
             for (int token = start_token; token < end_token; ++token) {
+                const int64_t rel_dist = (int64_t) q_pos - token; // >= 0 (end_token caps at q_pos + 1)
+
+                // analytic band: skip invisible cells before paying for the cache loads.
+                // NB: uniform across the block (all threads share q_pos/token), so no
+                // divergence around the __syncthreads in the reduction below.
+                if (visibility_window > 0 && rel_dist >= visibility_window) {
+                    continue;
+                }
+
                 const int token_in_block = token % block_size;
 
                 const size_t k_idx =
@@ -129,7 +143,13 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
                 float v_val = __half2float(kv_cache[v_idx]);
 
                 // Calculate full dot product and return the same scalar in every thread
-                const float qk = block_reduce_sum_full(q_val * k_val, smem, tid, head_dim);
+                float qk = block_reduce_sum_full(q_val * k_val, smem, tid, head_dim);
+
+                // banded relative-position bias; own rel_extent gate, independent of the
+                // visibility window. Same value in every thread (uniform indices).
+                if (rel != nullptr && rel_dist < rel_extent) {
+                    qk += rel[((size_t) token_batch_idx * n_heads + head_idx) * rel_extent + rel_dist];
+                }
 
                 // Online softmax update
                 const float qk_max_new = fmaxf(qk_max, qk);
@@ -149,8 +169,18 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
 }
 
 void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    // banded variant (rel_logits at src[10], 3b): inner-loop port pending
-    GGML_ASSERT(dst->src[10] == nullptr && "paged banded attention is not implemented on CUDA yet");
+    // banded variant (rel_logits at src[10], 3b): rel_extent / visibility_window at
+    // op_params bytes [16,24)/[24,32) -- the banded-FA layout
+    const ggml_tensor * rel = dst->src[10];
+    int64_t rel_extent        = 0;
+    int64_t visibility_window = 0;
+    memcpy(&rel_extent,        &dst->op_params[4], sizeof(rel_extent));
+    memcpy(&visibility_window, &dst->op_params[6], sizeof(visibility_window));
+    if (rel) {
+        GGML_ASSERT(rel->type == GGML_TYPE_F32 && ggml_is_contiguous(rel) &&
+                    "paged banded attention: rel_logits must be contiguous F32");
+        GGML_ASSERT(rel->ne[0] == rel_extent);
+    }
 
     const ggml_tensor * q             = dst->src[0];
     const ggml_tensor * k_new         = dst->src[1];
@@ -207,5 +237,6 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     paged_attention_decode_kernel<<<dim3(n_heads, n_seq), dim3(head_dim), smem_bytes, ctx.stream()>>>(
         (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,
         (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
-        stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale, (float *) dst->data);
+        stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
+        rel ? (const float *) rel->data : nullptr, rel_extent, visibility_window, (float *) dst->data);
 }

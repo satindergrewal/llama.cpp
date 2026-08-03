@@ -38,7 +38,11 @@ int main() {
     const int NB   = 2;   // blocks
     const float scale = 1.0f / sqrtf((float) D);
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    // best available backend: CUDA on the box, CPU on the Mac build (both paths get covered
+    // by running the binary on each machine)
+    ggml_backend_t backend = ggml_backend_init_best();
+    GGML_ASSERT(backend);
+    printf("backend: %s\n", ggml_backend_name(backend));
 
     int n_fail = 0;
 
