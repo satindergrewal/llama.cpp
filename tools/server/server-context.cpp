@@ -985,6 +985,11 @@ public:
     }
 
     ~server_context_impl() {
+        if (paged_sched) {
+            llama_paged_scheduler_free(paged_sched);
+            paged_sched = nullptr;
+        }
+
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -1009,6 +1014,10 @@ private:
     llama_context * ctx_dft   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
+
+    // 4d (P2-8): continuous-batching engine for paged serving; non-null only when
+    // params.kv_paged -- the static slot path is byte-untouched without it
+    llama_paged_scheduler * paged_sched = nullptr;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1472,6 +1481,15 @@ private:
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        if (params_base.kv_paged) {
+            // 4d: the paged cache demands scheduler-fed batch info (it aborts on decode
+            // without it -- the 2026-08-03 crash witness); own the engine here.
+            // Independent of the prompt-cache setting.
+            paged_sched = llama_paged_scheduler_init(ctx_tgt);
+            GGML_ASSERT(paged_sched && "failed to init the paged scheduler");
+            SRV_INF("%s", "paged serving: scheduler initialized (4d bring-up)\n");
+        }
 
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
