@@ -205,6 +205,13 @@ struct ds4p_quench_config {
     int   minev   = 4;     // minimum verify steps before a quench is allowed
     float budget  = 0.0f;  // cumulative shortfall allowed before quench (default 4*guard)
     int   force   = 0;     // gate use: force-quench at this verify step (0 = off)
+    // COLD-START IMMUNITY (ours, not ds4): verify steps before the governor observes at
+    // all. Measured 2026-08-04 (qwen3-4b + Qwen3-0.6B, box GPU0): with the ds4 default
+    // the governor judged inside the drafter's cold start and TERMINALLY quenched a pair
+    // that recovers to 0.883 acceptance -- drafting collapsed 5.4x and cost ~9% tps. With
+    // the cold steps excluded the same pair drafts exactly as much as governor-OFF and
+    // runs faster. Set DS4P_QUENCH_WARMUP=0 to reproduce ds4 semantics exactly.
+    int   warmup  = 8;
 };
 
 static const ds4p_quench_config & ds4p_quench() {
@@ -216,6 +223,7 @@ static const ds4p_quench_config & ds4p_quench() {
         s = getenv("DS4P_QUENCH_MINEV");  if (s) c.minev  = atoi(s);
         s = getenv("DS4P_QUENCH_BUDGET"); if (s) c.budget = atof(s);
         s = getenv("DS4P_QUENCH_FORCE");  if (s) c.force  = atoi(s);
+        s = getenv("DS4P_QUENCH_WARMUP"); if (s) c.warmup = atoi(s);
         if (c.budget <= 0.0f) {
             c.budget = 4.0f*c.guard;
         }
@@ -4192,11 +4200,19 @@ private:
             if (ds4p_quench().enabled && !slot.quenched) {
                 const auto & qc = ds4p_quench();
 
-                slot.quench_ewma += ((float) n_accepted - slot.quench_ewma) / 8.0f; // alpha = 1/8
-                slot.quench_debt = std::max(0.0f, slot.quench_debt + (qc.guard - (float) n_accepted));
+                // cold-start immunity: during warmup the governor does not observe at all
+                // -- the EWMA stays at its guard init and no debt accrues, so a drafter
+                // that starts cold and recovers is not condemned by its first steps
+                // (the quench is TERMINAL, so an early verdict is unrecoverable).
+                const bool warming = slot.n_draft_verif_steps <= qc.warmup;
+                if (!warming) {
+                    slot.quench_ewma += ((float) n_accepted - slot.quench_ewma) / 8.0f; // alpha = 1/8
+                    slot.quench_debt = std::max(0.0f, slot.quench_debt + (qc.guard - (float) n_accepted));
+                }
 
                 const bool force = qc.force > 0 && slot.n_draft_verif_steps >= qc.force;
-                const bool fire  = slot.n_draft_verif_steps >= qc.minev &&
+                const bool fire  = !warming &&
+                                   slot.n_draft_verif_steps >= qc.minev + qc.warmup &&
                                    slot.quench_ewma < qc.guard &&
                                    slot.quench_debt > qc.budget;
 
