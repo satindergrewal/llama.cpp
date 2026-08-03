@@ -2164,6 +2164,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_rs_seq,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen35) {
+                    // --kv-paged used to be silently ignored for hybrid archs, booting a
+                    // full-n_ctx static attention cache the user explicitly asked to avoid
+                    // (measured: inkling 4M ctx = 48 GiB actual vs 19.5 GiB pool estimate
+                    // -> OOM). Refuse loudly until paged hybrid support lands.
+                    if (cparams.kv_paged) {
+                        LLAMA_LOG_ERROR("%s: kv_paged is not yet supported for hybrid architectures; "
+                                "the attention cache would be a full-context static allocation, not a paged one\n", __func__);
+                    }
+                    GGML_ASSERT(!cparams.kv_paged && "kv_paged is not yet supported for hybrid architectures");
+
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
@@ -2278,6 +2288,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 reuse);
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
+
+                        // --kv-paged used to be silently ignored here, booting a full-n_ctx
+                        // static iswa allocation the user explicitly asked to avoid
+                        // (measured: inkling 4M ctx = 48 GiB actual vs 19.5 GiB pool
+                        // estimate -> OOM). Refuse loudly until paged hybrid support lands.
+                        if (cparams.kv_paged) {
+                            LLAMA_LOG_ERROR("%s: kv_paged is not yet supported for SWA/hybrid architectures; "
+                                    "the cache would be a full-context static allocation, not a paged one\n", __func__);
+                        }
+                        GGML_ASSERT(!cparams.kv_paged && "kv_paged is not yet supported for SWA/hybrid architectures");
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
                             llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
