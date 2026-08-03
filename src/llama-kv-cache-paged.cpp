@@ -467,6 +467,41 @@ struct ggml_tensor * llama_kv_cache_paged::get_kv_tensor(int layer_idx) const {
     return kv_gpu_layers[layer_idx];
 }
 
+int32_t llama_kv_cache_paged::debug_seq_kv_checksum(const llama_sequence_group & group, int32_t n_tokens,
+                                                    double * out_sums, int32_t max_layers) const {
+    const int32_t nl = std::min<int32_t>((int32_t) n_layers, max_layers);
+    std::vector<uint8_t> buf;
+    for (int32_t il = 0; il < nl; ++il) {
+        ggml_tensor * kv = kv_gpu_layers[il];
+        if (kv == nullptr) {
+            out_sums[il] = -1.0;
+            continue;
+        }
+        const size_t nb_token = kv->nb[1];
+        const size_t nb_head  = kv->nb[2];
+        const size_t nb_block = kv->nb[3];
+        const size_t row_sz   = (size_t) head_dim * ggml_type_size(kv->type);  // one head's dims for one token
+        buf.resize(row_sz);
+        double sum = 0.0;
+        for (int32_t t = 0; t < n_tokens; ++t) {
+            const size_t bt = (size_t) t / block_size;
+            if (bt >= group.block_table.size()) {
+                break;  // beyond the group's allocated span
+            }
+            const size_t off_base = (size_t) group.block_table[bt] * nb_block + (size_t) (t % block_size) * nb_token;
+            for (uint32_t h = 0; h < 2 * n_heads_kv; ++h) {  // K heads then V heads (interleaved layout)
+                ggml_backend_tensor_get(kv, buf.data(), off_base + (size_t) h * nb_head, row_sz);
+                const uint16_t * half_vals = (const uint16_t *) buf.data();
+                for (size_t i = 0; i < row_sz / 2; ++i) {
+                    sum += (double) half_vals[i];  // raw-bit additive sum: bit-equality detector, not a norm
+                }
+            }
+        }
+        out_sums[il] = sum;
+    }
+    return nl;
+}
+
 void llama_kv_cache_paged::clear(bool /*data*/) {
     sequence_positions.clear();
 }

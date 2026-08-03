@@ -54,6 +54,11 @@ class llama_kv_cache_paged : public llama_memory_i {
     void     set_paged_batch_info(const llama_paged_batch_info * info);
     uint32_t get_num_gpu_blocks() const;
 
+    // DEBUG (fork-residual discriminator): additive checksum of the group's first
+    // n_tokens of KV per layer, read back through its block table. Returns layers written.
+    int32_t debug_seq_kv_checksum(const llama_sequence_group & group, int32_t n_tokens,
+                                  double * out_sums, int32_t max_layers) const;
+
     //
     // llama_memory_i
     //

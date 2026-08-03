@@ -1698,6 +1698,15 @@ extern "C" {
     LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,
                                                        llama_paged_on_finish_cb       cb,
                                                        void *                         user_data);
+
+    // DEBUG (fork-residual discriminator): per-layer additive checksum of a request's
+    // first n_tokens of KV, read back from the pool through its block table. Fills
+    // out_sums[n_layers]; returns the number of layers written, or -1 on unknown request.
+    LLAMA_API int32_t llama_paged_debug_seq_kv_checksum(const struct llama_paged_scheduler * sched,
+                                                        int32_t  request_id,
+                                                        int32_t  n_tokens,
+                                                        double * out_sums,
+                                                        int32_t  max_layers);
 #ifdef __cplusplus
 }
 #endif

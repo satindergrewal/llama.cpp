@@ -29,6 +29,9 @@ class llama_paged_scheduler_impl {
     // that state to the fork point, so forking must degrade to a full-prefill request
     void set_hybrid(bool v) { is_hybrid = v; }
 
+    // DEBUG accessor for the fork-residual checksum API
+    const llama_kv_cache_paged * kv_cache() const { return kv_cache_manager; }
+
   private:
     bool is_hybrid = false;
 

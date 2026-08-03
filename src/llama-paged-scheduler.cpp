@@ -55,6 +55,21 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
     }
 }
 
+LLAMA_API int32_t llama_paged_debug_seq_kv_checksum(const struct llama_paged_scheduler * sched,
+                                                    int32_t  request_id,
+                                                    int32_t  n_tokens,
+                                                    double * out_sums,
+                                                    int32_t  max_layers) {
+    if (!sched || !out_sums) {
+        return -1;
+    }
+    const llama_sequence_group * group = sched->impl.get_group_from_id(request_id);
+    if (!group) {
+        return -1;
+    }
+    return sched->impl.kv_cache()->debug_seq_kv_checksum(*group, n_tokens, out_sums, max_layers);
+}
+
 LLAMA_API void llama_paged_scheduler_free(struct llama_paged_scheduler * sched) {
     if (sched) {
         delete sched;

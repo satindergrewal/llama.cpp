@@ -244,6 +244,25 @@ int main(int argc, char ** argv) {
             int32_t     last_token_in_batch = info->batch_offsets[i] + info->batch_lens[i] - 1;
             llama_token next_token          = common_sampler_sample(sampler, ctx, last_token_in_batch);
 
+            // fork-residual discriminator: at each child's FIRST sample, checksum its
+            // visible prefix KV per layer -- bit-identical sums fork-vs-independent mean
+            // the residual lives in inputs/bookkeeping, not block content
+            if (fork_gate && request_id != 0 && accumulated_responses[request_id].empty()) {
+                const char * pfx_env = getenv("LLAMA_PAGED_FORK_PREFIX_TOKENS");
+                const int    n_ck    = pfx_env ? atoi(pfx_env) : 64;
+                double       sums[128];
+                const int    nl = llama_paged_debug_seq_kv_checksum(scheduler, request_id, n_ck, sums, 128);
+                if (nl > 0) {
+                    double total = 0.0;
+                    for (int l = 0; l < nl; ++l) {
+                        total += sums[l];
+                    }
+                    LOG_INF("KVCK req %d n=%d total=%.0f l0=%.0f l1=%.0f l2=%.0f l3=%.0f\n",
+                            request_id, n_ck, total, sums[0], nl > 1 ? sums[1] : -1.0,
+                            nl > 2 ? sums[2] : -1.0, nl > 3 ? sums[3] : -1.0);
+                }
+            }
+
             // fork-gate discriminator: dump the raw logit of the sampled token and the
             // runner-up gap, so a KV defect (large delta) can be told from a near-tie flip
             if (fork_gate) {
