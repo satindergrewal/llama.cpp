@@ -3001,8 +3001,9 @@ extern "C" {
     // paged attention with the banded relative-position bias (3b: paged hybrid archs).
     // Same op as ggml_paged_attn with rel_logits at src[10]; rel_extent and
     // visibility_window live at op_params bytes [16,24) and [24,32) (the banded FA layout).
-    //   score += rel_logits[rel_dist] iff 0 <= rel_dist < rel_extent (rel_dist is LOGICAL,
-    //   from context positions -- block scattering does not affect it)
+    //   rel_logits: [rel_extent, n_heads, n_tokens] contiguous F32;
+    //   score += rel_logits[rel_dist, head, token] iff 0 <= rel_dist < rel_extent
+    //   (rel_dist is LOGICAL, from context positions -- block scattering does not affect it)
     //   visibility_window > 0: analytic band, cell visible iff 0 <= rel_dist < window
     // rel_logits == NULL degrades to exactly ggml_paged_attn.
     GGML_API struct ggml_tensor * ggml_paged_attn_banded(struct ggml_context * ctx,

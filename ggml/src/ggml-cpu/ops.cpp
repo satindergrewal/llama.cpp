@@ -12104,8 +12104,19 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
         return;
     }
 
-    // banded variant (rel_logits at src[10], 3b): inner-loop port pending
-    GGML_ASSERT(dst->src[10] == NULL && "paged banded attention is not implemented on CPU yet");
+    // banded variant (rel_logits at src[10], 3b): rel_extent and visibility_window at
+    // op_params bytes [16,24)/[24,32) -- the banded-FA layout. rel_dist is LOGICAL
+    // (q_pos - tok), so block scattering does not affect it.
+    const ggml_tensor * rel = dst->src[10];
+    int64_t rel_extent        = 0;
+    int64_t visibility_window = 0;
+    memcpy(&rel_extent,        &dst->op_params[4], sizeof(rel_extent));
+    memcpy(&visibility_window, &dst->op_params[6], sizeof(visibility_window));
+    if (rel) {
+        GGML_ASSERT(rel->type == GGML_TYPE_F32 && ggml_is_contiguous(rel) &&
+                    "paged banded attention: rel_logits must be contiguous F32 (reference impl)");
+        GGML_ASSERT(rel->ne[0] == rel_extent);
+    }
 
     static bool log_warning = false;
     if (!log_warning) {
@@ -12165,6 +12176,14 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     ggml_backend_tensor_get(ctx_lens,      ctx_lens_host.data(),      0, ggml_nbytes(ctx_lens));
     ggml_backend_tensor_get(batch_offsets, batch_offsets_host.data(), 0, ggml_nbytes(batch_offsets));
     ggml_backend_tensor_get(batch_lens,    batch_lens_host.data(),    0, ggml_nbytes(batch_lens));
+
+    std::vector<float> rel_host;
+    const float * rel_data = nullptr;
+    if (rel) {
+        rel_host.resize(ggml_nelements(rel));
+        ggml_backend_tensor_get(rel, rel_host.data(), 0, ggml_nbytes(rel));
+        rel_data = rel_host.data();
+    }
 
     const float *   q_data             = q_host.data();
     const float *   k_data             = k_host.data();
@@ -12245,6 +12264,17 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
                         ((start_token + block_size) < (q_pos + 1)) ? start_token + block_size : q_pos + 1;
 
                     for (int tok = start_token; tok < end_token; ++tok) {
+                        // logical distance from the query to this key; block scattering is
+                        // physical only, so this is exact
+                        const int64_t rel_dist = (int64_t) q_pos - tok;
+
+                        // analytic band (visibility_window > 0): skip invisible cells before
+                        // paying for the cache fetch. rel_dist >= 0 always holds here
+                        // (end_token caps at q_pos + 1), kept for form.
+                        if (visibility_window > 0 && (rel_dist < 0 || rel_dist >= visibility_window)) {
+                            continue;
+                        }
+
                         const int    token_in_block = tok % block_size;
                         const size_t k_byte_offset =
                             ((size_t) physical_block * stride_block + (size_t) kv_h * stride_head +
@@ -12265,6 +12295,12 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
                             qk += q_vec[d_id] * GGML_FP16_TO_FP32(staging_k[d_id]);
                         }
                         qk *= scale;
+
+                        // banded relative-position bias, own rel_extent gate independent of
+                        // the visibility window; rel_logits: [rel_extent, n_heads, n_tokens]
+                        if (rel_data && rel_dist >= 0 && rel_dist < rel_extent) {
+                            qk += rel_data[((size_t) token_batch_idx * n_heads + h_id) * rel_extent + rel_dist];
+                        }
 
                         // Online softmax update
                         const float qk_max_new = fmaxf(qk_max, qk);
