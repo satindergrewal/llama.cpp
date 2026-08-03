@@ -613,9 +613,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
-        GGML_OP_COUNT,
-
         GGML_OP_PAGED_ATTN,
+
+        GGML_OP_COUNT,
     };
 
     enum ggml_unary_op {

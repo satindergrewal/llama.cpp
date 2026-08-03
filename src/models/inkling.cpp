@@ -290,12 +290,32 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
             banded_cache_type_supported(cache->type_v());
     };
 
+    // 4c-1: the paged banded kernel has its own inputs (block table, write slots), so the
+    // static cache's contiguity (n_kv_flash) is irrelevant to it. Gating the paged branch
+    // on use_banded_flash silently rerouted ALL scheduler-driven hybrid decode to the
+    // static unfused path (caught op-level by hybrid_paged_gate, 2026-08-04). Only the
+    // kernel's own shape/type contract belongs here.
+    const auto use_paged_banded = [&](const llama_kv_cache_paged_context * pctx, int il) {
+        ggml_tensor * kv = pctx->get_k(il);
+        return kv != nullptr &&
+            (head_dim == 64 || head_dim == 128) &&
+            hparams.n_embd_head_v(il) == head_dim &&
+            hparams.n_head(il) % hparams.n_head_kv(il) == 0 &&
+            banded_cache_type_supported(kv->type);
+    };
+
+    // a layer that will take the 4c-1 paged branch consumes neither the static rel-idx
+    // inputs nor the static banded-flash views; creating an input no node consumes leaves
+    // it unallocated and its set_input crashes on a null buffer (hybrid_paged_gate run 2)
+    const auto * paged_ctx0 = mctx_hyb ? mctx_hyb->get_attn_paged() : nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
+        const bool paged_l = paged_ctx0 != nullptr && use_paged_banded(paged_ctx0, il);
         if (hparams.is_swa(il)) {
-            needs_rel_idx_local |= !use_banded_flash(il);
+            needs_rel_idx_local |= !paged_l && !use_banded_flash(il);
         } else {
             has_global = true;
-            needs_rel_idx_global |= !use_banded_flash(il);
+            needs_rel_idx_global |= !paged_l && !use_banded_flash(il);
         }
     }
 
@@ -442,7 +462,13 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         // cpy_k/cpy_v stores and the mask/stream slicing below are all skipped; visibility
         // is implicit-causal for base layers (window 0) and n_swa for SWA layers.
         const auto * paged_ctx = inp_hybrid->mctx ? inp_hybrid->mctx->get_attn_paged() : nullptr;
-        if (paged_ctx != nullptr && use_banded_flash(il)) {
+        if (paged_ctx != nullptr && !use_paged_banded(paged_ctx, il)) {
+            // never fall back silently: a scheduler-driven decode landing on the static
+            // cache defeats the paged design while producing correct-looking tokens
+            LLAMA_LOG_WARN("%s: paged pool active but layer %d fails the paged banded contract "
+                           "-- falling back to the static path\n", __func__, il);
+        }
+        if (paged_ctx != nullptr && use_paged_banded(paged_ctx, il)) {
             GGML_ASSERT(q->type == GGML_TYPE_F32);
 
             auto * inp_paged = build_attn_inp_kv_paged(paged_ctx);
