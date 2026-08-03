@@ -1,5 +1,6 @@
 #include "pagedattn.cuh"
 #include "mma.cuh"
+#include "cp-async.cuh"
 
 __device__ __forceinline__ float block_reduce_sum_full(float val, float * __restrict__ smem, int tid, int head_dim) {
     const int lane    = tid & 31;
@@ -825,7 +826,8 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
                                         float * __restrict__ out,
                                         const int    n_splits,
                                         float * __restrict__ part_m,
-                                        float * __restrict__ part_l) {
+                                        float * __restrict__ part_l,
+                                        const bool   use_cp_async) {
 #ifdef TURING_MMA_AVAILABLE
     using namespace ggml_cuda_mma;
     typedef tile<16, 16, float> tile_acc;   // score tile and output tiles
@@ -839,7 +841,7 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
     // smem = max(q, k+v) instead of q+k+v, which buys blocks per SM.
     half * q_h = (half *) smem_raw;                        // [64][ld], live until q_frag loaded
     half * k_h = (half *) smem_raw;                        // [PAGED_MMA_KV][ld]
-    half * v_t = k_h + PAGED_MMA_KV * ld;                  // [HD][PAGED_MMA_LDV] transposed
+    half * v_h = k_h + PAGED_MMA_KV * ld;                  // [PAGED_MMA_KV][ld], transposed on LOAD
 
     const int lane    = threadIdx.x;                 // mma.cuh indexes by threadIdx.x
     const int warp_id = threadIdx.y;
@@ -897,18 +899,42 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
 
     for (int kt0 = kt_lo; kt0 < kt_hi; kt0 += PAGED_MMA_KV) {
         __syncthreads();
-        for (int e = tid; e < PAGED_MMA_KV * HD; e += nthr) {
-            const int j = e / HD, d = e % HD;
-            const int tok = kt0 + j;
-            half kv_k = __float2half(0.0f), kv_v = __float2half(0.0f);
-            if (tok < n_tok) {
-                const int pb   = block_table[seq_idx * max_blocks + tok / block_size];
-                const size_t b = (size_t)(tok % block_size) * stride_token + (size_t) pb * stride_block;
-                kv_k = kv_cache[b + (size_t) kv_head * stride_head + d];
-                kv_v = kv_cache[b + (size_t)(n_heads_kv + kv_head) * stride_head + d];
+        if (use_cp_async) {
+            // 8 halves (16 B) per instruction, straight global->shared with no register
+            // round-trip. Every offset here is a multiple of 8 halves, so both ends are
+            // 16 B aligned: ld = HD + 8, stride_head = HD, stride_token = 2*n_heads_kv*HD.
+            for (int e = tid * 8; e < PAGED_MMA_KV * HD; e += nthr * 8) {
+                const int j = e / HD, d = e % HD;
+                const int tok = kt0 + j;
+                if (tok < n_tok) {
+                    const int pb   = block_table[seq_idx * max_blocks + tok / block_size];
+                    const size_t b = (size_t)(tok % block_size) * stride_token + (size_t) pb * stride_block;
+                    cp_async_cg_16<128>(ggml_cuda_cvta_generic_to_shared(k_h + j * ld + d),
+                                        kv_cache + b + (size_t) kv_head * stride_head + d);
+                    cp_async_cg_16<128>(ggml_cuda_cvta_generic_to_shared(v_h + j * ld + d),
+                                        kv_cache + b + (size_t)(n_heads_kv + kv_head) * stride_head + d);
+                } else {
+                    for (int u = 0; u < 8; ++u) {
+                        k_h[j * ld + d + u] = __float2half(0.0f);
+                        v_h[j * ld + d + u] = __float2half(0.0f);
+                    }
+                }
             }
-            k_h[j * ld + d]            = kv_k;
-            v_t[d * PAGED_MMA_LDV + j] = kv_v;   // transposed store: B operand for P x V
+            cp_async_wait_all();
+        } else {
+            for (int e = tid; e < PAGED_MMA_KV * HD; e += nthr) {
+                const int j = e / HD, d = e % HD;
+                const int tok = kt0 + j;
+                half kv_k = __float2half(0.0f), kv_v = __float2half(0.0f);
+                if (tok < n_tok) {
+                    const int pb   = block_table[seq_idx * max_blocks + tok / block_size];
+                    const size_t b = (size_t)(tok % block_size) * stride_token + (size_t) pb * stride_block;
+                    kv_k = kv_cache[b + (size_t) kv_head * stride_head + d];
+                    kv_v = kv_cache[b + (size_t)(n_heads_kv + kv_head) * stride_head + d];
+                }
+                k_h[j * ld + d] = kv_k;
+                v_h[j * ld + d] = kv_v;   // contiguous; ldmatrix.trans supplies the transpose
+            }
         }
         __syncthreads();
 
@@ -994,8 +1020,7 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
                 for (int l = 0; l < tile_acc::ne; ++l) { o_frag[c].x[l] *= resc[(l / 2) % 2]; }
             }
             tile_ab v_frag;
-            load_ldmatrix(v_frag, (const half2 *) (v_t + (size_t) c * 16 * PAGED_MMA_LDV + sub * PAGED_MMA_N),
-                          PAGED_MMA_LDV / 2);
+            load_ldmatrix_trans(v_frag, (const half2 *) (v_h + (size_t) sub * PAGED_MMA_N * ld + c * 16), ld / 2);
             mma(o_frag[c], p_frag, v_frag);
         }
         }   // sub
@@ -1044,7 +1069,7 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
     GGML_UNUSED_VARS(q, kv_cache, block_table, context_lens, batch_offsets, batch_lens,
                      stride_token, stride_head, stride_block, n_heads_kv, block_size,
                      max_blocks, scale, rel, rel_extent, visibility_window, out,
-                     n_splits, part_m, part_l);
+                     n_splits, part_m, part_l, use_cp_async);
     NO_DEVICE_CODE;
 #endif // TURING_MMA_AVAILABLE
 }
@@ -1168,8 +1193,7 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             const int    rows_blk  = PAGED_MMA_WARPS * PAGED_MMA_M;
             const int    n_q_tiles = (n_tokens_total + rows_blk - 1) / rows_blk;
             const int    ld        = head_dim + 8;
-            const size_t smem_m    = sizeof(half) * (size_t) std::max(rows_blk * ld,
-                                         PAGED_MMA_KV * ld + head_dim * PAGED_MMA_LDV);
+            const size_t smem_m    = sizeof(half) * (size_t) std::max(rows_blk * ld, 2 * PAGED_MMA_KV * ld);
             if (smem_m > 48 * 1024) {
                 GGML_ASSERT(smem_m <= 96 * 1024 && "mma prefill smem exceeds 96KB");
                 if (head_dim == 64) {
@@ -1197,6 +1221,14 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                 n_splits = std::min(8, (4 * nsm + base_blocks - 1) / base_blocks);
             }
 
+            // cp.async staging: refuted at 5.44 warps/SM (nothing to hide behind), worth
+            // repricing now that split-K + the register cap tripled occupancy.
+            static const int cpasync_env = []() {
+                const char * s = getenv("DS4P_PAGED_CPASYNC");
+                return s ? atoi(s) : 1;
+            }();
+            const bool cpa = cpasync_env != 0 && ggml_cuda_info().devices[ctx.device].cc >= GGML_CUDA_CC_AMPERE;
+
             const dim3 grid(n_heads, n_seq, n_q_tiles * n_splits);
             const dim3 blk(32, PAGED_MMA_WARPS);   // mma.cuh indexes fragments by threadIdx.x
 
@@ -1219,7 +1251,7 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                 (const int *) context_lens->data, (const int *) batch_offsets->data,                 \
                 (const int *) batch_lens->data, stride_token, stride_head, stride_block, n_heads_kv,  \
                 block_size, max_blocks, scale, rel ? (const float *) rel->data : nullptr, rel_extent, \
-                visibility_window, p_out, n_splits, p_m, p_l)
+                visibility_window, p_out, n_splits, p_m, p_l, cpa)
             if (head_dim == 64) { DS4P_LAUNCH_MMA(64); } else { DS4P_LAUNCH_MMA(128); }
 #undef DS4P_LAUNCH_MMA
 
