@@ -2933,6 +2933,21 @@ private:
     // 4d (DESIGN-P28 increments 1+2): the continuous-batching drive loop -- the
     // examples/paged loop transplanted onto the server's slot bookkeeping. Replaces the
     // whole static batch-assembly path when the scheduler owns serving.
+    // ⚠ KNOWN GAP (measured 2026-08-04): this path never populates slot.prompt.tokens nor
+    // slot.n_prompt_tokens_processed. Two visible consequences:
+    //   1. every paged timing reports prompt_n = 0 -- for a 22,000-token prompt. That zero
+    //      is NOT a display quirk, it is the symptom below, and it is convincing enough to
+    //      read past for an entire session. Do not trust prompt_n on the paged path.
+    //   2. prompt_save() returns false at its first line (`prompt.tokens.size() == 0`), so
+    //      the server prompt cache stores nothing and the P1-5 disk KV bank NEVER spills:
+    //      the bank is non-functional under --kv-paged. Proven by A/B against the same
+    //      binary/flags/prompts with only --kv-paged differing (non-paged logs "saving
+    //      prompt with length 2013"; paged never reaches that line).
+    // FIXING IT is not a one-liner: the mirror has to stay exact across chunked prefill,
+    // recompute/swap preemption replay, and forks, and a DESYNCED record is worse than an
+    // empty one -- P0-2's revalidate guard would bind a wrong token record to a sequence.
+    // Estimate: ~half a day WITH its own gate (DS4P_REVALIDATE + the cell-mismatch counter
+    // is the instrument that already exists for exactly this).
     void update_slots_paged() {
         llama_batch pbatch = {};
 
