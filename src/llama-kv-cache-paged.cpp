@@ -373,6 +373,19 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch(llama_batch_allocr & b
     return std::make_unique<llama_kv_cache_paged_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
+llama_memory_context_ptr llama_kv_cache_paged::init_batch_with_ubatches(std::vector<llama_ubatch> ubatches) {
+    if (ubatches.empty()) {
+        return std::make_unique<llama_kv_cache_paged_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
+    auto ctx = std::make_unique<llama_kv_cache_paged_context>(this, std::move(ubatches));
+
+    // same ordering contract as init_batch: the scheduler must have set the batch info first
+    GGML_ASSERT(last_paged_info && "no paged batch info set before init_batch_with_ubatches was called.");
+    ctx->set_batch_data(*last_paged_info);
+    return ctx;
+}
+
 // Used by llama_context scheduler to dry-run
 llama_memory_context_ptr llama_kv_cache_paged::init_full() {
     LLAMA_LOG_DEBUG("%s: reserving graph for n_ubatch=%d, n_seq_max=%d, num_gpu_blocks=%d\n", __func__, n_ubatch,

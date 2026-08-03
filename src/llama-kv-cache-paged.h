@@ -52,6 +52,11 @@ class llama_kv_cache_paged : public llama_memory_i {
     //
     llama_memory_context_ptr init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) override;
 
+    // 3b (paged hybrid): same contract as init_batch but the caller owns the ubatch split.
+    // The hybrid wrapper must split per its recurrent side's constraints and feed the SAME
+    // ubatches to both members, so it cannot let this cache consume balloc itself.
+    llama_memory_context_ptr init_batch_with_ubatches(std::vector<llama_ubatch> ubatches);
+
     llama_memory_context_ptr init_full() override;
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
