@@ -6942,9 +6942,10 @@ struct test_flash_attn_ext_banded : public test_case {
     const ggml_type rel_type;
     const bool strided;
     const int64_t n_stream; // ne[3] > 1: multi-sequence streams (per-stream banded attention)
+    const int64_t visibility_window; // > 0: analytic band, no mask tensor (mask_kind must be 0)
 
     std::string vars() override {
-        return VARS_TO_STR12(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, k_type, v_type, rel_type, strided, n_stream);
+        return VARS_TO_STR13(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, k_type, v_type, rel_type, strided, n_stream, visibility_window);
     }
 
     double max_nmse_err() override {
@@ -6965,11 +6966,15 @@ struct test_flash_attn_ext_banded : public test_case {
             int64_t d, int64_t n_head, int64_t n_head_kv,
             int64_t n_q, int64_t n_kv, int64_t rel_extent,
             int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided = false,
-            int64_t n_stream = 1, ggml_type v_type_arg = GGML_TYPE_COUNT)
+            int64_t n_stream = 1, ggml_type v_type_arg = GGML_TYPE_COUNT,
+            int64_t visibility_window = 0)
         : d(d), n_head(n_head), n_head_kv(n_head_kv), n_q(n_q), n_kv(n_kv),
           rel_extent(rel_extent), mask_kind(mask_kind), k_type(kv_type),
           v_type(v_type_arg == GGML_TYPE_COUNT ? kv_type : v_type_arg),
-          rel_type(rel_type), strided(strided), n_stream(n_stream) {}
+          rel_type(rel_type), strided(strided), n_stream(n_stream),
+          visibility_window(visibility_window) {
+        GGML_ASSERT(visibility_window == 0 || mask_kind == 0);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t ns = n_stream;
@@ -7002,7 +7007,7 @@ struct test_flash_attn_ext_banded : public test_case {
             ggml_set_name(m, "m");
         }
 
-        ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, m, r, 1.0f/float(d), rel_extent, 0);
+        ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, m, r, 1.0f/float(d), rel_extent, visibility_window);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
         ggml_set_name(out, "out");
         return out;
@@ -9717,6 +9722,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2, 16, 64,   8, 1, GGML_TYPE_Q8_0, GGML_TYPE_F16, false, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64,   8, 2, GGML_TYPE_Q8_0, GGML_TYPE_F32, false, 2, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 8192, 1024, 1, GGML_TYPE_Q8_0, GGML_TYPE_F32, false, 1, GGML_TYPE_F16));
+
+    // analytic band (visibility_window > 0, mask tensor absent): pure causal (window = n_kv),
+    // cutoff inside the KV (window < n_kv), multi-stream, composed with Q8_0-K, and real-model
+    // depth with an n_swa-scale window
+    test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2,  16,   64,    8, 0, GGML_TYPE_F16,  GGML_TYPE_F32, false, 1, GGML_TYPE_COUNT,   64));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2,  64,   64,    8, 0, GGML_TYPE_F16,  GGML_TYPE_F32, false, 2, GGML_TYPE_COUNT,   32));
+    test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2,  16,   64,    8, 0, GGML_TYPE_Q8_0, GGML_TYPE_F16, false, 1, GGML_TYPE_F16,     24));
+    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 8192, 1024, 0, GGML_TYPE_F16,  GGML_TYPE_F32, false, 1, GGML_TYPE_COUNT, 1024));
     // production-scale n_kv straddling the observed ~16.4-16.9K garbage threshold
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512,  8192, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 16384, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
