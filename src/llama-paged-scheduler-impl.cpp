@@ -364,8 +364,12 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
         }
 
         ++count;
-        // When prefilling, we want to always guarantee at least one decode to avoid thrashing
-        const bool success = kv_cache_manager->allocate(tokens_needed, *group);
+        // When prefilling, we want to always guarantee at least one decode to avoid thrashing.
+        // allocate() already counts n_prompt + n_decoded internally, so the argument is the
+        // DELTA only: passing tokens_needed (= n_prompt+1) double-counted the prompt and
+        // demanded ~2x the blocks -- admission serialized every fat request (running=1
+        // always in the starved walls) and eviction/recompute became unreachable.
+        const bool success = kv_cache_manager->allocate(1, *group);
         if (!success) {
             // We respect FCFS, so we stop here to prevent a younger waiting request from jumping ahead.
             break;
