@@ -612,6 +612,126 @@ __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ 
     }
 }
 
+// stage 3b: the fragment prefill kernel -- one warp owns a 16-query tile and walks the key
+// tiles, doing both matmuls on tensor cores with a standard flash-attention online softmax
+// between them. Q/K/V are staged as half in smem (wmma needs half operands); the score tile
+// and the output accumulator stay f32. Dark: only DS4P_PAGED_QTILE=2 dispatches here.
+__global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q,
+                                                    const half * __restrict__ kv_cache,
+                                                    const int * __restrict__ block_table,
+                                                    const int * __restrict__ context_lens,
+                                                    const int * __restrict__ batch_offsets,
+                                                    const int * __restrict__ batch_lens,
+                                                    const size_t stride_token,
+                                                    const size_t stride_head,
+                                                    const size_t stride_block,
+                                                    const int    n_heads_kv,
+                                                    const int    block_size,
+                                                    const int    max_blocks,
+                                                    const float  scale,
+                                                    const float * __restrict__ rel,
+                                                    const int64_t rel_extent,
+                                                    const int64_t visibility_window,
+                                                    const int    head_dim,
+                                                    float * __restrict__ out) {
+    extern __shared__ char smem_raw[];
+    const int ld  = head_dim + 8;                 // pad against bank conflicts
+    half  * q_h   = (half *)  smem_raw;
+    half  * k_h   = q_h   + PAGED_WMMA_M * ld;
+    half  * v_h   = k_h   + PAGED_WMMA_N * ld;
+    half  * p_h   = v_h   + PAGED_WMMA_N * ld;
+    float * sc    = (float *) (p_h + PAGED_WMMA_M * PAGED_WMMA_N);
+    float * o_acc = sc + PAGED_WMMA_M * PAGED_WMMA_N;
+    float * m_s   = o_acc + PAGED_WMMA_M * ld;
+    float * l_s   = m_s + PAGED_WMMA_M;
+
+    const int head_idx = blockIdx.x;
+    const int seq_idx  = blockIdx.y;
+    const int q_tile   = blockIdx.z;
+    const int tid      = threadIdx.x;             // one warp
+    const int n_heads  = gridDim.x;
+    const int kv_head  = head_idx / (n_heads / n_heads_kv);
+
+    const int seq_start = batch_offsets[seq_idx];
+    const int n_new     = batch_lens[seq_idx];
+    const int q_base    = q_tile * PAGED_WMMA_M;
+    if (q_base >= n_new) { return; }
+    const int q_cnt     = min(PAGED_WMMA_M, n_new - q_base);
+    const int first_pos = context_lens[seq_idx] - n_new;
+
+    for (int e = tid; e < PAGED_WMMA_M * ld; e += 32) {
+        const int i = e / ld, d = e % ld;
+        q_h[e]   = (i < q_cnt && d < head_dim)
+                 ? __float2half(q[(size_t)(seq_start + q_base + i) * n_heads * head_dim
+                                  + (size_t) head_idx * head_dim + d])
+                 : __float2half(0.0f);
+        o_acc[e] = 0.0f;
+    }
+    for (int i = tid; i < PAGED_WMMA_M; i += 32) { m_s[i] = -FLT_MAX; l_s[i] = 0.0f; }
+    __syncwarp();
+
+    const int n_tok = first_pos + q_base + q_cnt;   // last query in the tile bounds the walk
+    for (int kt = 0; kt < n_tok; kt += PAGED_WMMA_N) {
+        for (int e = tid; e < PAGED_WMMA_N * ld; e += 32) {
+            const int j = e / ld, d = e % ld;
+            const int tok = kt + j;
+            half kv_k = __float2half(0.0f), kv_v = __float2half(0.0f);
+            if (tok < n_tok && d < head_dim) {
+                const int pb   = block_table[seq_idx * max_blocks + tok / block_size];
+                const size_t b = (size_t)(tok % block_size) * stride_token + (size_t) pb * stride_block;
+                kv_k = kv_cache[b + (size_t) kv_head * stride_head + d];
+                kv_v = kv_cache[b + (size_t)(n_heads_kv + kv_head) * stride_head + d];
+            }
+            k_h[e] = kv_k; v_h[e] = kv_v;
+        }
+        __syncwarp();
+
+        paged_wmma_qk(q_h, k_h, ld, head_dim, scale, sc);
+        __syncwarp();
+
+        // mask + band + rel bias, then the online softmax row by row
+        for (int i = tid; i < PAGED_WMMA_M; i += 32) {
+            const int q_pos = first_pos + q_base + i;
+            float rmax = -FLT_MAX;
+            for (int j = 0; j < PAGED_WMMA_N; ++j) {
+                const int tok = kt + j;
+                float v = sc[i * PAGED_WMMA_N + j];
+                const int64_t rd = (int64_t) q_pos - tok;
+                if (i >= q_cnt || tok >= n_tok || tok > q_pos ||
+                    (visibility_window > 0 && rd >= visibility_window)) {
+                    v = -FLT_MAX;
+                } else if (rel != nullptr && rd < rel_extent) {
+                    v += rel[((size_t)(seq_start + q_base + i) * n_heads + head_idx) * rel_extent + rd];
+                }
+                sc[i * PAGED_WMMA_N + j] = v;
+                rmax = fmaxf(rmax, v);
+            }
+            const float m_new = fmaxf(m_s[i], rmax);
+            const float resc  = (m_s[i] == -FLT_MAX) ? 0.0f : __expf(m_s[i] - m_new);
+            float row_l = 0.0f;
+            for (int j = 0; j < PAGED_WMMA_N; ++j) {
+                const float v = sc[i * PAGED_WMMA_N + j];
+                const float pv = (v == -FLT_MAX) ? 0.0f : __expf(v - m_new);
+                p_h[i * PAGED_WMMA_N + j] = __float2half(pv);
+                row_l += pv;
+            }
+            for (int d = 0; d < head_dim; ++d) { o_acc[i * ld + d] *= resc; }  // rescale BEFORE pv
+            l_s[i] = l_s[i] * resc + row_l;
+            m_s[i] = m_new;
+        }
+        __syncwarp();
+
+        paged_wmma_pv(p_h, v_h, ld, head_dim, o_acc, ld);
+        __syncwarp();
+    }
+
+    for (int e = tid; e < q_cnt * head_dim; e += 32) {
+        const int i = e / head_dim, d = e % head_dim;
+        out[(size_t)(seq_start + q_base + i) * n_heads * head_dim
+            + (size_t) head_idx * head_dim + d] = o_acc[i * ld + d] / (l_s[i] + 1e-6f);
+    }
+}
+
 // M7: merge the split-K partials for one (token, head) by log-sum-exp.
 // grid (n_heads, n_tokens), blockDim head_dim.
 __global__ void paged_attention_combine_kernel(const float * __restrict__ part_acc,
@@ -722,6 +842,32 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             const char * s = getenv("DS4P_PAGED_QTILE");
             return s && atoi(s) != 0;
         }();
+        // DS4P_PAGED_QTILE=2 -> the WMMA fragment path (dark: only when asked for)
+        static const int qtile_mode = []() {
+            const char * s = getenv("DS4P_PAGED_QTILE");
+            return s ? atoi(s) : 0;
+        }();
+        if (qtile_mode == 2 && n_tokens_total > n_seq) {
+            const int    n_q_tiles = (n_tokens_total + PAGED_WMMA_M - 1) / PAGED_WMMA_M;
+            const int    ld        = head_dim + 8;
+            const size_t smem_w    = (size_t) (PAGED_WMMA_M * ld + 2 * PAGED_WMMA_N * ld
+                                             + PAGED_WMMA_M * PAGED_WMMA_N) * sizeof(half)
+                                   + (size_t) (PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld
+                                             + 2 * PAGED_WMMA_M) * sizeof(float);
+            if (smem_w > 48 * 1024) {
+                GGML_ASSERT(smem_w <= 96 * 1024 && "wmma prefill smem exceeds 96KB");
+                CUDA_CHECK(cudaFuncSetAttribute(paged_attention_prefill_wmma_kernel,
+                                                cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_w));
+            }
+            paged_attention_prefill_wmma_kernel<<<dim3(n_heads, n_seq, n_q_tiles), dim3(32), smem_w, ctx.stream()>>>(
+                (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,
+                (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
+                stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
+                rel ? (const float *) rel->data : nullptr, rel_extent, visibility_window, head_dim,
+                (float *) dst->data);
+            return;
+        }
+
         if (qtile_on && n_tokens_total > n_seq) {   // multi-query (prefill) batch
             const int    n_q_tiles  = (n_tokens_total + PAGED_Q_TILE - 1) / PAGED_Q_TILE;
             const size_t n_warps_t  = (size_t) head_dim / 32;
