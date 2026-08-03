@@ -195,14 +195,19 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
                                               const float * __restrict__ rel,
                                               const int64_t rel_extent,
                                               const int64_t visibility_window,
-                                              float * __restrict__ out) {
+                                              float * __restrict__ out,
+                                              // M7 split-K (n_splits == 1 => original path):
+                                              const int n_splits,
+                                              float * __restrict__ out_m,
+                                              float * __restrict__ out_l) {
     extern __shared__ float smem[];
 
-    const int head_idx = blockIdx.x;
-    const int seq_idx  = blockIdx.y;
-    const int tid      = threadIdx.x;
-    const int lane     = tid & 31;
-    const int warp_id  = tid >> 5;
+    const int head_idx  = blockIdx.x;
+    const int seq_idx   = blockIdx.y;
+    const int split_idx = (n_splits > 1) ? (int) blockIdx.z : 0;
+    const int tid       = threadIdx.x;
+    const int lane      = tid & 31;
+    const int warp_id   = tid >> 5;
 
     const int n_heads  = gridDim.x;
     const int head_dim = blockDim.x;
@@ -224,7 +229,9 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
     // prefill chunk previously ran 512 full context scans back-to-back in one block, which
     // made chunked prefill O(minutes) at 8K context (Q4 gate). One block = one query token.
     {
-        const int i = blockIdx.z;
+        // split-K borrows blockIdx.z, which is free during decode (num_new_tokens == 1);
+        // with n_splits == 1 it stays the query index as before
+        const int i = (n_splits > 1) ? 0 : (int) blockIdx.z;
         if (i >= num_new_tokens) {
             return;
         }
@@ -244,7 +251,30 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
         float l_i = 0.0f;
         float acc_i[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
-        for (int token = lo + warp_id; token < n_tok; token += n_warps) {
+        // M7 split-K: when the launcher splits the context across the grid, each block
+        // owns a contiguous slice [split_lo, split_hi) and emits a PARTIAL (m, l, acc);
+        // the combine kernel merges partials by log-sum-exp. n_splits == 1 is the
+        // original whole-context path, bit-for-bit (same warp striding, same order).
+        int split_lo = lo, split_hi = n_tok;
+        if (n_splits > 1) {
+            const int span = (n_tok - lo + n_splits - 1) / n_splits;
+            split_lo = lo + split_idx * span;
+            split_hi = min(n_tok, split_lo + span);
+            if (split_lo >= split_hi) {   // empty slice: emit a null partial
+                if (out_m != nullptr && tid == 0) {
+                    const size_t pidx = ((size_t) token_batch_idx * n_heads + head_idx) * n_splits + split_idx;
+                    out_m[pidx] = -FLT_MAX;
+                    out_l[pidx] = 0.0f;
+                }
+                if (out_m != nullptr) {
+                    const size_t aidx = (((size_t) token_batch_idx * n_heads + head_idx) * n_splits + split_idx) * head_dim;
+                    out[aidx + tid] = 0.0f;
+                }
+                continue;
+            }
+        }
+
+        for (int token = split_lo + warp_id; token < split_hi; token += n_warps) {
             const int    bid            = token / block_size;
             const int    physical_block = block_table[seq_idx * max_blocks + bid];
             const int    token_in_block = token % block_size;
@@ -311,10 +341,51 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
             out_acc += warp_acc[w * head_dim + tid] * f;
         }
 
-        const int out_idx = (size_t) token_batch_idx * n_heads * head_dim + (size_t) head_idx * head_dim + tid;
-        out[out_idx] = out_acc / (l_tot + 1e-6f);
+        if (n_splits > 1) {
+            // emit this slice's PARTIAL: un-normalised acc plus its (m, l) so the
+            // combine kernel can merge slices by log-sum-exp
+            const size_t pidx = ((size_t) token_batch_idx * n_heads + head_idx) * n_splits + split_idx;
+            if (tid == 0) {
+                out_m[pidx] = m_tot;
+                out_l[pidx] = l_tot;
+            }
+            out[pidx * head_dim + tid] = out_acc;
+        } else {
+            const int out_idx = (size_t) token_batch_idx * n_heads * head_dim + (size_t) head_idx * head_dim + tid;
+            out[out_idx] = out_acc / (l_tot + 1e-6f);
+        }
         __syncthreads();  // q_s / warp_acc are rewritten next iteration
     }
+}
+
+// M7: merge the split-K partials for one (token, head) by log-sum-exp.
+// grid (n_heads, n_tokens), blockDim head_dim.
+__global__ void paged_attention_combine_kernel(const float * __restrict__ part_acc,
+                                               const float * __restrict__ part_m,
+                                               const float * __restrict__ part_l,
+                                               const int   n_splits,
+                                               float * __restrict__ out) {
+    const int head_idx = blockIdx.x;
+    const int tok_idx  = blockIdx.y;
+    const int tid      = threadIdx.x;
+    const int n_heads  = gridDim.x;
+    const int head_dim = blockDim.x;
+
+    const size_t base = ((size_t) tok_idx * n_heads + head_idx) * n_splits;
+
+    float m_tot = -FLT_MAX;
+    for (int s = 0; s < n_splits; ++s) {
+        m_tot = fmaxf(m_tot, part_m[base + s]);
+    }
+    float l_tot = 0.0f;
+    float acc   = 0.0f;
+    for (int s = 0; s < n_splits; ++s) {
+        const float f = __expf(part_m[base + s] - m_tot);
+        l_tot += part_l[base + s] * f;
+        acc   += part_acc[(base + s) * head_dim + tid] * f;
+    }
+
+    out[((size_t) tok_idx * n_heads + head_idx) * head_dim + tid] = acc / (l_tot + 1e-6f);
 }
 
 void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -380,11 +451,49 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         // per-seq max is not host-visible -- total n_tokens is a safe upper bound)
         const int n_tokens_total = (int) q->ne[2];
 
+        // M7 split-K: decode-only batches (one query per seq) leave blockIdx.z free and
+        // are exactly the case that starves for parallelism at long context -- a single
+        // (head, seq) block walking 22K tokens measured 220 ms/token (18-28x off the
+        // static banded path). Split the context across the grid and merge partials.
+        // DS4P_PAGED_SPLITK=0 disables; default splits only when the context is long
+        // enough for the extra launch + combine to pay.
+        static const int splitk_env = []() {
+            const char * s = getenv("DS4P_PAGED_SPLITK");
+            return s ? atoi(s) : -1;   // -1 = auto
+        }();
+        int n_splits = 1;
+        if (splitk_env != 0 && n_tokens_total == n_seq) {   // decode-only batch
+            const int ctx_hint = (int) kv_cache->ne[3] * block_size;  // pool span upper bound
+            const int want     = splitk_env > 0 ? splitk_env : 8;
+            if (splitk_env > 0 || ctx_hint >= 4096) {
+                n_splits = want;
+            }
+        }
+
+        if (n_splits > 1) {
+            const size_t n_part = (size_t) n_tokens_total * n_heads * n_splits;
+            ggml_cuda_pool_alloc<float> part_acc(ctx.pool(), n_part * head_dim);
+            ggml_cuda_pool_alloc<float> part_m(ctx.pool(), n_part);
+            ggml_cuda_pool_alloc<float> part_l(ctx.pool(), n_part);
+
+            paged_attention_decode_kernel<<<dim3(n_heads, n_seq, n_splits), dim3(head_dim), smem_bytes, ctx.stream()>>>(
+                (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,
+                (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
+                stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
+                rel ? (const float *) rel->data : nullptr, rel_extent, visibility_window,
+                part_acc.get(), n_splits, part_m.get(), part_l.get());
+
+            paged_attention_combine_kernel<<<dim3(n_heads, n_tokens_total), dim3(head_dim), 0, ctx.stream()>>>(
+                part_acc.get(), part_m.get(), part_l.get(), n_splits, (float *) dst->data);
+            return;
+        }
+
         paged_attention_decode_kernel<<<dim3(n_heads, n_seq, n_tokens_total), dim3(head_dim), smem_bytes, ctx.stream()>>>(
             (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,
             (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
             stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
-            rel ? (const float *) rel->data : nullptr, rel_extent, visibility_window, (float *) dst->data);
+            rel ? (const float *) rel->data : nullptr, rel_extent, visibility_window, (float *) dst->data,
+            /*n_splits =*/ 1, nullptr, nullptr);
         return;
     }
 
