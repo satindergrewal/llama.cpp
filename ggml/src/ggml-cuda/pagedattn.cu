@@ -822,7 +822,10 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
                                         const float * __restrict__ rel,
                                         const int64_t rel_extent,
                                         const int64_t visibility_window,
-                                        float * __restrict__ out) {
+                                        float * __restrict__ out,
+                                        const int    n_splits,
+                                        float * __restrict__ part_m,
+                                        float * __restrict__ part_l) {
 #ifdef TURING_MMA_AVAILABLE
     using namespace ggml_cuda_mma;
     typedef tile<16, 16, float> tile_acc;   // score tile and output tiles
@@ -850,7 +853,9 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
 
     const int seq_start = batch_offsets[seq_idx];
     const int n_new     = batch_lens[seq_idx];
-    const int q_base    = blockIdx.z * (PAGED_MMA_WARPS * PAGED_MMA_M);
+    const int q_tile    = (n_splits > 1) ? (int) blockIdx.z / n_splits : (int) blockIdx.z;
+    const int split_idx = (n_splits > 1) ? (int) blockIdx.z % n_splits : 0;
+    const int q_base    = q_tile * (PAGED_MMA_WARPS * PAGED_MMA_M);
     if (q_base >= n_new) { return; }
     const int q_cnt_blk = min(PAGED_MMA_WARPS * PAGED_MMA_M, n_new - q_base);
     const int first_pos = context_lens[seq_idx] - n_new;
@@ -882,7 +887,15 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
     float m_r[2] = { -FLT_MAX, -FLT_MAX };
     float l_r[2] = { 0.0f, 0.0f };
 
-    for (int kt0 = 0; kt0 < n_tok; kt0 += PAGED_MMA_KV) {
+    // split-K: this block owns keys [kt_lo, kt_hi); partials merged by the combine kernel.
+    // The span is rounded to the mma tile so no split straddles a tile.
+    const int span  = (n_splits > 1)
+                    ? ((n_tok + n_splits - 1) / n_splits + PAGED_MMA_N - 1) / PAGED_MMA_N * PAGED_MMA_N
+                    : n_tok;
+    const int kt_lo = (n_splits > 1) ? split_idx * span : 0;
+    const int kt_hi = (n_splits > 1) ? min(n_tok, kt_lo + span) : n_tok;
+
+    for (int kt0 = kt_lo; kt0 < kt_hi; kt0 += PAGED_MMA_KV) {
         __syncthreads();
         for (int e = tid; e < PAGED_MMA_KV * HD; e += nthr) {
             const int j = e / HD, d = e % HD;
@@ -902,7 +915,7 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
         // sub-tiles run back to back with NO barriers: all state is in registers
         for (int sub = 0; sub < PAGED_MMA_KV / PAGED_MMA_N; ++sub) {
         const int kt = kt0 + sub * PAGED_MMA_N;
-        if (kt >= n_tok) { break; }   // uniform across the block
+        if (kt >= kt_hi) { break; }   // uniform across the block
 
         tile_acc s_frag;
 #pragma unroll
@@ -969,17 +982,51 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
             m_r[r] = m_new[r];
         }
 
-        // rescale + accumulate: registers only, no shared-memory round trip
+        // rescale + accumulate: registers only, no shared-memory round trip.
+        // The rescale is 8*NC register multiplies per tile, but it is only NEEDED when a
+        // row max actually grew. In causal prefill the max stops growing after the first
+        // few tiles, so skip it warp-uniformly when no row in this warp changed.
+        const bool need_resc = (resc[0] != 1.0f) | (resc[1] != 1.0f);
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
+            if (need_resc) {
 #pragma unroll
-            for (int l = 0; l < tile_acc::ne; ++l) { o_frag[c].x[l] *= resc[(l / 2) % 2]; }
+                for (int l = 0; l < tile_acc::ne; ++l) { o_frag[c].x[l] *= resc[(l / 2) % 2]; }
+            }
             tile_ab v_frag;
             load_ldmatrix(v_frag, (const half2 *) (v_t + (size_t) c * 16 * PAGED_MMA_LDV + sub * PAGED_MMA_N),
                           PAGED_MMA_LDV / 2);
             mma(o_frag[c], p_frag, v_frag);
         }
         }   // sub
+    }
+
+    if (n_splits > 1) {
+        // raw (unnormalised) partials; paged_attention_combine_kernel folds them by log-sum-exp
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+#pragma unroll
+            for (int l = 0; l < tile_acc::ne; ++l) {
+                const int i = tile_acc::get_i(l);
+                if (i >= q_cnt_w) { continue; }
+                const int d = c * 16 + tile_acc::get_j(l);
+                const size_t pidx = ((size_t)(seq_start + q_base_w + i) * n_heads + head_idx) * n_splits + split_idx;
+                out[pidx * HD + d] = o_frag[c].x[l];
+            }
+        }
+        // one thread per row writes that row's (m, l)
+        if (lane % 4 == 0) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int i = r * 8 + lane / 4;
+                if (i < q_cnt_w) {
+                    const size_t pidx = ((size_t)(seq_start + q_base_w + i) * n_heads + head_idx) * n_splits + split_idx;
+                    part_m[pidx] = m_r[r];
+                    part_l[pidx] = l_r[r];
+                }
+            }
+        }
+        return;
     }
 
 #pragma unroll
@@ -996,7 +1043,8 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
 #else
     GGML_UNUSED_VARS(q, kv_cache, block_table, context_lens, batch_offsets, batch_lens,
                      stride_token, stride_head, stride_block, n_heads_kv, block_size,
-                     max_blocks, scale, rel, rel_extent, visibility_window, out);
+                     max_blocks, scale, rel, rel_extent, visibility_window, out,
+                     n_splits, part_m, part_l);
     NO_DEVICE_CODE;
 #endif // TURING_MMA_AVAILABLE
 }
@@ -1132,20 +1180,52 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_m));
                 }
             }
-            const dim3 grid(n_heads, n_seq, n_q_tiles);
+            // The profile said this kernel is starved, not slow: 256 blocks on ~188 SMs is
+            // 0.7 waves and 5.44 active warps/SM. Split the KEY range across extra blocks so
+            // the warps exist, then fold the partials with the same log-sum-exp combine
+            // kernel the decode path already uses.
+            const int  base_blocks = n_heads * n_seq * n_q_tiles;
+            const int  nsm         = ggml_cuda_info().devices[ctx.device].nsm;
+            static const int psplit_env = []() {
+                const char * s = getenv("DS4P_PAGED_PSPLIT");
+                return s ? atoi(s) : -1;
+            }();
+            int n_splits = 1;
+            if (psplit_env >= 0) {
+                n_splits = std::max(1, psplit_env);
+            } else if (base_blocks < 4 * nsm) {
+                n_splits = std::min(8, (4 * nsm + base_blocks - 1) / base_blocks);
+            }
+
+            const dim3 grid(n_heads, n_seq, n_q_tiles * n_splits);
             const dim3 blk(32, PAGED_MMA_WARPS);   // mma.cuh indexes fragments by threadIdx.x
-            if (head_dim == 64) {
-                paged_attention_prefill_mma_kernel<64><<<grid, blk, smem_m, ctx.stream()>>>(
-                    (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,
-                    (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
-                    stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
-                    rel ? (const float *) rel->data : nullptr, rel_extent, visibility_window, (float *) dst->data);
-            } else {
-                paged_attention_prefill_mma_kernel<128><<<grid, blk, smem_m, ctx.stream()>>>(
-                    (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,
-                    (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
-                    stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
-                    rel ? (const float *) rel->data : nullptr, rel_extent, visibility_window, (float *) dst->data);
+
+            ggml_cuda_pool_alloc<float> part_acc(ctx.pool());
+            ggml_cuda_pool_alloc<float> part_m(ctx.pool());
+            ggml_cuda_pool_alloc<float> part_l(ctx.pool());
+            float * p_out = (float *) dst->data;
+            float * p_m   = nullptr;
+            float * p_l   = nullptr;
+            if (n_splits > 1) {
+                const size_t n_part = (size_t) n_tokens_total * n_heads * n_splits;
+                p_out = part_acc.alloc(n_part * head_dim);
+                p_m   = part_m.alloc(n_part);
+                p_l   = part_l.alloc(n_part);
+            }
+
+#define DS4P_LAUNCH_MMA(HD)                                                                          \
+            paged_attention_prefill_mma_kernel<HD><<<grid, blk, smem_m, ctx.stream()>>>(              \
+                (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data, \
+                (const int *) context_lens->data, (const int *) batch_offsets->data,                 \
+                (const int *) batch_lens->data, stride_token, stride_head, stride_block, n_heads_kv,  \
+                block_size, max_blocks, scale, rel ? (const float *) rel->data : nullptr, rel_extent, \
+                visibility_window, p_out, n_splits, p_m, p_l)
+            if (head_dim == 64) { DS4P_LAUNCH_MMA(64); } else { DS4P_LAUNCH_MMA(128); }
+#undef DS4P_LAUNCH_MMA
+
+            if (n_splits > 1) {
+                paged_attention_combine_kernel<<<dim3(n_heads, n_tokens_total), dim3(head_dim), 0, ctx.stream()>>>(
+                    p_out, p_m, p_l, n_splits, (float *) dst->data);
             }
             return;
         }
