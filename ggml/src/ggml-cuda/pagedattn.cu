@@ -220,7 +220,14 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
     float * warp_l   = warp_m + n_warps;
     float * warp_acc = warp_l + n_warps;
 
-    for (int i = 0; i < num_new_tokens; i++) {
+    // the query-token axis lives on the GRID (blockIdx.z), not in a serial loop: a 512-token
+    // prefill chunk previously ran 512 full context scans back-to-back in one block, which
+    // made chunked prefill O(minutes) at 8K context (Q4 gate). One block = one query token.
+    {
+        const int i = blockIdx.z;
+        if (i >= num_new_tokens) {
+            return;
+        }
         const int token_batch_idx = seq_start + i;
 
         q_s[tid] = q[(size_t) token_batch_idx * n_heads * head_dim + (size_t) head_idx * head_dim + tid] * scale;
@@ -368,7 +375,12 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         const size_t n_warps    = (size_t) head_dim / 32;
         const size_t smem_bytes = (head_dim + 2 * n_warps + n_warps * head_dim) * sizeof(float);
 
-        paged_attention_decode_kernel<<<dim3(n_heads, n_seq), dim3(head_dim), smem_bytes, ctx.stream()>>>(
+        // grid.z = query tokens: covers the largest per-seq chunk; blocks whose z exceeds
+        // their seq's batch_lens early-return (batch_lens lives on device, so the exact
+        // per-seq max is not host-visible -- total n_tokens is a safe upper bound)
+        const int n_tokens_total = (int) q->ne[2];
+
+        paged_attention_decode_kernel<<<dim3(n_heads, n_seq, n_tokens_total), dim3(head_dim), smem_bytes, ctx.stream()>>>(
             (const float *) q->data, (const half *) kv_cache->data, (const int *) block_table->data,
             (const int *) context_lens->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
             stride_token, stride_head, stride_block, n_heads_kv, block_size, max_blocks, scale,
