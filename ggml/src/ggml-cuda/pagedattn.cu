@@ -1307,7 +1307,17 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         int n_splits = 1;
         if (splitk_env != 0 && n_tokens_total == n_seq) {   // decode-only batch
             const int ctx_hint = (int) kv_cache->ne[3] * block_size;  // pool span upper bound
-            const int want     = splitk_env > 0 ? splitk_env : 8;
+            const int nsm      = ggml_cuda_info().devices[ctx.device].nsm;
+            // The old hard-coded 8 never adapted to the device or the head count, and it
+            // was leaving 3.1x on the floor: measured at 22K context on one Blackwell card,
+            // decode ms/tok by split count was 8 -> 36.4, 16 -> 21.2, 32 -> 13.7,
+            // 48 -> 12.3, 64 -> 11.6, 96 -> 12.6. Each decode block does one token's work,
+            // so it takes ~12 blocks/SM to saturate; past the knee the combine pass and the
+            // shrinking per-block work take it back.
+            const int fill = (12 * nsm) / std::max(1, n_heads * n_seq);
+            const int cap  = std::max(1, ctx_hint / 256);   // >=256 keys per slice
+            const int want = splitk_env > 0 ? splitk_env
+                                            : std::max(1, std::min(std::min(fill, cap), 64));
             if (splitk_env > 0 || ctx_hint >= 4096) {
                 n_splits = want;
             }
