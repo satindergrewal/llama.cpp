@@ -1177,6 +1177,28 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         (const int *) write_slots->data, (const int *) batch_offsets->data, (const int *) batch_lens->data,
         stride_token, stride_head, stride_block, n_heads_kv, block_size);
 
+    // ⚠ THIS OUTER GUARD IS THE REAL HEAD_DIM GATE, and it gates far more than it looks:
+    // EVERYTHING fast lives inside it -- the mma prefill, the split-K decode, the warp-
+    // parallel decode. A head_dim outside {64,128} therefore falls all the way through to
+    // the generic scalar kernel for BOTH prefill and decode, not merely to a slower prefill.
+    // (Measured 2026-08-04 with test-paged-vs-cpu: at head_dim 96 the CUDA output agrees
+    // with the CPU reference to ~1 ULP (4.5e-08), whereas 64/128 sit at ~4e-05 because the
+    // mma path carries f16 rounding. The error MAGNITUDE reports which kernel ran, and it
+    // said "scalar" no matter what the inner dispatch claimed.)
+    // Widening this to head_dim % 32 == 0 is plausible -- the decode kernel's n_warps =
+    // head_dim/32 divides cleanly at 96/192 -- but it is a change to the DECODE path as
+    // well as prefill and needs its own gate. Not attempted here.
+    if (head_dim != 64 && head_dim != 128) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_DEBUG("%s: head_dim %d takes the generic scalar paged kernel -- ALL the "
+                           "fast paths (mma prefill, split-K decode, warp-parallel decode) are "
+                           "gated to head_dim 64/128. Expect order-of-magnitude slower prefill "
+                           "AND decode.\n", __func__, head_dim);
+        }
+    }
+
     if (head_dim == 64 || head_dim == 128) {
         // warp-parallel kernel: q_s[head_dim] + warp_m/l[n_warps each] + warp_acc[n_warps*head_dim]
         const size_t n_warps    = (size_t) head_dim / 32;
@@ -1213,19 +1235,6 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             const char * s = getenv("DS4P_PAGED_QTILE");
             return s ? atoi(s) : 3;
         }();
-        // A silent fallback to a 12.8x-slower prefill is the same class as the flag that
-        // switches off the guard that would have computed it: say so once, at -lv 4.
-        if (qtile_mode == 3 && n_tokens_total > n_seq && head_dim != 64 && head_dim != 128) {
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
-                GGML_LOG_DEBUG("%s: head_dim %d has no mma prefill instantiation (only 64/128) "
-                               "-> falling back to the grid-per-token prefill, which is ~12.8x "
-                               "slower at 22K. Add an instantiation for this head_dim.\n",
-                               __func__, head_dim);
-            }
-        }
-
         if (qtile_mode == 3 && n_tokens_total > n_seq && (head_dim == 64 || head_dim == 128)) {
             const int    rows_blk  = PAGED_MMA_WARPS * PAGED_MMA_M;
             const int    n_q_tiles = (n_tokens_total + rows_blk - 1) / rows_blk;
