@@ -16,6 +16,10 @@ class llama_paged_scheduler_impl {
 
     llama_scheduler_status step(llama_batch & batch);
     bool                   queue_request(llama_sequence_group group);
+
+    // P1-6: queue `group` as a COW fork of an existing request -- it inherits the parent's
+    // prefix blocks by reference (fork_blocks) instead of prefilling them again.
+    bool                   queue_forked_request(llama_sequence_group group, int32_t parent_request_id);
     void update(const llama_batch & batch, const std::vector<llama_token> & new_tokens, const int8_t * stop_flags);
     void set_on_finish(llama_paged_on_finish_cb cb, void * user_data);
     llama_sequence_group *         get_group_from_id(int32_t request_id) const;

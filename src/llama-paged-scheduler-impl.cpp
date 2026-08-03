@@ -95,6 +95,43 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group) {
     return true;
 }
 
+bool llama_paged_scheduler_impl::queue_forked_request(llama_sequence_group group, int32_t parent_request_id) {
+    auto it = id_to_group.find(parent_request_id);
+    if (it == id_to_group.end() || it->second == nullptr) {
+        LLAMA_LOG_ERROR("%s: parent request %d not found; queueing as a normal request\n",
+                        __func__, parent_request_id);
+        return queue_request(std::move(group));
+    }
+
+    const llama_sequence_group & parent = *it->second;
+
+    // the fork only makes sense while the parent's prefix is a true prefix of the child's
+    const size_t n_shared = std::min(parent.logical_seq.size(), group.logical_seq.size());
+    bool prefix_ok = true;
+    for (size_t i = 0; i < n_shared; ++i) {
+        if (parent.logical_seq[i] != group.logical_seq[i]) { prefix_ok = false; break; }
+    }
+    if (!prefix_ok || n_shared == 0) {
+        LLAMA_LOG_WARN("%s: request %d is not a prefix-fork of %d; queueing normally\n",
+                       __func__, group.request_id, parent_request_id);
+        return queue_request(std::move(group));
+    }
+
+    const std::vector<llama_token> full_seq = group.logical_seq;
+
+    const uint32_t n_inherited = kv_cache_manager->fork_blocks(parent, group);
+
+    // logical_seq must stay the FULL prompt; fork_blocks trimmed it to the inherited span
+    group.logical_seq = full_seq;
+    group.n_prompt    = (uint32_t) full_seq.size();
+    group.n_past      = n_inherited;
+
+    LLAMA_LOG_INFO("%s: request %d forked from %d: %u of %zu prompt tokens inherited (no re-prefill)\n",
+                   __func__, group.request_id, parent_request_id, n_inherited, full_seq.size());
+
+    return queue_request(std::move(group));
+}
+
 void llama_paged_scheduler_impl::insert_sorted_by_arrival_time(llama_sequence_group_ptr    new_group_ptr,
                                                                llama_sequence_group_list & list) {
     GGML_ASSERT(new_group_ptr && "New group cannot be sorted because it's nullptr.");
