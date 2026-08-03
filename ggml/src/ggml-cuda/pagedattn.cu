@@ -612,13 +612,13 @@ __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ 
     }
 }
 
-// per-warp key tiles: each warp owns its OWN key tile stream and its OWN online-softmax
-// state (m, l, o_acc) -- the split-K insight applied to prefill: any partition of the keys
-// is valid if each partition keeps its own state and the final merge is log-sum-exp. All
-// four warps run their own wmma matmuls concurrently (wmma is warp-scoped), so nothing
-// idles: the 4-warp/warp0-only shape measured 31,915 ms with 3 warps parked through both
-// matmuls. NO block barrier inside the key loop -- each warp is fully independent until
-// the merge. Q/K/V staged half; scores + accumulators f32. Dark: DS4P_PAGED_QTILE=2 only.
+// double-buffered fragment prefill: warps 1-3 stage key tile T+1 while warp 0 computes
+// tile T (qk fragments -> softmax rows -> pv fragments), overlapping the HBM staging
+// latency with the tensor-core work instead of barriering the whole block around both.
+// Basis: the 4-warp shared-accumulator shape (31,915 ms) -- its remaining cost was every
+// warp waiting through every phase. smem doubles only the K/V tiles (~+8.7 KB), keeping
+// occupancy, unlike the per-warp variant whose private accumulators collapsed it (53.3 s).
+// Dark: DS4P_PAGED_QTILE=2 only.
 __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q,
                                                     const half * __restrict__ kv_cache,
                                                     const int * __restrict__ block_table,
@@ -642,19 +642,15 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
     const int tid     = threadIdx.x;
     const int lane    = tid & 31;
     const int warp_id = tid >> 5;
-    const int n_warps = blockDim.x >> 5;          // 4
 
-    // layout: q_h[M*ld] | per-warp { k_h[N*ld] v_h[N*ld] p_h[M*N] } half |
-    //         per-warp { sc[M*N] o_acc[M*ld] m[M] l[M] } f32
-    half * q_h = (half *) smem_raw;
-    half * kw  = q_h + PAGED_WMMA_M * ld;
-    const size_t half_per_warp = (size_t) 2 * PAGED_WMMA_N * ld + PAGED_WMMA_M * PAGED_WMMA_N;
-    half  * k_h = kw + warp_id * half_per_warp;
-    half  * v_h = k_h + PAGED_WMMA_N * ld;
-    half  * p_h = v_h + PAGED_WMMA_N * ld;
-    float * fbase = (float *) (kw + n_warps * half_per_warp);
-    const size_t f_per_warp = (size_t) PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld + 2 * PAGED_WMMA_M;
-    float * sc    = fbase + warp_id * f_per_warp;
+    // q_h[M*ld] | k_h[2][N*ld] v_h[2][N*ld] p_h[M*N] (half) | sc[M*N] o_acc[M*ld] m l (f32)
+    half  * q_h  = (half *) smem_raw;
+    half  * k_b0 = q_h + PAGED_WMMA_M * ld;
+    half  * k_b1 = k_b0 + PAGED_WMMA_N * ld;
+    half  * v_b0 = k_b1 + PAGED_WMMA_N * ld;
+    half  * v_b1 = v_b0 + PAGED_WMMA_N * ld;
+    half  * p_h  = v_b1 + PAGED_WMMA_N * ld;
+    float * sc   = (float *) (p_h + PAGED_WMMA_M * PAGED_WMMA_N);
     float * o_acc = sc + PAGED_WMMA_M * PAGED_WMMA_N;
     float * m_s   = o_acc + PAGED_WMMA_M * ld;
     float * l_s   = m_s + PAGED_WMMA_M;
@@ -671,100 +667,105 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
     if (q_base >= n_new) { return; }
     const int q_cnt     = min(PAGED_WMMA_M, n_new - q_base);
     const int first_pos = context_lens[seq_idx] - n_new;
+    const int n_tok     = first_pos + q_base + q_cnt;
 
     for (int e = tid; e < PAGED_WMMA_M * ld; e += blockDim.x) {
         const int i = e / ld, d = e % ld;
-        q_h[e] = (i < q_cnt && d < head_dim)
-               ? __float2half(q[(size_t)(seq_start + q_base + i) * n_heads * head_dim
-                                + (size_t) head_idx * head_dim + d])
-               : __float2half(0.0f);
+        q_h[e]   = (i < q_cnt && d < head_dim)
+                 ? __float2half(q[(size_t)(seq_start + q_base + i) * n_heads * head_dim
+                                  + (size_t) head_idx * head_dim + d])
+                 : __float2half(0.0f);
+        o_acc[e] = 0.0f;
     }
-    for (int e = lane; e < PAGED_WMMA_M * ld; e += 32) { o_acc[e] = 0.0f; }
-    for (int i = lane; i < PAGED_WMMA_M; i += 32) { m_s[i] = -FLT_MAX; l_s[i] = 0.0f; }
-    __syncthreads();                              // q_h ready for every warp
+    for (int i = tid; i < PAGED_WMMA_M; i += blockDim.x) { m_s[i] = -FLT_MAX; l_s[i] = 0.0f; }
 
-    const int n_tok = first_pos + q_base + q_cnt;
-    // warp w takes key tiles w, w+n_warps, w+2*n_warps, ... -- independent streams
-    for (int kt = warp_id * PAGED_WMMA_N; kt < n_tok; kt += n_warps * PAGED_WMMA_N) {
-        for (int e = lane; e < PAGED_WMMA_N * ld; e += 32) {
-            const int j = e / ld, d = e % ld;
-            const int tok = kt + j;
-            half kv_k = __float2half(0.0f), kv_v = __float2half(0.0f);
-            if (tok < n_tok && d < head_dim) {
-                const int pb   = block_table[seq_idx * max_blocks + tok / block_size];
-                const size_t b = (size_t)(tok % block_size) * stride_token + (size_t) pb * stride_block;
-                kv_k = kv_cache[b + (size_t) kv_head * stride_head + d];
-                kv_v = kv_cache[b + (size_t)(n_heads_kv + kv_head) * stride_head + d];
-            }
-            k_h[e] = kv_k; v_h[e] = kv_v;
+    // stage tile 0 into buffer 0 (whole block; nothing to overlap yet)
+    for (int e = tid; e < PAGED_WMMA_N * ld; e += blockDim.x) {
+        const int j = e / ld, d = e % ld;
+        half kv_k = __float2half(0.0f), kv_v = __float2half(0.0f);
+        if (j < n_tok && d < head_dim) {
+            const int pb   = block_table[seq_idx * max_blocks + j / block_size];
+            const size_t b = (size_t)(j % block_size) * stride_token + (size_t) pb * stride_block;
+            kv_k = kv_cache[b + (size_t) kv_head * stride_head + d];
+            kv_v = kv_cache[b + (size_t)(n_heads_kv + kv_head) * stride_head + d];
         }
-        __syncwarp();
+        k_b0[e] = kv_k; v_b0[e] = kv_v;
+    }
+    __syncthreads();
 
-        paged_wmma_qk(q_h, k_h, ld, head_dim, scale, sc);
-        __syncwarp();
+    for (int kt = 0; kt < n_tok; kt += PAGED_WMMA_N) {
+        const int  buf   = (kt / PAGED_WMMA_N) & 1;
+        half * k_cur = buf ? k_b1 : k_b0;
+        half * v_cur = buf ? v_b1 : v_b0;
+        half * k_nxt = buf ? k_b0 : k_b1;
+        half * v_nxt = buf ? v_b0 : v_b1;
+        const int kt_next = kt + PAGED_WMMA_N;
 
-        for (int i = lane; i < PAGED_WMMA_M; i += 32) {
-            const int q_pos = first_pos + q_base + i;
-            float rmax = -FLT_MAX;
-            for (int j = 0; j < PAGED_WMMA_N; ++j) {
-                const int tok = kt + j;
-                float v = sc[i * PAGED_WMMA_N + j];
-                const int64_t rd = (int64_t) q_pos - tok;
-                if (i >= q_cnt || tok >= n_tok || tok > q_pos ||
-                    (visibility_window > 0 && rd >= visibility_window)) {
-                    v = -FLT_MAX;
-                } else if (rel != nullptr && rd < rel_extent) {
-                    v += rel[((size_t)(seq_start + q_base + i) * n_heads + head_idx) * rel_extent + rd];
+        if (warp_id > 0) {
+            // warps 1-3: prefetch tile T+1 into the other buffer while warp 0 computes
+            if (kt_next < n_tok) {
+                for (int e = (warp_id - 1) * 32 + lane; e < PAGED_WMMA_N * ld; e += 96) {
+                    const int j = e / ld, d = e % ld;
+                    const int tok = kt_next + j;
+                    half kv_k = __float2half(0.0f), kv_v = __float2half(0.0f);
+                    if (tok < n_tok && d < head_dim) {
+                        const int pb   = block_table[seq_idx * max_blocks + tok / block_size];
+                        const size_t b = (size_t)(tok % block_size) * stride_token + (size_t) pb * stride_block;
+                        kv_k = kv_cache[b + (size_t) kv_head * stride_head + d];
+                        kv_v = kv_cache[b + (size_t)(n_heads_kv + kv_head) * stride_head + d];
+                    }
+                    k_nxt[e] = kv_k; v_nxt[e] = kv_v;
                 }
-                sc[i * PAGED_WMMA_N + j] = v;
-                rmax = fmaxf(rmax, v);
             }
-            const float m_new = fmaxf(m_s[i], rmax);
-            if (m_new == -FLT_MAX) {              // fully masked tile for this row
-                for (int j = 0; j < PAGED_WMMA_N; ++j) { p_h[i * PAGED_WMMA_N + j] = __float2half(0.0f); }
-                continue;
-            }
-            const float resc = (m_s[i] == -FLT_MAX) ? 0.0f : __expf(m_s[i] - m_new);
-            float row_l = 0.0f;
-            for (int j = 0; j < PAGED_WMMA_N; ++j) {
-                const float v  = sc[i * PAGED_WMMA_N + j];
-                const float pv = (v == -FLT_MAX) ? 0.0f : __expf(v - m_new);
-                p_h[i * PAGED_WMMA_N + j] = __float2half(pv);
-                row_l += pv;
-            }
-            for (int d = 0; d < head_dim; ++d) { o_acc[i * ld + d] *= resc; }
-            l_s[i] = l_s[i] * resc + row_l;
-            m_s[i] = m_new;
-        }
-        __syncwarp();
+        } else {
+            // warp 0: full compute for tile T on the current buffer
+            paged_wmma_qk(q_h, k_cur, ld, head_dim, scale, sc);
+            __syncwarp();
 
-        paged_wmma_pv(p_h, v_h, ld, head_dim, o_acc, ld);
-        __syncwarp();
+            for (int i = lane; i < PAGED_WMMA_M; i += 32) {
+                const int q_pos = first_pos + q_base + i;
+                float rmax = -FLT_MAX;
+                for (int j = 0; j < PAGED_WMMA_N; ++j) {
+                    const int tok = kt + j;
+                    float v = sc[i * PAGED_WMMA_N + j];
+                    const int64_t rd = (int64_t) q_pos - tok;
+                    if (i >= q_cnt || tok >= n_tok || tok > q_pos ||
+                        (visibility_window > 0 && rd >= visibility_window)) {
+                        v = -FLT_MAX;
+                    } else if (rel != nullptr && rd < rel_extent) {
+                        v += rel[((size_t)(seq_start + q_base + i) * n_heads + head_idx) * rel_extent + rd];
+                    }
+                    sc[i * PAGED_WMMA_N + j] = v;
+                    rmax = fmaxf(rmax, v);
+                }
+                const float m_new = fmaxf(m_s[i], rmax);
+                if (m_new == -FLT_MAX) {
+                    for (int j = 0; j < PAGED_WMMA_N; ++j) { p_h[i * PAGED_WMMA_N + j] = __float2half(0.0f); }
+                    continue;
+                }
+                const float resc = (m_s[i] == -FLT_MAX) ? 0.0f : __expf(m_s[i] - m_new);
+                float row_l = 0.0f;
+                for (int j = 0; j < PAGED_WMMA_N; ++j) {
+                    const float v  = sc[i * PAGED_WMMA_N + j];
+                    const float pv = (v == -FLT_MAX) ? 0.0f : __expf(v - m_new);
+                    p_h[i * PAGED_WMMA_N + j] = __float2half(pv);
+                    row_l += pv;
+                }
+                for (int d = 0; d < head_dim; ++d) { o_acc[i * ld + d] *= resc; }
+                l_s[i] = l_s[i] * resc + row_l;
+                m_s[i] = m_new;
+            }
+            __syncwarp();
+
+            paged_wmma_pv(p_h, v_cur, ld, head_dim, o_acc, ld);
+        }
+        __syncthreads();   // compute(T) done AND prefetch(T+1) done
     }
-    __syncthreads();                              // all warps done: merge their states
 
-    // log-sum-exp merge of the n_warps per-warp states, then write. warp 0's smem
-    // region is reused as the merge target; rows spread over the whole block.
-    for (int i = tid; i < q_cnt; i += blockDim.x) {
-        float m_tot = -FLT_MAX;
-        for (int w = 0; w < n_warps; ++w) { m_tot = fmaxf(m_tot, fbase[w * f_per_warp + PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld + i]); }
-        if (m_tot == -FLT_MAX) { continue; }
-        float l_tot = 0.0f;
-        for (int w = 0; w < n_warps; ++w) {
-            const float mw = fbase[w * f_per_warp + PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld + i];
-            const float lw = fbase[w * f_per_warp + PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld + PAGED_WMMA_M + i];
-            l_tot += (mw == -FLT_MAX) ? 0.0f : lw * __expf(mw - m_tot);
-        }
-        for (int d = 0; d < head_dim; ++d) {
-            float o = 0.0f;
-            for (int w = 0; w < n_warps; ++w) {
-                const float mw = fbase[w * f_per_warp + PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld + i];
-                if (mw == -FLT_MAX) { continue; }
-                o += fbase[w * f_per_warp + PAGED_WMMA_M * PAGED_WMMA_N + i * ld + d] * __expf(mw - m_tot);
-            }
-            out[(size_t)(seq_start + q_base + i) * n_heads * head_dim
-                + (size_t) head_idx * head_dim + d] = o / (l_tot + 1e-6f);
-        }
+    for (int e = tid; e < q_cnt * head_dim; e += blockDim.x) {
+        const int i = e / head_dim, d = e % head_dim;
+        out[(size_t)(seq_start + q_base + i) * n_heads * head_dim
+            + (size_t) head_idx * head_dim + d] = o_acc[i * ld + d] / (l_s[i] + 1e-6f);
     }
 }
 
@@ -886,11 +887,11 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         if (qtile_mode == 2 && n_tokens_total > n_seq) {
             const int    n_q_tiles = (n_tokens_total + PAGED_WMMA_M - 1) / PAGED_WMMA_M;
             const int    ld        = head_dim + 8;
-            // per-warp regions: q_h shared + 4x { k,v,p half } + 4x { sc,o_acc,m,l f32 }
-            const size_t smem_w    = (size_t) PAGED_WMMA_M * ld * sizeof(half)
-                                   + 4 * ((size_t) (2 * PAGED_WMMA_N * ld + PAGED_WMMA_M * PAGED_WMMA_N) * sizeof(half)
-                                        + (size_t) (PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld
-                                                  + 2 * PAGED_WMMA_M) * sizeof(float));
+            // q_h + DOUBLE-buffered K/V + P (half) | sc + o_acc + m + l (f32)
+            const size_t smem_w    = (size_t) (PAGED_WMMA_M * ld + 4 * PAGED_WMMA_N * ld
+                                             + PAGED_WMMA_M * PAGED_WMMA_N) * sizeof(half)
+                                   + (size_t) (PAGED_WMMA_M * PAGED_WMMA_N + PAGED_WMMA_M * ld
+                                             + 2 * PAGED_WMMA_M) * sizeof(float);
             if (smem_w > 48 * 1024) {
                 GGML_ASSERT(smem_w <= 96 * 1024 && "wmma prefill smem exceeds 96KB");
                 CUDA_CHECK(cudaFuncSetAttribute(paged_attention_prefill_wmma_kernel,
