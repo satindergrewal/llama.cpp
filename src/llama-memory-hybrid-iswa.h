@@ -9,6 +9,8 @@
 #include <memory>
 #include <vector>
 
+class llama_kv_cache_paged;
+
 //
 // llama_memory_hybrid_iswa
 //
@@ -41,7 +43,15 @@ public:
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr);
 
-    ~llama_memory_hybrid_iswa() = default;
+    // defined in the .cpp where llama_kv_cache_paged is complete (unique_ptr member)
+    ~llama_memory_hybrid_iswa();
+
+    // 3b (DS4P_PAGED_HYBRID): hand ownership of a constructed+init'd paged attention pool
+    // to this wrapper. Built by create_memory, where the backends are in scope (same shape
+    // as the flat-arch paged path). Inert until the paged hybrid graph path lands.
+    void set_attn_paged(llama_kv_cache_paged * paged);
+
+    llama_kv_cache_paged * get_mem_attn_paged() const;
 
     //
     // llama_memory_i
@@ -88,6 +98,10 @@ private:
 
     const std::unique_ptr<llama_kv_cache_iswa> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+
+    // 3b: optional paged attention pool (replaces mem_attn's role when active); see
+    // set_attn_paged. Not const: handed in post-construction by create_memory.
+    std::unique_ptr<llama_kv_cache_paged> mem_attn_paged;
 };
 
 class llama_memory_hybrid_iswa_context : public llama_memory_context_i {

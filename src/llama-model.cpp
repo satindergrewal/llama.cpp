@@ -2168,11 +2168,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // full-n_ctx static attention cache the user explicitly asked to avoid
                     // (measured: inkling 4M ctx = 48 GiB actual vs 19.5 GiB pool estimate
                     // -> OOM). Refuse loudly until paged hybrid support lands.
-                    if (cparams.kv_paged) {
+                    // DS4P_PAGED_HYBRID=1 (3b development): allow construction of the paged
+                    // attention pool inside the hybrid-iswa wrapper; the graph path does not
+                    // exist yet, so this is for bring-up only.
+                    static const bool paged_hybrid_dev = []() {
+                        const char * s = getenv("DS4P_PAGED_HYBRID");
+                        return s != nullptr && atoi(s) != 0;
+                    }();
+                    if (cparams.kv_paged && !paged_hybrid_dev) {
                         LLAMA_LOG_ERROR("%s: kv_paged is not yet supported for hybrid architectures; "
                                 "the attention cache would be a full-context static allocation, not a paged one\n", __func__);
                     }
-                    GGML_ASSERT(!cparams.kv_paged && "kv_paged is not yet supported for hybrid architectures");
+                    GGML_ASSERT((!cparams.kv_paged || paged_hybrid_dev) && "kv_paged is not yet supported for hybrid architectures");
 
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
@@ -2200,7 +2207,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
-                        res = new llama_memory_hybrid_iswa(
+                        auto * hybrid_iswa = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
@@ -2218,6 +2225,41 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
+
+                        // 3b bring-up: build + init the paged attention pool here, where the
+                        // backends are in scope (same shape as the flat-arch paged path), and
+                        // hand ownership to the wrapper. Pool spans all layers for now; the
+                        // attn-only filter refinement comes with the graph path.
+                        if (cparams.kv_paged && paged_hybrid_dev) {
+                            LLAMA_LOG_WARN("%s: DS4P_PAGED_HYBRID bring-up: constructing paged attention pool "
+                                    "for a hybrid arch; the paged hybrid graph path is NOT implemented yet\n", __func__);
+
+                            const uint32_t pg_head_dim   = hparams.n_embd_head_v();
+                            const uint32_t pg_n_head     = hparams.n_head_kv();
+                            const uint32_t pg_n_layers   = hparams.n_layer();
+                            const uint32_t pg_block_size = cparams.block_size;
+
+                            auto * paged_attn = new llama_kv_cache_paged(pg_head_dim, pg_n_head,
+                                    pg_block_size, pg_n_layers, cparams.n_ubatch, cparams.n_seq_max);
+
+                            bool pg_multi_dev = false;
+                            if (layer_backends.size() == pg_n_layers) {
+                                for (uint32_t il = 1; il < pg_n_layers; ++il) {
+                                    if (layer_backends[il] != layer_backends[0]) { pg_multi_dev = true; break; }
+                                }
+                            }
+                            if (pg_multi_dev) {
+                                paged_attn->init_multi(layer_backends, backend_cpu, params.type_k,
+                                        cparams.n_gpu_blocks, cparams.n_cpu_blocks, cparams.kv_paged_watermark);
+                            } else {
+                                paged_attn->init(backend_gpu, backend_cpu, params.type_k,
+                                        cparams.n_gpu_blocks, cparams.n_cpu_blocks, cparams.kv_paged_watermark);
+                            }
+
+                            hybrid_iswa->set_attn_paged(paged_attn);
+                        }
+
+                        res = hybrid_iswa;
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,

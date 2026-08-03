@@ -1,6 +1,7 @@
 #include "llama-memory-hybrid-iswa.h"
 
 #include "llama-impl.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -62,6 +63,16 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
     )) {}
+
+llama_memory_hybrid_iswa::~llama_memory_hybrid_iswa() = default;
+
+void llama_memory_hybrid_iswa::set_attn_paged(llama_kv_cache_paged * paged) {
+    mem_attn_paged.reset(paged);
+}
+
+llama_kv_cache_paged * llama_memory_hybrid_iswa::get_mem_attn_paged() const {
+    return mem_attn_paged.get();
+}
 
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
