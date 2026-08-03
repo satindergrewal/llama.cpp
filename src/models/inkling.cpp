@@ -249,8 +249,18 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
     bool needs_rel_idx_local  = false;
     bool needs_rel_idx_global = false;
 
+    // DS4P_BANDED_QKV (B4 arc-2, default OFF): admit Q8_0 KV into the banded path. The CPU
+    // banded kernel dispatches K through block-aware vec_dot type traits and V through
+    // to_float, so quantized caches are mechanically representable there; the CUDA kernel's
+    // scalar typed loads are NOT quantization-aware yet. Gate: q8-fallback vs q8-banded A/B.
+    static const bool banded_quant_kv = []() {
+        const char * s = getenv("DS4P_BANDED_QKV");
+        return s != nullptr && atoi(s) != 0;
+    }();
+
     const auto banded_cache_type_supported = [](ggml_type type) {
-        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 ||
+               (banded_quant_kv && type == GGML_TYPE_Q8_0);
     };
 
     const auto use_banded_flash = [&](int il) {
