@@ -799,14 +799,20 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
 // cross-warp softmax merge and no per-tile barrier beyond the K/V staging.
 // V is staged TRANSPOSED so P x V is a plain row.col mma.
 // ---------------------------------------------------------------------------
-#define PAGED_MMA_WARPS 4
+// 8 warps = 128 q rows per block, each warp still owning its OWN 16 rows (no output
+// splitting, no duplicated work). This is the only remaining lever that REDUCES
+// instructions instead of adding warps: the K/V tile is staged ONCE per block, so
+// doubling the q rows halves the staging work per q row. Occupancy is unchanged
+// (2 blocks x 8 warps = 16 warps/SM, same as 4 x 4), which is the point -- two levers
+// that bought warps at a cost in work or spill both LOST (+27%, +40%).
+#define PAGED_MMA_WARPS 8
 #define PAGED_MMA_M     16
 #define PAGED_MMA_N     16
 #define PAGED_MMA_KV    32   // keys staged per round (64 measured worse: smem cost occupancy)
 #define PAGED_MMA_LDV   (PAGED_MMA_KV + 8)   // pad; multiple of 8 halves for ldmatrix
 
 template <int HD>
-__global__ __launch_bounds__(128, 4)   // 5 MEASURED WORSE (3,942 vs 3,113): the re-profile
+__global__ __launch_bounds__(256, 2)   // 128 threads/5 blocks MEASURED WORSE (3,942): the re-profile
                                       // says smem allows a 5th block and registers refuse it,
                                       // but forcing it spills more than the warps return.
                                       // Getting past 4 needs a STRUCTURAL register cut.
