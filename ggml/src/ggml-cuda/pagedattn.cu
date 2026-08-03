@@ -364,6 +364,41 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
 // Cross-warp merge is the same log-sum-exp as the decode kernel, done per query.
 #define PAGED_Q_TILE 4
 
+// ============================ M7 phase 3: WMMA SKELETON ============================
+// The f32 tile family is measured out: 2/4/8/16 -> 31,277 / 28,816 / 31,272 / 218,100 ms
+// at 22K, i.e. a 1.52x ceiling where the gate wants >=5x (<= 8,745 ms). The escape is the
+// same one flash-attention uses: hold the score tile in warp FRAGMENTS instead of per-lane
+// accumulator arrays, so the QK^T product runs on tensor cores and register pressure stops
+// being the binding constraint.
+//
+// Fragment shape: 16x16x16 half inputs with an f32 accumulator (nvcuda::wmma), following
+// the in-tree pattern in lightning-indexer.cu (frag_q row_major / frag_k col_major /
+// mma_sync into a float accumulator).
+//
+// ACCEPTANCE BAR, chosen up front and justified: q->data is FLOAT and wmma needs HALF
+// operands, so Q must be converted at tile load. That is a real numeric change, so the
+// bit-identical bar used for every other paged kernel does NOT apply here. The bar is the
+// one tests/test-paged-banded.cpp already enforces for this op family --
+//     max_abs < 2e-3 && nmse < 1e-6
+// -- which is the half-input tolerance the suite was written around; no new tolerance is
+// invented for this kernel, and the existing gate is the judge.
+//
+// Staging (why it is a skeleton and what the next commit fills in):
+//   1. [this commit] layout + guard + bar recorded; dispatch stays on the f32 tiled path.
+//   2. QK^T in fragments: q_h/k_h half tiles in smem (padded to avoid bank conflicts),
+//      wmma::load_matrix_sync + mma_sync -> f32 score fragment.
+//   3. online softmax over the score fragment, then P(half) x V(half) -> f32 out fragment.
+//   4. flip DS4P_PAGED_QTILE=2 (fragment path) only after max_abs/nmse + >=5x + p28 3/3.
+#define PAGED_WMMA_M 16
+#define PAGED_WMMA_N 16
+#define PAGED_WMMA_K 16
+// smem for the fragment path: Q tile + K tile + V tile in half, +8 pad per row against
+// bank conflicts, plus the f32 score tile. Recomputed at launch like the f32 path does.
+#define PAGED_WMMA_SMEM(head_dim) \
+    ((size_t) (PAGED_WMMA_M * ((head_dim) + 8) + 2 * PAGED_WMMA_N * ((head_dim) + 8)) * sizeof(half) \
+     + (size_t) PAGED_WMMA_M * PAGED_WMMA_N * sizeof(float))
+
+
 __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ q,
                                                      const half * __restrict__ kv_cache,
                                                      const int * __restrict__ block_table,
