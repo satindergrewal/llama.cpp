@@ -212,6 +212,13 @@ struct ds4p_quench_config {
     // the cold steps excluded the same pair drafts exactly as much as governor-OFF and
     // runs faster. Set DS4P_QUENCH_WARMUP=0 to reproduce ds4 semantics exactly.
     int   warmup  = 8;
+    // RE-ARMABLE QUENCH (ours, not ds4): after this many decode tokens spent quenched,
+    // give the request one more chance -- speculation is re-armed with fresh state, and
+    // if the drafter is still bad the governor re-quenches within minev steps. ds4's
+    // quench is TERMINAL, which is right for a permanently-mismatched drafter and wrong
+    // for one that degrades in a PHASE (long context, a code block, a language switch).
+    // 0 = terminal (ds4 semantics). Cost of a wasted probe is bounded by minev steps.
+    int   probe   = 256;
 };
 
 static const ds4p_quench_config & ds4p_quench() {
@@ -224,6 +231,7 @@ static const ds4p_quench_config & ds4p_quench() {
         s = getenv("DS4P_QUENCH_BUDGET"); if (s) c.budget = atof(s);
         s = getenv("DS4P_QUENCH_FORCE");  if (s) c.force  = atoi(s);
         s = getenv("DS4P_QUENCH_WARMUP"); if (s) c.warmup = atoi(s);
+        s = getenv("DS4P_QUENCH_PROBE");  if (s) c.probe  = atoi(s);
         if (c.budget <= 0.0f) {
             c.budget = 4.0f*c.guard;
         }
@@ -388,7 +396,9 @@ struct server_slot {
     // DS4P_YIELD_QUENCH (P0-1) per-request governor state
     float quench_ewma = 0.0f; // EWMA of accepted tokens per verify step, initialized AT guard
     float quench_debt = 0.0f; // cumulative shortfall vs guard, clamped at 0 on credit
-    bool  quenched    = false; // TERMINAL for this request
+    bool  quenched    = false; // terminal unless DS4P_QUENCH_PROBE re-arms it
+    int   quench_at   = 0;     // n_decoded when the quench fired (re-arm clock)
+    int   quench_fires = 0;    // how many times this request has quenched
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -421,9 +431,11 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         // re-arm the yield-quench governor for the next request (quench is per-request)
-        quench_ewma = ds4p_quench().guard;
-        quench_debt = 0.0f;
-        quenched    = false;
+        quench_ewma  = ds4p_quench().guard;
+        quench_debt  = 0.0f;
+        quenched     = false;
+        quench_at    = 0;
+        quench_fires = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -532,10 +544,25 @@ struct server_slot {
             return 0;
         }
 
-        // DS4P_YIELD_QUENCH (P0-1): a quenched request never drafts again — this is the
-        // single choke point every draft-arming site goes through
+        // DS4P_YIELD_QUENCH (P0-1): a quenched request does not draft — this is the
+        // single choke point every draft-arming site goes through. With
+        // DS4P_QUENCH_PROBE > 0 the quench is not terminal: after that many decode
+        // tokens the request gets one fresh chance (a drafter can degrade in a PHASE),
+        // and a still-bad drafter re-quenches within minev steps.
         if (quenched) {
-            return 0;
+            const auto & qc = ds4p_quench();
+            if (qc.probe <= 0 || n_decoded - quench_at < qc.probe) {
+                return 0;
+            }
+            // re-arm with fresh state (const_cast: this choke point is the only place
+            // that observes the clock; the governor's own fields are request-local)
+            auto * self = const_cast<server_slot *>(this);
+            self->quenched         = false;
+            self->quench_ewma      = qc.guard;
+            self->quench_debt      = 0.0f;
+            self->n_draft_verif_steps = 0;  // warmup grace applies to the retry too
+            SLT_INF(*this, "yield-quench RE-ARMED after %d decoded tokens (fires=%d)\n",
+                    n_decoded - quench_at, quench_fires);
         }
 
         // determine the max draft that fits the current slot state
@@ -4217,7 +4244,9 @@ private:
                                    slot.quench_debt > qc.budget;
 
                 if (force || fire) {
-                    slot.quenched = true;
+                    slot.quenched   = true;
+                    slot.quench_at  = slot.n_decoded;
+                    slot.quench_fires++;
                     metrics.n_quench_seqs_total++;
                     SLT_INF(slot, "yield-quench FIRED%s: steps=%d ewma=%.3f guard=%.3f debt=%.3f budget=%.3f (quench_seqs=%llu)\n",
                             force ? " (forced)" : "", slot.n_draft_verif_steps,
