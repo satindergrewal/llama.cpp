@@ -1224,6 +1224,9 @@ typedef struct {
     float    scale;
     int32_t  rel_extent;        // 0 = no rel bias
     int32_t  visibility_window; // 0 = unbanded
+    int32_t  q_parallel;
+    int32_t  n_tokens_total;
+    int32_t  nsg;
     uint64_t stride_token;      // in halves
     uint64_t stride_head;
     uint64_t stride_block;

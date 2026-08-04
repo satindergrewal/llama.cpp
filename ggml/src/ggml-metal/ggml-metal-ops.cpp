@@ -4514,6 +4514,9 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.scale             =*/ op_params_f[0],
         /*.rel_extent        =*/ rel ? (int32_t) rel_extent : 0,
         /*.visibility_window =*/ (int32_t) vis_window,
+        /*.q_parallel        =*/ (n_tokens > 1) ? 1 : 0,
+        /*.n_tokens_total    =*/ n_tokens,
+        /*.nsg               =*/ (n_tokens > 1) ? 8 : 32,
         /*.stride_token      =*/ kv_cache->nb[1] / sizeof(ggml_fp16_t),
         /*.stride_head       =*/ kv_cache->nb[2] / sizeof(ggml_fp16_t),
         /*.stride_block      =*/ kv_cache->nb[3] / sizeof(ggml_fp16_t),
@@ -4553,7 +4556,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // unlike the CUDA decode split count, which peaked at 64 and got worse after.
     // Prefill goes the other way (3885 -> 4855 ms over the same sweep) because it already
     // has n_tokens*n_heads threadgroups and extra slices only widen the combine.
-    int nsg = n_tokens > 1 ? 2 : 32;
+    int nsg = n_tokens > 1 ? 8 : 32;
     // DS4P_METAL_NSG forces the simd-group count so a sweep runs as PAIRED ARMS IN ONE
     // BINARY rather than one rebuild per point -- the discipline that made the CUDA
     // cp.async A/B trustworthy. Decode is the shape worth sweeping: its grid is only
@@ -4575,9 +4578,15 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rel ? rel : q), 7);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),       8);
 
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, (2*nsg + nsg*head_dim)*sizeof(float), 0);
+    // prefill stages K+V tiles (2 * block_size * head_dim halves); decode keeps its
+    // combine area. Take the max so either path fits.
+    const int    bs_stage   = ((const int32_t *)(op_params_f + 1))[0];
+    const size_t smem_stage = (size_t) 2 * bs_stage * head_dim * sizeof(uint16_t);
+    const size_t smem_comb  = (size_t) (2*nsg + nsg*head_dim) * sizeof(float);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_stage > smem_comb ? smem_stage : smem_comb, 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, n_heads, 1, nth, 1, 1);
+    const int n_groups_x = (n_tokens > 1) ? (n_tokens + nsg - 1) / nsg : n_tokens;
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_groups_x, n_heads, 1, nth, 1, 1);
 
     return 1;
 }

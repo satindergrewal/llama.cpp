@@ -3009,7 +3009,15 @@ kernel void kernel_paged_attn_f32(
 
     const int D        = args.head_dim;
     const int head_idx = (int) tgpig[1];
-    const int gtok     = (int) tgpig[0];
+    // Q-block packing: simd group s owns row tgpig[0]*nsg + s. Tail rows past
+    // n_tokens_total CLAMP instead of returning: a non-uniform early return would leave
+    // the threadgroup's barriers below with missing threads (deadlock/UB on Metal), so an
+    // invalid row computes a duplicate of the last valid row and simply never writes.
+    const int gtok_raw = args.q_parallel
+                       ? (int) tgpig[0] * args.nsg + (int) (tpitg3[0] / 32)
+                       : (int) tgpig[0];
+    const bool row_ok  = !args.q_parallel || gtok_raw < args.n_tokens_total;
+    const int gtok     = row_ok ? gtok_raw : (args.n_tokens_total - 1);
 
     int seq = -1, i_local = 0;
     for (int s = 0; s < args.n_seq; ++s) {
@@ -3041,6 +3049,118 @@ kernel void kernel_paged_attn_f32(
 
     float m_i = -INFINITY;
     float l_i = 0.0f;
+
+    if (args.q_parallel) {
+        // ★ Q-BLOCK INCREMENT (champion shape, ggml-metal.metal:6592/:6619/:6716 -- one
+        // query block per threadgroup, rows split across simd groups, K/V tiles staged
+        // ONCE in threadgroup memory and shared by every row; barriers are per BLOCK, not
+        // per token, and threadgroup-uniform by construction (bounds derive from tgpig
+        // only). Per-row trip counts inside a staged block may diverge -- proven safe
+        // (arms E + packing arm), because no barrier lives inside the token loop.
+        const int bs     = args.block_size;
+        const int gfirst = (int) tgpig[0] * args.nsg;
+        const int glast  = min((int) (tgpig[0] + 1) * args.nsg, args.n_tokens_total) - 1;
+
+        int seq_f = -1, seq_l = -1, il_l = 0;
+        for (int s2 = 0; s2 < args.n_seq; ++s2) {
+            const int off = batch_offsets[s2];
+            const int len = batch_lens[s2];
+            if (gfirst >= off && gfirst < off + len) { seq_f = s2; }
+            if (glast  >= off && glast  < off + len) { seq_l = s2; il_l = glast - off; }
+        }
+
+        threadgroup half * tk = (threadgroup half *) shmem;
+        threadgroup half * tv = tk + bs*D;
+
+        if (seq_f == seq_l && seq_l >= 0) {
+            // SHARED-TILE PATH (same seq for the whole pack -- the common case)
+            const int n_tok_u = (ctx_lens[seq_l] - batch_lens[seq_l]) + il_l + 1;
+            const int nblk    = (n_tok_u + bs - 1) / bs;
+            const uint tid    = tpitg3[0];
+
+            for (int bi = 0; bi < nblk; ++bi) {
+                const int pb = block_table[seq_l * args.max_blocks + bi];
+                const uint64_t kb = (uint64_t) pb * args.stride_block + (uint64_t) kv_h * args.stride_head;
+                const uint64_t vb = (uint64_t) pb * args.stride_block + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head;
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);   // prev iter's readers
+                for (uint idx = tid; idx < (uint)(bs*D); idx += ntg) {
+                    const uint t  = idx / (uint) D;
+                    const uint d2 = idx % (uint) D;
+                    tk[idx] = kv_cache[kb + (uint64_t) t * args.stride_token + d2];
+                    tv[idx] = kv_cache[vb + (uint64_t) t * args.stride_token + d2];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const int t0   = bi*bs;
+                const int tend = min(bs, n_tok - t0);   // this ROW's bound; may diverge per sg
+                const int tbeg = max(0, lo - t0);
+                for (int t = tbeg; t < tend; ++t) {
+                    float part = 0.0f;
+                    for (int i = 0; i < NPT; ++i) {
+                        const int d2 = (int) lane + i*32;
+                        if (d2 < D) { part += qv[i] * (float) tk[t*D + d2]; }
+                    }
+                    float sc = simd_sum(part) * args.scale;
+                    const int rd = q_pos - (t0 + t);
+                    if (args.rel_extent > 0 && rd >= 0 && rd < args.rel_extent) {
+                        sc += rel[((uint64_t) gtok * args.n_heads + head_idx) * args.rel_extent + rd];
+                    }
+                    const float m_new = max(m_i, sc);
+                    const float resc  = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
+                    const float pv    = (sc  == -INFINITY) ? 0.0f : exp(sc - m_new);
+                    l_i = l_i * resc + pv;
+                    for (int i = 0; i < NPT; ++i) {
+                        const int d2 = (int) lane + i*32;
+                        if (d2 < D) { accv[i] = accv[i] * resc + pv * (float) tv[t*D + d2]; }
+                    }
+                    m_i = m_new;
+                }
+            }
+        } else {
+            // CROSS-SEQ PACK (rare boundary): rows need different physical blocks, so a
+            // shared tile would be wrong -- fall back to the proven per-row unshared walk.
+            int cur2 = -1; uint64_t base2 = 0;
+            for (int tok = lo; tok < n_tok; ++tok) {
+                const int blk = tok / bs;
+                if (blk != cur2) {
+                    cur2  = blk;
+                    base2 = (uint64_t) block_table[seq * args.max_blocks + blk] * args.stride_block
+                          - (uint64_t) blk * bs * args.stride_token;
+                }
+                const uint64_t b     = base2 + (uint64_t) tok * args.stride_token;
+                const uint64_t k_off = b + (uint64_t) kv_h * args.stride_head;
+                float part = 0.0f;
+                for (int i = 0; i < NPT; ++i) {
+                    const int d2 = (int) lane + i*32;
+                    if (d2 < D) { part += qv[i] * (float) kv_cache[k_off + d2]; }
+                }
+                float sc = simd_sum(part) * args.scale;
+                const int rd = q_pos - tok;
+                if (args.rel_extent > 0 && rd >= 0 && rd < args.rel_extent) {
+                    sc += rel[((uint64_t) gtok * args.n_heads + head_idx) * args.rel_extent + rd];
+                }
+                const float m_new = max(m_i, sc);
+                const float resc  = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
+                const float pv    = exp(sc - m_new);
+                l_i = l_i * resc + pv;
+                const uint64_t v_off = b + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head;
+                for (int i = 0; i < NPT; ++i) {
+                    const int d2 = (int) lane + i*32;
+                    if (d2 < D) { accv[i] = accv[i] * resc + pv * (float) kv_cache[v_off + d2]; }
+                }
+                m_i = m_new;
+            }
+        }
+
+        if (row_ok) {
+            for (int i = 0; i < NPT; ++i) {
+                const int d2 = (int) lane + i*32;
+                if (d2 < D) { dst[q_off + d2] = accv[i] / (l_i + 1e-6f); }
+            }
+        }
+        return;
+    }
 
     // Split-K over the key range: simd group s walks tokens s, s+nsg, s+2*nsg, ... Strided
     // rather than contiguous because a strided walk keeps every group's loads inside the
