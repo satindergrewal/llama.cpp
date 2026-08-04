@@ -12610,3 +12610,76 @@ void kernel_paged_champ_impl(
 #undef NS10
 #undef NS20
 }
+
+
+template<
+    typename q_t,     // query types in shared memory
+    typename q4_t,
+    typename q8x8_t,
+    typename k_t,     // key types in shared memory
+    typename k4x4_t,
+    typename k8x8_t,
+    typename v_t,     // value types in shared memory
+    typename v4x4_t,
+    typename v8x8_t,
+    typename qk_t,    // Q*K types
+    typename qk8x8_t,
+    typename s_t,     // soft-max types
+    typename s2_t,
+    typename s8x8_t,
+    typename o_t,     // attention accumulation types
+    typename o4_t,
+    typename o8x8_t,
+    typename kd4x4_t, // key type in device memory
+    short nl_k,
+    void (*deq_k)(device const kd4x4_t *, short, thread k4x4_t &),
+    typename vd4x4_t, // value type in device memory
+    short nl_v,
+    void (*deq_v)(device const vd4x4_t *, short, thread v4x4_t &),
+    short DK,         // K head size
+    short DV,         // V head size
+    short Q  = OP_FLASH_ATTN_EXT_NQPSG, // queries per threadgroup
+    short C  = OP_FLASH_ATTN_EXT_NCPSG> // cache items per threadgroup -- MUST equal paged block_size
+kernel void kernel_paged_attn_champ(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * sinks,
+        device const char * pad,
+        device const char * blk,
+        device const int32_t * ptab,
+        device const int32_t * plen,
+        device       char * dst,
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+#define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
+#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, ptab, plen, dst, shmem_f16, tgpig, tiisg, sgitg
+    switch (FC_flash_attn_ext_nsg) {
+        case 4: kernel_paged_champ_impl<FWD_TMPL, 4>(FWD_ARGS); break;
+        case 8: kernel_paged_champ_impl<FWD_TMPL, 8>(FWD_ARGS); break;
+    }
+#undef FWD_TMPL
+#undef FWD_ARGS
+}
+
+// FA_TYPES is #undef'd after the champion's instantiations; redeclare it for ours rather than
+// moving the undef, so the champion's block stays byte-identical.
+#define FA_TYPES_PAGED \
+    half,   half4,     simdgroup_half8x8,  \
+    half,   half4x4,   simdgroup_half8x8,  \
+    half,   half4x4,   simdgroup_half8x8,  \
+    float,             simdgroup_float8x8, \
+    float,  float2,    simdgroup_float8x8, \
+    float,  float4,    simdgroup_float8x8
+
+typedef decltype(kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 64, 64>) paged_champ_t;
+
+template [[host_name("kernel_paged_attn_champ_dk64_dv64"  )]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16,  64,  64>;
+template [[host_name("kernel_paged_attn_champ_dk96_dv96"  )]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16,  96,  96>;
+template [[host_name("kernel_paged_attn_champ_dk128_dv128")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 128, 128>;
+template [[host_name("kernel_paged_attn_champ_dk192_dv192")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 192, 192>;
+
