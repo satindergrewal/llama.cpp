@@ -1284,11 +1284,39 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         return;
     }
 
-    const uint32_t n_gpu_blocks = (uint32_t)(available / bytes_per_block);
+    // How many blocks the VRAM would allow. On a DISCRETE GPU this is the right answer and is
+    // what vLLM does: the block pool owns the card's private memory. On UNIFIED MEMORY it is
+    // catastrophic, because "free VRAM" IS the machine's RAM -- measured on a 128 GB Mac with
+    // a 2.3 GB model at -c 16384, this sized the pool at ~46,000 blocks and the server held
+    // 88.79 GB RSS with the system at 5% free (static: 4.91 GB, 87% free). At -c 32768 it was
+    // 112.39 GB. n_ctx never entered the calculation at all, so asking for a small context
+    // bought a pool 45x larger than the request.
+    const uint32_t n_gpu_blocks_vram = (uint32_t)(available / bytes_per_block);
+
+    // Cap by what the requested context actually needs, with headroom for fragmentation and
+    // for the sharing/spill the paged cache exists to do. VRAM stays the hard ceiling.
+    const uint32_t blocks_per_seq = (params.n_ctx + block_size - 1) / block_size;
+    const uint32_t n_seqs         = params.n_parallel > 0 ? (uint32_t) params.n_parallel : 1u;
+    // Headroom over the bare context. 1.5x by default; LLAMA_PAGED_POOL_HEADROOM overrides,
+    // and setting it very large restores the old fill-all-VRAM behaviour for discrete GPUs.
+    float headroom = 1.5f;
+    if (const char * e = getenv("LLAMA_PAGED_POOL_HEADROOM")) {
+        const float v = (float) atof(e);
+        if (v > 0.0f) { headroom = v; }
+    }
+    const uint32_t blocks_needed  = (uint32_t)((float) blocks_per_seq * (float) n_seqs * headroom);
+
+    const uint32_t n_gpu_blocks = blocks_needed > 0 && blocks_needed < n_gpu_blocks_vram
+                                ? blocks_needed
+                                : n_gpu_blocks_vram;
     const uint32_t n_cpu_blocks = (uint32_t)(n_gpu_blocks * params.cpu_to_gpu_blocks_ratio);
 
     LOG_INF("%s: free_vram=%0.1f MiB, bytes_per_block=%ld, n_gpu_blocks=%d, n_cpu_blocks=%d\n",
             __func__, free_vram / 1024.0f / 1024.0f, bytes_per_block, n_gpu_blocks, n_cpu_blocks);
+    LOG_INF("%s: pool sized for n_ctx=%d x %d seq (%d blocks x %.2f headroom = %d); "
+            "VRAM would have allowed %d blocks (%.1f GiB)\n",
+            __func__, params.n_ctx, n_seqs, blocks_per_seq, headroom, blocks_needed,
+            n_gpu_blocks_vram, (n_gpu_blocks_vram * (double) bytes_per_block) / (1024.0*1024.0*1024.0));
 
     params.n_gpu_blocks = n_gpu_blocks;
     params.n_cpu_blocks = n_cpu_blocks;
