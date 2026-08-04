@@ -4547,7 +4547,21 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // decode has ONE query token, so its grid is only (1, n_heads) threadgroups and needs
     // simd groups to create parallelism; prefill already has n_tokens*n_heads threadgroups
     // and extra slices there only widen the combine.
-    const int nsg = n_tokens > 1 ? 2 : 8;
+    // SWEPT, n=1 per point, all correctness-gated first (decode tok/s): 4 -> 19.25 ·
+    // 8 -> 31.50 · 16 -> 45.73 · 32 -> 54.78. Monotonic to 32, which is the hardware
+    // ceiling (1024 threads per threadgroup / 32 lanes), so the curve never turns over --
+    // unlike the CUDA decode split count, which peaked at 64 and got worse after.
+    // Prefill goes the other way (3885 -> 4855 ms over the same sweep) because it already
+    // has n_tokens*n_heads threadgroups and extra slices only widen the combine.
+    int nsg = n_tokens > 1 ? 2 : 32;
+    // DS4P_METAL_NSG forces the simd-group count so a sweep runs as PAIRED ARMS IN ONE
+    // BINARY rather than one rebuild per point -- the discipline that made the CUDA
+    // cp.async A/B trustworthy. Decode is the shape worth sweeping: its grid is only
+    // (1, n_heads) threadgroups, so on a 40-core M3 Max nsg is the only parallelism knob.
+    if (const char * e = getenv("DS4P_METAL_NSG")) {
+        const int v = atoi(e);
+        if (v >= 1 && v <= 32) { nsg = v; }
+    }
     const int nth = 32 * nsg;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
