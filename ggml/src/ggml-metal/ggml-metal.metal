@@ -3047,10 +3047,20 @@ kernel void kernel_paged_attn_f32(
     // same neighbourhood of the block table, and because contiguous chunking leaves the last
     // group short whenever the span does not divide evenly.
     // (Both distributions were measured equivalent for correctness -- arms B and C.)
+    // Block-table lookup HOISTED (vLLM PagedAttention pattern, per the transfer list):
+    // the old body did an integer divide, a modulo and a global block_table load EVERY
+    // token. The block index only changes every block_size/nsg iterations on this strided
+    // walk, so cache it and recompute the base only on block crossings.
+    int      cur_blk  = -1;
+    uint64_t blk_base = 0;
     for (int tok = lo + (int) sg; tok < n_tok; tok += (int) nsg) {
-        const int pb = block_table[seq * args.max_blocks + tok / args.block_size];
-        const uint64_t b = (uint64_t) (tok % args.block_size) * args.stride_token
-                         + (uint64_t) pb * args.stride_block;
+        const int blk = tok / args.block_size;
+        if (blk != cur_blk) {
+            cur_blk  = blk;
+            blk_base = (uint64_t) block_table[seq * args.max_blocks + blk] * args.stride_block
+                     - (uint64_t) blk * args.block_size * args.stride_token;
+        }
+        const uint64_t b = blk_base + (uint64_t) tok * args.stride_token;
 
         const uint64_t k_off = b + (uint64_t) kv_h * args.stride_head;
         float part = 0.0f;
