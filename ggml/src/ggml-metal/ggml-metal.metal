@@ -2987,6 +2987,15 @@ kernel void kernel_paged_attn_write_f32(
 // same op and needs no CUDA-only reference.
 //
 // grid: (n_tokens_total, n_heads, 1); threadgroup: head_dim threads (one per dim).
+// head_dim as a FUNCTION CONSTANT. The champion instantiates 213 template specialisations
+// with head_dim baked in; this kernel was one generic build for every head size, which meant
+// every D-derived loop bound was a runtime value. Specialising here lets the compiler unroll
+// those loops and, crucially, makes register-resident accumulators legal later: `lo[D/8]`
+// indexed by a loop variable is only register-allocatable when D is compile-time -- with a
+// runtime D it becomes dynamic indexing into a register array and spills to thread-private
+// (device-backed) memory. One pipeline per head_dim; the host always supplies the value.
+constant int32_t FC_paged_attn_D [[function_constant(FC_PAGED_ATTN + 0)]];
+
 kernel void kernel_paged_attn_f32(
         constant ggml_metal_kargs_paged_attn & args,
         device const float   * q             [[buffer(1)]],
@@ -3007,7 +3016,10 @@ kernel void kernel_paged_attn_f32(
     const uint tpitg = tpitg3[0];
     const uint ntg   = ntg3[0];
 
-    const int D        = args.head_dim;
+    // COMPILE-TIME head_dim (function constant). args.head_dim carries the same value and is
+    // asserted equal on the host; using the constant is what lets the compiler unroll the
+    // D-derived loops below.
+    const int D        = FC_paged_attn_D;
     const int head_idx = (int) tgpig[1];
 
     // ================= MMA PREFILL PATH (args.use_mma) =================

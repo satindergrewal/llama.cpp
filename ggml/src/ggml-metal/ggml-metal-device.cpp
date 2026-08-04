@@ -1223,12 +1223,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn(ggml_
     char base[256];
     char name[256];
 
+    // Specialise per head_dim: the pipeline NAME must carry it, or every head size would
+    // share one cached compilation and the function constant would silently be whatever the
+    // first caller baked in.
+    const int32_t head_dim = (int32_t) op->src[0]->ne[0];
+
     snprintf(base, 256, "kernel_paged_attn_f32");
-    snprintf(name, 256, "%s", base);
+    snprintf(name, 256, "%s_d%d", base, head_dim);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int32(cv, head_dim, FC_PAGED_ATTN + 0);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
     }
 
     // one float per thread for the QK dot reduction

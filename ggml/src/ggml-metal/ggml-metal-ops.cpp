@@ -4565,7 +4565,19 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         }
         if (mma_nsg == 0) { use_mma = false; }   // no tile fits -> scalar path, no silence
     }
-    if (getenv("DS4P_METAL_NO_MMA")) { use_mma = false; }   // one-factor arm switch
+    // ⚠ MMA IS OFF BY DEFAULT AS OF 2026-08-04, ON THE MEASUREMENT, NOT ON PREFERENCE.
+    // Once head_dim became a function constant, the SCALAR path got far more from the
+    // resulting unrolling than the MMA path did:
+    //     scalar 2,944 -> 1,570 ms  (-46.5%)      MMA 2,023 -> 1,960 ms  (-3.1%)
+    // so the specialised scalar kernel now BEATS the MMA kernel by 1.25x at D=128/bs=16
+    // (1,569.4 and 1,568.2 on two independent runs vs 1,959.0; noise floor ~5 ms).
+    // The scalar path's hot loop is the NPT walk over head_dim, which compile-time D unrolls
+    // completely; the MMA path's inner work was already in fragments and had less to gain.
+    // MMA stays in the tree, correct and gated at 12/12, behind DS4P_METAL_MMA=1 -- it must
+    // BEAT the specialised scalar path before it goes back to being the default. Shipping the
+    // slower path because it is the one I spent the day building would be the wrong call.
+    const bool mma_opt_in = getenv("DS4P_METAL_MMA") != nullptr;
+    if (!mma_opt_in || getenv("DS4P_METAL_NO_MMA")) { use_mma = false; }
 
     ggml_metal_kargs_paged_attn args = {
         /*.head_dim          =*/ head_dim,
