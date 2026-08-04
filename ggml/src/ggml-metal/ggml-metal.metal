@@ -12704,6 +12704,7 @@ kernel void kernel_paged_champ_mask(
         device       half    * mask          [[buffer(5)]],
         constant     int32_t & n_kv          [[buffer(6)]],
         device       float   * dst_sentinel  [[buffer(7)]],
+        device       char    * blk_skip     [[buffer(8)]],
         uint2 gid [[thread_position_in_grid]]) {
     const int row = (int) gid.y;
     const int col = (int) gid.x;
@@ -12745,6 +12746,12 @@ kernel void kernel_paged_champ_mask(
     }
 
     mask[(uint64_t) row*n_kv + col] = v;
+
+    // blk = the champion's per-block SKIP array, read whenever has_mask is true. 1 = process.
+    // Leaving it as a dummy buffer let garbage act as skip flags and blocks silently vanished.
+    if (col < 64) {
+        blk_skip[(uint64_t) row*64 + col] = 1;
+    }
 
     // SEPARATOR: "loop never ran" and "dst never written" both give all-zero output. Stamp dst
     // with a sentinel here; if it SURVIVES the champion dispatch, the champion never wrote. If

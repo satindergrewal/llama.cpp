@@ -2607,7 +2607,15 @@ size_t ggml_metal_op_paged_attn_extra_mask(const ggml_tensor * op) {
     // Worst case: every block the table can address, padded to the champion's C-key chunk.
     const int64_t n_kv = (int64_t) max_blk * bs;
 
-    return GGML_PAD((size_t) n_tokens * n_kv * sizeof(ggml_fp16_t), 32);
+    // mask + blk. blk is the champion's per-(head, q-block, kv-block) SKIP array, read
+    // whenever has_mask is true. Binding a dummy for it meant garbage was interpreted as skip
+    // flags and whole blocks vanished -- the kernel ran, wrote dst, and was quietly wrong.
+    const size_t mask_sz = GGML_PAD((size_t) n_tokens * n_kv * sizeof(ggml_fp16_t), 32);
+    const int64_t n_heads_e = op->src[0]->ne[2];
+    const size_t blk_sz  = GGML_PAD((size_t) n_heads_e *
+                                    ((n_tokens + OP_FLASH_ATTN_EXT_NQPSG - 1)/OP_FLASH_ATTN_EXT_NQPSG) *
+                                    ((n_kv + OP_FLASH_ATTN_EXT_NCPSG - 1)/OP_FLASH_ATTN_EXT_NCPSG + 1), 32);
+    return mask_sz + blk_sz;
 }
 
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
@@ -4749,6 +4757,8 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             int32_t n_kv_c = max_blk_c * bs_pa_lpk;
             ggml_metal_buffer_id bid_mask = ggml_metal_get_buffer_id(op);
             bid_mask.offs += ggml_nbytes(op);
+            ggml_metal_buffer_id bid_blk = bid_mask;
+            bid_blk.offs += GGML_PAD((size_t) n_tokens * n_kv_c * sizeof(ggml_fp16_t), 32);
 
             {   // FILL the mask: causality + banded window + rel bias, so the champion's own
                 // tested masking code provides correctness rather than hand-rolled indexing.
@@ -4765,6 +4775,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer(enc, bid_mask, 5);
                 ggml_metal_encoder_set_bytes (enc, &n_kv_c, sizeof(n_kv_c), 6);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
+                ggml_metal_encoder_set_buffer(enc, bid_blk, 8);
                 ggml_metal_encoder_dispatch_threadgroups(enc,
                     (n_kv_c + 31)/32, n_tokens, 1, 32, 1, 1);
             }
@@ -4800,7 +4811,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_mask,                          4);  // mask
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        5);  // sinks (unused)
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        6);  // pad (unused)
-            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        7);  // blk (unused)
+            ggml_metal_encoder_set_buffer  (enc, bid_blk,                           7);  // blk: skip flags
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(btab),     8);  // ptab
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(clens),    9);  // plen
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),      10);  // dst
