@@ -4746,7 +4746,14 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                               __func__, why, head_dim, bs_pa_lpk, n_seq_c, n_tokens);
             }
         } else {
-            const int champ_nsg = 4;
+            // Champion smem is nsg-INVARIANT for f16 KV (10,240 B at any nsg), so more simd
+            // groups are free -- the knob our own layouts could never turn, because theirs all
+            // scale with QR = 8*nsg. Kept as an env arm so it is measured, not assumed.
+            int champ_nsg = 4;   // 8 FAILS 12/12 -- see below; default stays at the CORRECT config
+            if (const char * e = getenv("DS4P_CHAMP_NSG")) {
+                const int v = atoi(e);
+                if (v == 4 || v == 8) { champ_nsg = v; }   // dispatcher only instantiates 4 and 8
+            }
             auto cp = ggml_metal_library_get_pipeline_paged_attn_champ(lib, op, champ_nsg);
             const uint64_t st = kv_cache->nb[1] / sizeof(ggml_fp16_t);   // stride_token, elements
             const uint64_t sh = kv_cache->nb[2] / sizeof(ggml_fp16_t);
