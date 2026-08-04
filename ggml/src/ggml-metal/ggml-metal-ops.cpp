@@ -4521,7 +4521,8 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         const size_t QR = (size_t) 8 * nsg_try;
         const size_t KT = (size_t) sb_try * bs_pa;
         // ss is reused in place as P (both float), so ONE score tile, not two.
-        return (2*KT*head_dim + QR*head_dim) * sizeof(uint16_t)
+        // K only: V is read directly from device, which is what lets KT double at flat cost.
+        return (KT*head_dim + QR*head_dim) * sizeof(uint16_t)
              + (QR*KT + QR*head_dim + 2*QR) * sizeof(float);
     };
     int  mma_nsg = 0, mma_sb = 0;
@@ -4546,9 +4547,19 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             const int v = atoi(e);
             if (v >= 1 && v <= 8) { sb_lo = v; sb_hi = v; }
         }
+        // DS4P_METAL_NSG pins the simd-group count for the MMA path too. It must be applied
+        // HERE, not to the dispatch variable alone: args.nsg and the smem allocation are both
+        // derived from mma_nsg, so overriding only the launch width would desync the tile
+        // from its allocation -- the exact layout/allocation mismatch that already cost a
+        // crash and a false ALL PASSED.
+        int nsg_hi = 8, nsg_lo = 1;
+        if (const char * e = getenv("DS4P_METAL_NSG")) {
+            const int v = atoi(e);
+            if (v >= 1 && v <= 8) { nsg_hi = v; nsg_lo = v; }
+        }
         // prefer more staged blocks, then the largest simd-group count that still fits
         for (int sb = sb_hi; sb >= sb_lo && mma_nsg == 0; --sb) {
-            for (int cand = 8; cand >= 1; cand >>= 1) {
+            for (int cand = nsg_hi; cand >= nsg_lo; cand >>= 1) {
                 if (mma_smem(cand, sb) <= smem_budget) { mma_nsg = cand; mma_sb = sb; break; }
             }
         }
@@ -4615,9 +4626,18 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // BINARY rather than one rebuild per point -- the discipline that made the CUDA
     // cp.async A/B trustworthy. Decode is the shape worth sweeping: its grid is only
     // (1, n_heads) threadgroups, so on a 40-core M3 Max nsg is the only parallelism knob.
+    // ⚠ BUG, PRE-EXISTING AND FOUND 2026-08-04: this override set only the DISPATCH width.
+    // args.nsg is the SCALAR kernel's ROW STRIDE (gtok_raw = tgpig[0]*args.nsg + sg), so with
+    // args.nsg=8 and 4 simd groups launched, rows 4-7, 12-15, 20-23 were NEVER COMPUTED --
+    // nmse ~0.3, silently, on a knob whose whole purpose is trustworthy paired arms.
+    // It surfaced only when D=192 fell back to the scalar path under DS4P_METAL_NSG=4 while
+    // the MMA path (whose override keeps args.nsg and the dispatch in lockstep) passed.
+    // ⇒ Any previously recorded SCALAR nsg-sweep point taken through this env var measured a
+    //   kernel doing LESS work than it should. Only the default (8) is unaffected, which is
+    //   also, tellingly, the point that "won" that sweep.
     if (const char * e = getenv("DS4P_METAL_NSG")) {
         const int v = atoi(e);
-        if (v >= 1 && v <= 32) { nsg = v; }
+        if (v >= 1 && v <= 32) { nsg = v; args.nsg = v; }   // keep BOTH in lockstep
     }
     const int nth = 32 * nsg;
 

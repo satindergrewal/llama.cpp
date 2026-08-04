@@ -3042,9 +3042,13 @@ kernel void kernel_paged_attn_f32(
         const uint SH = (uint) KT;         // score-tile row stride  (its OWN stride)
         const uint PV = (uint) D;          // O accumulator stride   (its OWN stride)
 
+        // V IS NOT STAGED. It is read straight from device memory in the P@V step, which is
+        // what the champion does (ggml-metal.metal:7150, `device const v_t * pv`). That frees
+        // KT*D halves -- exactly enough to DOUBLE the tile at the ORIGINAL footprint, and
+        // footprint is what costs 18.4% (measured, DS4P_METAL_SMEM_PAD). Staging still pays
+        // for K, which every one of the KT/8 score tiles re-reads with a transpose.
         threadgroup half  * tk = (threadgroup half *) shmem;
-        threadgroup half  * tv = tk + KT*D;
-        threadgroup half  * sq = tv + KT*D;
+        threadgroup half  * sq = tk + KT*D;
         // ss holds the SCORES and is then overwritten IN PLACE with P. They were two
         // buffers only while P was half and the scores were float; both are float now, so
         // the split cost QR*SH floats for nothing. Safe in place: each lane owns distinct
@@ -3105,16 +3109,12 @@ kernel void kernel_paged_attn_f32(
                         // block_table out of range; those key positions are beyond every
                         // row's q_pos and the causal mask discards them anyway.
                         tk[idx] = (half) 0.0f;
-                        tv[idx] = (half) 0.0f;
                         continue;
                     }
                     const int pb = block_table[seq * args.max_blocks + bi];
                     const uint64_t kb = (uint64_t) pb * args.stride_block
                                       + (uint64_t) kv_h * args.stride_head;
-                    const uint64_t vb = (uint64_t) pb * args.stride_block
-                                      + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head;
                     tk[idx] = kv_cache[kb + (uint64_t) t * args.stride_token + d2];
-                    tv[idx] = kv_cache[vb + (uint64_t) t * args.stride_token + d2];
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -3183,11 +3183,22 @@ kernel void kernel_paged_attn_f32(
                     simdgroup_float8x8 lo8;
                     simdgroup_load(lo8, so + (8*sgm)*PV + dd*8, PV);
                     for (int cc = 0; cc < KT/8; ++cc) {
+                        // V direct from device. A tile's 8 keys are guaranteed to sit in ONE
+                        // paged block because 8 divides bs, so one block lookup per tile and
+                        // the fragment pitch is simply stride_token.
+                        const int sub = (cc*8) / bs;
+                        const int off = (cc*8) % bs;
+                        const int bi  = bg + sub;
                         simdgroup_float8x8 mp;
                         simdgroup_half8x8  mv;
+                        if (bi >= nblk) { continue; }   // P is 0 there; nothing to accumulate
+                        const int pbv = block_table[seq * args.max_blocks + bi];
+                        const uint64_t vb = (uint64_t) pbv * args.stride_block
+                                          + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head
+                                          + (uint64_t) off * args.stride_token;
                         simdgroup_barrier(mem_flags::mem_none);
                         simdgroup_load(mp, ss + (8*sgm)*SH + cc*8, SH);
-                        simdgroup_load(mv, tv + cc*8*D + dd*8, D);
+                        simdgroup_load(mv, kv_cache + vb + dd*8, args.stride_token);
                         simdgroup_barrier(mem_flags::mem_none);
                         simdgroup_multiply_accumulate(lo8, mp, mv, lo8);
                     }
