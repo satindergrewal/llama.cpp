@@ -4784,7 +4784,11 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             fa.ne31 = n_tokens; fa.ne32 = 1; fa.ne33 = 1;
             fa.nb31 = (uint64_t) n_kv_c*sizeof(ggml_fp16_t); fa.nb32 = 0; fa.nb33 = 0;
             fa.ne11 = n_kv_c;   // mask width; the port still bounds the walk on plen[0]
-            fa.ne1 = n_tokens; fa.ne2 = n_heads; fa.ne3 = 1;
+            // ★ dst index is ((iq1+j)*ne1 + iq2)*DV4 -- token-major, head within token -- so
+            // ne1 is the HEAD COUNT, not the token count. Setting these the natural-looking way
+            // round sent every write past the end of dst (straight into the mask workspace that
+            // sits immediately after it), which is exactly why the sentinel survived.
+            fa.ne1 = n_heads; fa.ne2 = n_tokens; fa.ne3 = 1;
             fa.scale = op_params_f[0];
 
             GGML_ASSERT(cp.smem <= 32768);
