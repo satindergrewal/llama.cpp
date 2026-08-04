@@ -122,10 +122,16 @@ int main() {
 
     // head_dims the mma prefill instantiates or might: 64 and 128 ship today; 96/192 are the
     // ones test-paged-banded cannot reach, which is the whole reason this file exists.
-    const int dims[] = { 64, 96, 128, 192 };
+    // 256 added: Ornith-9B has head_dim=256 and the capability predicate was refusing it on a
+    // hardcoded {64,128} allow-list. NPT = (D+31)/32 with float qv[8] means D<=256 is the
+    // kernel's real ceiling -- so 256 must be TESTED before the predicate is widened to admit it.
+    const int dims[] = { 64, 96, 128, 192, 256 };
     int n_fail = 0;
 
-    for (int di = 0; di < 4; ++di) {
+    // ⚠ WAS `di < 4` -- a HARDCODED bound beside a sized array. Adding 256 to dims[] silently did
+    // nothing and the run still printed ALL PASSED, i.e. a green verdict for a case never executed.
+    // Same gate-plumbing-lie class this lane keeps paying for. Derive the bound from the array.
+    for (size_t di = 0; di < sizeof(dims)/sizeof(dims[0]); ++di) {
         const int D = dims[di];
         for (int cse = 0; cse < 3; ++cse) {
             const bool    with_rel = cse != 2;

@@ -3806,10 +3806,19 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
 
     const int64_t head_dim = hparams.n_embd_head_v(il);
 
-    // Head geometry the banded/paged kernels actually implement. Widening this set is a KERNEL
-    // change, not a model change -- which is exactly why it is asked of the layer and not of a
-    // model name.
-    if (!(head_dim == 64 || head_dim == 128)) {
+    // ★ Head geometry the paged kernel ACTUALLY implements -- derived, not enumerated.
+    //
+    // This was `head_dim == 64 || head_dim == 128`: a hardcoded pair inherited from inkling.cpp,
+    // i.e. a THIRD allow-list (after the arch allow-list and the env-flag allow-list, both removed
+    // the same day). It refused Ornith-9B, whose head_dim is 256, even though the kernel handles
+    // it: the scalar path is NPT = (D+31)/32 over `float qv[8]`, so 256 is exactly its ceiling.
+    //
+    // Verified before widening, not assumed: test-paged-vs-cpu now covers D=256 against the CPU
+    // reference and passes at nmse ~8e-15. (Adding 256 to that test ALSO exposed a hardcoded
+    // `di < 4` loop bound that had been silently skipping it while printing ALL PASSED.)
+    //
+    // The real contract is: a multiple of 32, at most 256.
+    if (head_dim <= 0 || head_dim > 256 || (head_dim % 32) != 0) {
         return false;
     }
 
