@@ -4756,6 +4756,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_pipeline(enc, mp);
                 ggml_metal_kargs_paged_attn margs = args;
                 if (getenv("DS4P_CHAMP_MASK_OPEN")) { margs.lpk = 99; }   // diagnostic probe
+                if (getenv("DS4P_CHAMP_SENTINEL"))  { margs.lpk = 98; }   // separator probe
                 ggml_metal_encoder_set_bytes (enc, &margs, sizeof(margs), 0);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(clens), 1);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(boffs), 2);
@@ -4763,6 +4764,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(rel ? rel : q), 4);
                 ggml_metal_encoder_set_buffer(enc, bid_mask, 5);
                 ggml_metal_encoder_set_bytes (enc, &n_kv_c, sizeof(n_kv_c), 6);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
                 ggml_metal_encoder_dispatch_threadgroups(enc,
                     (n_kv_c + 31)/32, n_tokens, 1, 32, 1, 1);
             }

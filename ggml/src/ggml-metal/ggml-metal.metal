@@ -12703,6 +12703,7 @@ kernel void kernel_paged_champ_mask(
         device const float   * rel           [[buffer(4)]],
         device       half    * mask          [[buffer(5)]],
         constant     int32_t & n_kv          [[buffer(6)]],
+        device       float   * dst_sentinel  [[buffer(7)]],
         uint2 gid [[thread_position_in_grid]]) {
     const int row = (int) gid.y;
     const int col = (int) gid.x;
@@ -12744,4 +12745,11 @@ kernel void kernel_paged_champ_mask(
     }
 
     mask[(uint64_t) row*n_kv + col] = v;
+
+    // SEPARATOR: "loop never ran" and "dst never written" both give all-zero output. Stamp dst
+    // with a sentinel here; if it SURVIVES the champion dispatch, the champion never wrote. If
+    // it is gone, the champion ran and its loop produced nothing. Two suspects, one arm.
+    if (args.lpk == 98 && col < args.head_dim) {
+        dst_sentinel[(uint64_t) row*args.n_heads*args.head_dim + col] = 7.0f;
+    }
 }
