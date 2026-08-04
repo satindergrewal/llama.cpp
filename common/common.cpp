@@ -1263,9 +1263,66 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
 
     const size_t bytes_per_block = (size_t)2 * head_dim * n_heads_kv * block_size * n_layers * ggml_type_size(GGML_TYPE_F16);
 
-    const size_t margin = params.fit_params_target.empty()
-        ? (size_t)(total_vram * 0.05f)
-        : (size_t)params.fit_params_target[0];
+    // ---- RESERVE POLICY -------------------------------------------------------------------
+    // The old reserve was a flat 5% of total. That is wrong at both ends of the range: on a
+    // 128 GB unified-memory machine it leaves 6.4 GB for the whole OS, and on a 16 GB machine
+    // it leaves 0.8 GB, which cannot even hold the window server. On UNIFIED MEMORY the
+    // "VRAM" we are carving up IS the machine's working memory, so the reserve has to be an
+    // absolute floor, not a fraction.
+    //
+    // Detected rather than assumed: on a unified-memory device the reported device total is
+    // essentially physical RAM, so total_vram >= 90% of RAM identifies it without a
+    // platform #ifdef, and it stays correct if a future backend reports the same way.
+    size_t phys_ram = 0;
+#if defined(__APPLE__)
+    {
+        int64_t v = 0; size_t len = sizeof(v);
+        if (sysctlbyname("hw.memsize", &v, &len, nullptr, 0) == 0 && v > 0) { phys_ram = (size_t) v; }
+    }
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    {
+        const long pages = sysconf(_SC_PHYS_PAGES);
+        const long psz   = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && psz > 0) { phys_ram = (size_t) pages * (size_t) psz; }
+    }
+#endif
+    // Apple GPUs are ALWAYS unified memory, so say so directly rather than inferring it.
+    // The inference I tried first -- total_vram >= 90% of phys_ram -- FAILED on a 128 GB Mac:
+    // Metal reports its recommended working set (107.5 GiB, ~84% of RAM), not physical RAM,
+    // so the check said "discrete" and handed back a 1 GiB reserve on a unified machine.
+    // Elsewhere, fall back to the ratio but at a threshold a discrete card cannot reach.
+#if defined(__APPLE__)
+    const bool unified = true;
+    (void) phys_ram;
+#else
+    const bool unified = phys_ram > 0 && total_vram >= (size_t)(0.7 * (double) phys_ram);
+#endif
+
+    // NOTE: fit_params_target carries a DEFAULT (1 GiB), not only an explicit user choice, so
+    // an "if user set it, use it" branch here silently won every time and the unified floor
+    // below never ran -- measured: the policy line said UNIFIED and then reserved 1.0 GiB on a
+    // 128 GB Mac, which is the very thing this policy exists to prevent. On unified memory we
+    // therefore take the LARGER of the requested margin and the safety floor: a bigger
+    // explicit request is still honoured, a smaller one cannot undercut the OS.
+    size_t margin;
+    const size_t margin_req = params.fit_params_target.empty()
+                            ? 0 : (size_t) params.fit_params_target[0];
+    if (unified) {
+        // Leave the OS a real working set: the larger of 8 GiB or 15% of RAM. On 16 GB that
+        // is 8 GiB (deliberately conservative -- a desktop needs it); on 128 GB it is 19.2 GiB.
+        const size_t floor_abs = (size_t) 8  * 1024 * 1024 * 1024;
+        const size_t floor_pct = (size_t) (0.15 * (double) total_vram);
+        const size_t floor     = floor_abs > floor_pct ? floor_abs : floor_pct;
+        margin = margin_req > floor ? margin_req : floor;
+    } else if (margin_req > 0) {
+        margin = margin_req;                                     // discrete: honour as given
+    } else {
+        margin = (size_t)(total_vram * 0.05f);                   // discrete GPU: private pool
+    }
+
+    LOG_INF("%s: memory policy: %s, total=%.1f GiB, free=%.1f GiB, reserve=%.1f GiB\n",
+            __func__, unified ? "UNIFIED (reserve is the OS working set)" : "discrete VRAM",
+            total_vram / 1073741824.0, free_vram / 1073741824.0, margin / 1073741824.0);
 
     if (free_vram <= margin) {
         LOG_ERR("%s: not enough free VRAM for paged KV blocks. "
@@ -1306,9 +1363,44 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     }
     const uint32_t blocks_needed  = (uint32_t)((float) blocks_per_seq * (float) n_seqs * headroom);
 
-    const uint32_t n_gpu_blocks = blocks_needed > 0 && blocks_needed < n_gpu_blocks_vram
-                                ? blocks_needed
-                                : n_gpu_blocks_vram;
+    // ---- ELASTICITY: refuse or clamp, never silently fill the machine -------------------
+    // Capping by n_ctx stops gratuitous over-allocation for SMALL contexts, but a LARGE
+    // context still walks straight into the ceiling. Measured before this block existed:
+    // -c 4000000 served happily at 75.15 GB RSS with the system at 6% free, while the STATIC
+    // path refused the same request outright. A pool that cannot fit must behave like static
+    // and say so, not take the desktop down with it.
+    uint32_t n_gpu_blocks = blocks_needed > 0 ? blocks_needed : n_gpu_blocks_vram;
+
+    if (n_gpu_blocks > n_gpu_blocks_vram) {
+        // How much context DOES fit, so the message is actionable rather than just a refusal.
+        const uint32_t fit_blocks_per_seq = (uint32_t) ((double) n_gpu_blocks_vram / (headroom * (double) n_seqs));
+        const uint32_t fit_ctx            = fit_blocks_per_seq * block_size;
+
+        if (params.paged_pool_clamp) {
+            LOG_WRN("%s: requested n_ctx=%d needs %u blocks but only %u fit in the memory "
+                    "budget. CLAMPING to n_ctx=%u (--paged-pool-clamp).\n",
+                    __func__, params.n_ctx, n_gpu_blocks, n_gpu_blocks_vram, fit_ctx);
+            n_gpu_blocks = n_gpu_blocks_vram;
+        } else {
+            LOG_ERR("%s: requested n_ctx=%d x %u seq needs %u KV blocks (%.1f GiB), but the "
+                    "memory budget allows %u (%.1f GiB).\n"
+                    "        Largest n_ctx that fits here: ~%u. Options: lower -c, lower -np, "
+                    "raise the budget with --margin, reduce LLAMA_PAGED_POOL_HEADROOM (now "
+                    "%.2f), or pass --paged-pool-clamp to shrink automatically.\n",
+                    __func__, params.n_ctx, n_seqs, n_gpu_blocks,
+                    n_gpu_blocks * (double) bytes_per_block / 1073741824.0,
+                    n_gpu_blocks_vram,
+                    n_gpu_blocks_vram * (double) bytes_per_block / 1073741824.0,
+                    fit_ctx, headroom);
+            // Fail LOUDLY rather than half-fit. Leaving the previous value here let the
+            // server start anyway on a request it had just declared impossible -- measured:
+            // -c 4000000 printed the refusal and then served. Zero trips the
+            // "n_gpu_blocks need to be greater than 0" assert in the paged cache init.
+            params.n_gpu_blocks = 0;
+            params.n_cpu_blocks = 0;
+            return;
+        }
+    }
     const uint32_t n_cpu_blocks = (uint32_t)(n_gpu_blocks * params.cpu_to_gpu_blocks_ratio);
 
     LOG_INF("%s: free_vram=%0.1f MiB, bytes_per_block=%ld, n_gpu_blocks=%d, n_cpu_blocks=%d\n",

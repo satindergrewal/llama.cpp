@@ -577,6 +577,10 @@ struct common_params {
     uint32_t n_cpu_blocks    = 1;
 
     float cpu_to_gpu_blocks_ratio = 0.25;
+    // When the requested context does not fit the memory budget: false = refuse with the
+    // largest n_ctx that would fit (matches how the static path behaves); true = shrink the
+    // pool and serve a smaller context with a warning.
+    bool  paged_pool_clamp = false;
     float kv_paged_watermark      = 0.05;  // percentage
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
