@@ -2610,8 +2610,8 @@ size_t ggml_metal_op_paged_attn_extra_mask(const ggml_tensor * op) {
     // mask + blk. blk is the champion's per-(head, q-block, kv-block) SKIP array, read
     // whenever has_mask is true. Binding a dummy for it meant garbage was interpreted as skip
     // flags and whole blocks vanished -- the kernel ran, wrote dst, and was quietly wrong.
-    const size_t mask_sz = GGML_PAD((size_t) n_tokens * n_kv * sizeof(ggml_fp16_t), 32);
     const int64_t n_heads_e = op->src[0]->ne[2];
+    const size_t mask_sz = GGML_PAD((size_t) n_heads_e * n_tokens * n_kv * sizeof(ggml_fp16_t), 32);
     const size_t blk_sz  = GGML_PAD((size_t) n_heads_e *
                                     ((n_tokens + OP_FLASH_ATTN_EXT_NQPSG - 1)/OP_FLASH_ATTN_EXT_NQPSG) *
                                     ((n_kv + OP_FLASH_ATTN_EXT_NCPSG - 1)/OP_FLASH_ATTN_EXT_NCPSG + 1), 32);
@@ -4758,7 +4758,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             ggml_metal_buffer_id bid_mask = ggml_metal_get_buffer_id(op);
             bid_mask.offs += ggml_nbytes(op);
             ggml_metal_buffer_id bid_blk = bid_mask;
-            bid_blk.offs += GGML_PAD((size_t) n_tokens * n_kv_c * sizeof(ggml_fp16_t), 32);
+            bid_blk.offs += GGML_PAD((size_t) n_heads * n_tokens * n_kv_c * sizeof(ggml_fp16_t), 32);
 
             {   // FILL the mask: causality + banded window + rel bias, so the champion's own
                 // tested masking code provides correctness rather than hand-rolled indexing.
@@ -4777,7 +4777,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
                 ggml_metal_encoder_set_buffer(enc, bid_blk, 8);
                 ggml_metal_encoder_dispatch_threadgroups(enc,
-                    (n_kv_c + 31)/32, n_tokens, 1, 32, 1, 1);
+                    (n_kv_c + 31)/32, n_tokens, n_heads, 32, 1, 1);
             }
 
             ggml_metal_kargs_flash_attn_ext fa = {};
@@ -4792,8 +4792,10 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             fa.nb11 = st*sizeof(ggml_fp16_t);  fa.nb21 = st*sizeof(ggml_fp16_t);
             fa.nb12 = sh*sizeof(ggml_fp16_t);  fa.nb22 = sh*sizeof(ggml_fp16_t);
             fa.nb13 = sb*sizeof(ggml_fp16_t);  fa.nb23 = sb*sizeof(ggml_fp16_t);  // BLOCK stride
-            fa.ne31 = n_tokens; fa.ne32 = 1; fa.ne33 = 1;
-            fa.nb31 = (uint64_t) n_kv_c*sizeof(ggml_fp16_t); fa.nb32 = 0; fa.nb33 = 0;
+            fa.ne31 = n_tokens; fa.ne32 = n_heads; fa.ne33 = 1;
+            fa.nb31 = (uint64_t) n_kv_c*sizeof(ggml_fp16_t);
+            fa.nb32 = (uint64_t) n_tokens*n_kv_c*sizeof(ggml_fp16_t);   // per-head mask plane
+            fa.nb33 = 0;
             fa.ne11 = n_kv_c;   // mask width; the port still bounds the walk on plen[0]
             // ★ dst index is ((iq1+j)*ne1 + iq2)*DV4 -- token-major, head within token -- so
             // ne1 is the HEAD COUNT, not the token count. Setting these the natural-looking way

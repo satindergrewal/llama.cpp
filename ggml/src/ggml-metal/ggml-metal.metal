@@ -12705,12 +12705,16 @@ kernel void kernel_paged_champ_mask(
         constant     int32_t & n_kv          [[buffer(6)]],
         device       float   * dst_sentinel  [[buffer(7)]],
         device       char    * blk_skip     [[buffer(8)]],
-        uint2 gid [[thread_position_in_grid]]) {
-    const int row = (int) gid.y;
-    const int col = (int) gid.x;
-    if (row >= args.n_tokens_total || col >= n_kv) {
+        uint3 gid [[thread_position_in_grid]]) {
+    const int row  = (int) gid.y;
+    const int col  = (int) gid.x;
+    const int head = (int) gid.z;
+    if (row >= args.n_tokens_total || col >= n_kv || head >= args.n_heads) {
         return;
     }
+    // Layout MUST match the champion's read: mask + (iq1+j)*nb31 + (iq2%ne32)*nb32,
+    // i.e. [head][row][col] with head stride nb32 = n_tokens*n_kv.
+    const uint64_t moff = (uint64_t) head*args.n_tokens_total*n_kv + (uint64_t) row*n_kv + col;
 
     // Which sequence owns this query row, and what absolute position is it?
     int seq = -1, i_local = 0;
@@ -12719,7 +12723,7 @@ kernel void kernel_paged_champ_mask(
         const int len = batch_lens[s];
         if (row >= off && row < off + len) { seq = s; i_local = row - off; break; }
     }
-    if (seq < 0) { mask[(uint64_t) row*n_kv + col] = (half) -MAXHALF; return; }
+    if (seq < 0) { mask[moff] = (half) -MAXHALF; return; }
 
     const int q_pos = (ctx_lens[seq] - batch_lens[seq]) + i_local;
 
@@ -12740,16 +12744,17 @@ kernel void kernel_paged_champ_mask(
     if (vis && args.rel_extent > 0) {
         const int rd = q_pos - col;
         if (rd >= 0 && rd < args.rel_extent) {
-            // head 0 only in this first cut -- the champion mask is not per-head here.
-            v = (half) rel[((uint64_t) row * args.n_heads) * args.rel_extent + rd];
+            // per-head now: rel is [token][head][rel_extent], matching the scalar path's
+            // ((gtok*n_heads + head_idx)*rel_extent + rd).
+            v = (half) rel[((uint64_t) row * args.n_heads + head) * args.rel_extent + rd];
         }
     }
 
-    mask[(uint64_t) row*n_kv + col] = v;
+    mask[moff] = v;
 
     // blk = the champion's per-block SKIP array, read whenever has_mask is true. 1 = process.
     // Leaving it as a dummy buffer let garbage act as skip flags and blocks silently vanished.
-    if (col < 64) {
+    if (col < 64 && head == 0) {
         blk_skip[(uint64_t) row*64 + col] = 1;
     }
 
