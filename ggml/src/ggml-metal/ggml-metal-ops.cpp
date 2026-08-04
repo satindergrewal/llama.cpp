@@ -4603,6 +4603,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.lpk               =*/ 0,   // set below, once nsg is final and before set_bytes
         /*.stage_v           =*/ 1,   // set below alongside lpk
         /*.mma_stage_k       =*/ 1,   // set below alongside lpk
+        /*.bs_fc             =*/ 1,   // set below alongside lpk
         /*.stride_token      =*/ kv_cache->nb[1] / sizeof(ggml_fp16_t),
         /*.stride_head       =*/ kv_cache->nb[2] / sizeof(ggml_fp16_t),
         /*.stride_block      =*/ kv_cache->nb[3] / sizeof(ggml_fp16_t),
@@ -4690,6 +4691,8 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     args.lpk     = use_lpk ? lpk_mode : 0;
     args.stage_v     = stage_v ? 1 : 0;
     args.mma_stage_k = mma_stg_k ? 1 : 0;
+    const bool bs_fc = !(getenv("DS4P_METAL_NO_BSFC") && atoi(getenv("DS4P_METAL_NO_BSFC")) != 0);
+    args.bs_fc       = bs_fc ? 1 : 0;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -4781,7 +4784,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 GGML_LOG_INFO("%s: DS4P-LPK ACTIVE (lane-per-key two-phase) D=%d bs=%d nsg=%d "
                               "TKP=%d%s VSTAGE=%s smem=%zu/%zu\n",
                               __func__, head_dim, bs_pa, (int) nsg, TKP,
-                              lpk_mode == 2 ? " UNPADDED" : "", stage_v ? "on" : "OFF", smem_lpk, smem_budget);
+                              lpk_mode == 2 ? " UNPADDED" : "", stage_v ? "on" : "OFF", bs_fc ? "on" : "OFF", smem_lpk, smem_budget);
             } else {
                 // State WHY, not just that it is off. A silent fallback is how a "PASS" once
                 // got reported for a path that never executed.

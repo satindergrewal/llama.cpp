@@ -1228,13 +1228,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn(ggml_
     // first caller baked in.
     const int32_t head_dim = (int32_t) op->src[0]->ne[0];
 
+    // ★ M3: block_size joins head_dim as a function constant. The LPK tile loop is bounded by
+    // bs, so a compile-time bs lets it unroll and makes TKP compile-time too. NOTE: bs-as-FC was
+    // tried once and recorded NEUTRAL (ornith 1941628) -- but that was measured PRE-LPK and on
+    // the sequential harness since shown to drift 29%. The condition that produced that negative
+    // no longer holds, which is the only reason this is being re-asked.
+    // The NAME must carry BOTH, or two block sizes would share one cached compilation and the
+    // constant would silently be whatever the first caller baked in.
+    const int32_t bs_fc = ((const int32_t *)((const float *) op->op_params + 1))[0];
+
     snprintf(base, 256, "kernel_paged_attn_f32");
-    snprintf(name, 256, "%s_d%d", base, head_dim);
+    snprintf(name, 256, "%s_d%d_bs%d", base, head_dim, bs_fc);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
         ggml_metal_cv_set_int32(cv, head_dim, FC_PAGED_ATTN + 0);
+        ggml_metal_cv_set_int32(cv, bs_fc,    FC_PAGED_ATTN + 1);
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
         ggml_metal_cv_free(cv);
     }

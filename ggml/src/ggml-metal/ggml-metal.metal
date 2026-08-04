@@ -2994,7 +2994,8 @@ kernel void kernel_paged_attn_write_f32(
 // indexed by a loop variable is only register-allocatable when D is compile-time -- with a
 // runtime D it becomes dynamic indexing into a register array and spills to thread-private
 // (device-backed) memory. One pipeline per head_dim; the host always supplies the value.
-constant int32_t FC_paged_attn_D [[function_constant(FC_PAGED_ATTN + 0)]];
+constant int32_t FC_paged_attn_D  [[function_constant(FC_PAGED_ATTN + 0)]];
+constant int32_t FC_paged_attn_BS [[function_constant(FC_PAGED_ATTN + 1)]];
 
 kernel void kernel_paged_attn_f32(
         constant ggml_metal_kargs_paged_attn & args,
@@ -3317,7 +3318,12 @@ kernel void kernel_paged_attn_f32(
         // per token, and threadgroup-uniform by construction (bounds derive from tgpig
         // only). Per-row trip counts inside a staged block may diverge -- proven safe
         // (arms E + packing arm), because no barrier lives inside the token loop.
-        const int bs     = args.block_size;
+        // Compile-time bs: args.block_size carries the same value and the host keys the
+        // pipeline name on it, so the two cannot diverge.
+        // One binary, two arms: args.bs_fc selects the COMPILE-TIME bs (the arm) or the
+        // runtime args.block_size (the control). Both carry the same value, so this is a pure
+        // one-factor test of specialisation and nothing else changes.
+        const int bs     = args.bs_fc ? FC_paged_attn_BS : args.block_size;
         const int gfirst = (int) tgpig[0] * args.nsg;
         const int glast  = min((int) (tgpig[0] + 1) * args.nsg, args.n_tokens_total) - 1;
 
