@@ -4640,7 +4640,22 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // The MMA tile needs its own (larger) allocation, computed by the SAME expression the
     // eligibility test used. Layout and allocation move together or not at all.
     const size_t smem_scal = smem_stage > smem_comb ? smem_stage : smem_comb;
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, use_mma ? mma_smem(mma_nsg, mma_sb) : smem_scal, 0);
+    // OCCUPANCY PROBE. The sb=2 arm widened the tile AND raised smem 21,632 -> 30,848, so it
+    // varied two things and cannot attribute its own 11% loss. Holding smem flat while
+    // widening is not possible -- width DRIVES the staged K/V -- so isolate from the other
+    // side: hold the tile completely fixed and inflate ONLY the allocation. The kernel's
+    // layout is untouched and the extra bytes are never addressed, so the sole difference is
+    // how many threadgroups stay resident per core.
+    //   pad=0     -> 21,632, the sb=1 tile
+    //   pad=9216  -> 30,848, the sb=2 FOOTPRINT with the sb=1 TILE
+    // If the padded arm lands near sb=2's 2,561 the loss is occupancy; if it stays near
+    // sb=1's 2,298 the loss is the width itself. One factor either way.
+    size_t smem_use = use_mma ? mma_smem(mma_nsg, mma_sb) : smem_scal;
+    if (const char * e = getenv("DS4P_METAL_SMEM_PAD")) {
+        const size_t pad = (size_t) atol(e);
+        if (smem_use + pad <= smem_budget) { smem_use += pad; }
+    }
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_use, 0);
 
     // PRESENCE MARKER. A float arm once reported "ALL PASSED" while the fallback silently
     // ran because the tile had quietly exceeded the smem limit -- so which path executed is
@@ -4657,9 +4672,10 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         if (key != last_key) {
             last_key = key;
             if (use_mma) {
-                GGML_LOG_INFO("%s: DS4P-MMA ACTIVE  D=%d bs=%d sb=%d KT=%d nsg=%d QR=%d smem=%zu/%zu\n",
+                const char * pe = getenv("DS4P_METAL_SMEM_PAD");
+                GGML_LOG_INFO("%s: DS4P-MMA ACTIVE  D=%d bs=%d sb=%d KT=%d nsg=%d QR=%d smem=%zu(+pad %s)/%zu\n",
                               __func__, head_dim, bs_pa, mma_sb, mma_sb*bs_pa, mma_nsg,
-                              8*mma_nsg, mma_smem(mma_nsg, mma_sb), smem_budget);
+                              8*mma_nsg, mma_smem(mma_nsg, mma_sb), pe ? pe : "0", smem_budget);
             } else {
                 GGML_LOG_INFO("%s: DS4P-MMA OFF (scalar path) D=%d bs=%d n_tokens=%d\n",
                               __func__, head_dim, bs_pa, n_tokens);
