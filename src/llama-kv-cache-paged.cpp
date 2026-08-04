@@ -11,6 +11,38 @@
 // llama_kv_cache_paged
 //
 
+
+// KV pool fill value. 0 normally; 0xFF under DS4P_KV_POISON, which makes every fp16 a NaN so
+// that ANY read of an unwritten block turns the output to NaN and fails loudly.
+//
+// PROVEN INVARIANT (keep this probe -- it is how the invariant was established): nothing ever
+// reads an unwritten KV block. Filling all four pools with NaN left the server's output sha
+// BIT-IDENTICAL to the zeroed control (8cb6c8212e both ways), with 4 markers proving the fill
+// ran and 0 in the control. The scalar path bounds its token loop rather than reading and then
+// masking, so unwritten positions are never visited at all.
+//
+// The marker is NOT optional. Getting here took three tries: the first patched only two of the
+// four clear sites and the test used a third; the second used LLAMA_LOG_INFO, which is off in a
+// bare test binary; and test-paged-vs-cpu turned out never to construct a paged cache at all,
+// so it could not answer the question in principle. Each failure looked exactly like "ALL
+// PASSED".
+//
+// ⚠ REFUTED, do not retry blind: skipping the clear does NOT make the pool lazily committed.
+// Measured RSS 58.67 GB with the clear skipped vs 58.68 GB with it, on a deliberately huge
+// 20x-headroom pool. The residency path (rset addAllocation + requestResidency in
+// ggml-metal-device.m) wires the buffer regardless of whether anything touches it, so
+// kvcached-style lazy commit on Metal needs sparse/placement MTLHeap, not a missing memset.
+static uint8_t ds4p_kv_fill(const char * where) {
+    if (getenv("DS4P_KV_POISON") == nullptr) {
+        return 0;
+    }
+    // fprintf, not LLAMA_LOG_INFO: the llama logger may be disabled in a bare test binary,
+    // and a marker that depends on log configuration is a marker that can lie by omission --
+    // which is exactly how the first two attempts at this probe reported nothing.
+    fprintf(stderr, "DS4P-KV-POISON: filling %s with 0xFF (every fp16 = NaN)\n", where);
+    return 0xFF;
+}
+
 llama_kv_cache_paged::llama_kv_cache_paged(uint32_t head_dim,
                                            uint32_t n_heads_kv,
                                            uint32_t block_size,
@@ -86,7 +118,7 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
 
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
         GGML_ASSERT(buf && "Failed to allocate paged KV buffer on a device");
-        ggml_backend_buffer_clear(buf, 0);
+        ggml_backend_buffer_clear(buf, ds4p_kv_fill("multi-device GPU pool"));
 
         LLAMA_LOG_INFO("%s:   device %s holds %zu layer(s), %.2f MiB\n", __func__,
                        ggml_backend_name(be), n_here,
@@ -114,7 +146,7 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
     }
     ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
     GGML_ASSERT(buf_cpu && "Failed to allocate CPU KV cache buffer");
-    ggml_backend_buffer_clear(buf_cpu, 0);
+    ggml_backend_buffer_clear(buf_cpu, ds4p_kv_fill("CPU pool (A)"));
     for (uint32_t il = 0; il < n_layers; ++il) {
         GGML_ASSERT(kv_cpu_layers[il]->buffer && "CPU layer tensor has null buffer");
     }
@@ -170,7 +202,11 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     // Allocate on GPU backend
     ggml_backend_buffer_t buf_gpu = ggml_backend_alloc_ctx_tensors(ctx_gpu, backend_gpu);
     GGML_ASSERT(buf_gpu && "Failed to allocate GPU KV cache buffer");
-    ggml_backend_buffer_clear(buf_gpu, 0);  // zero out the cache
+    // POISON PROBE (DS4P_KV_POISON): fill with 0xFF so every fp16 is NaN. If nothing ever
+    // reads an unwritten block, results are unchanged and the gates still pass -- which is
+    // the premise that makes deferring this clear (and thus lazy commit) safe. If something
+    // does read one, everything turns NaN and the gate fails LOUDLY instead of silently.
+    ggml_backend_buffer_clear(buf_gpu, ds4p_kv_fill("single-device GPU pool"));
     for (uint32_t il = 0; il < n_layers; ++il) {
         GGML_ASSERT(kv_gpu_layers[il]->buffer && "GPU layer tensor has null buffer");
     }
@@ -192,7 +228,7 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     // Allocate on the CPU backend (using pinned memory for faster PCIe transfer)
     ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
     GGML_ASSERT(buf_cpu && "Failed to allocate CPU KV cache buffer");
-    ggml_backend_buffer_clear(buf_cpu, 0);  // zero out the cache
+    ggml_backend_buffer_clear(buf_cpu, ds4p_kv_fill("CPU pool (B)"));
     for (uint32_t il = 0; il < n_layers; ++il) {
         GGML_ASSERT(kv_cpu_layers[il]->buffer && "CPU layer tensor has null buffer");
     }
