@@ -465,6 +465,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_pool_2d(ctx, idx);
             } break;
+        case GGML_OP_PAGED_ATTN:
+            {
+                n_fuse = ggml_metal_op_paged_attn(ctx, idx);
+            } break;
         case GGML_OP_ARGMAX:
             {
                 n_fuse = ggml_metal_op_argmax(ctx, idx);
@@ -4470,6 +4474,94 @@ int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne00, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q        = op->src[0];
+    const ggml_tensor * k_new    = op->src[1];
+    const ggml_tensor * kv_cache = op->src[3];
+    const ggml_tensor * btab     = op->src[5];
+    const ggml_tensor * clens    = op->src[7];
+    const ggml_tensor * boffs    = op->src[8];
+    const ggml_tensor * blens    = op->src[9];
+    const ggml_tensor * rel      = op->src[10];
+
+    const float * op_params_f = (const float *) op->op_params;
+
+    int64_t rel_extent = 0, vis_window = 0;
+    memcpy(&rel_extent, &op->op_params[4], sizeof(rel_extent));
+    memcpy(&vis_window, &op->op_params[6], sizeof(vis_window));
+
+    const int head_dim   = (int) q->ne[0];
+    const int n_heads    = (int) q->ne[1];
+    const int n_tokens   = (int) q->ne[2];
+    const int n_heads_kv = (int) k_new->ne[1];
+
+    ggml_metal_kargs_paged_attn args = {
+        /*.head_dim          =*/ head_dim,
+        /*.n_heads           =*/ n_heads,
+        /*.n_heads_kv        =*/ n_heads_kv,
+        /*.n_seq             =*/ (int) blens->ne[0],
+        /*.block_size        =*/ ((const int32_t *)(op_params_f + 1))[0],
+        /*.max_blocks        =*/ ((const int32_t *)(op_params_f + 2))[0],
+        /*.scale             =*/ op_params_f[0],
+        /*.rel_extent        =*/ rel ? (int32_t) rel_extent : 0,
+        /*.visibility_window =*/ (int32_t) vis_window,
+        /*.stride_token      =*/ kv_cache->nb[1] / sizeof(ggml_fp16_t),
+        /*.stride_head       =*/ kv_cache->nb[2] / sizeof(ggml_fp16_t),
+        /*.stride_block      =*/ kv_cache->nb[3] / sizeof(ggml_fp16_t),
+    };
+
+    // WRITE PHASE FIRST -- k_new/v_new into the cache at write_slots. Omitting this left
+    // the cache zeroed and every harness case reported nmse == 1.000 (all-zero output).
+    // Separate dispatch, not a barrier inside one kernel: threadgroup ordering across a
+    // grid is not guaranteed, so the write must complete as its own encoded pass.
+    {
+        auto wpipe = ggml_metal_library_get_pipeline_paged_attn_write(lib, op);
+        int wnth = 32;
+        while (wnth < head_dim) { wnth *= 2; }
+        ggml_metal_encoder_set_pipeline(enc, wpipe);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);  // k_new
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 2);  // v_new
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache),   3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[6]), 4);  // write_slots
+        ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, n_heads_kv, 1, wnth, 1, 1);
+
+        // The attend pass READS what this pass WROTE. Consecutive dispatches in one
+        // encoder may run concurrently, so without this barrier the attention can read a
+        // stale cache -- which is what a single narrow failure among identically shaped
+        // cases looks like (D=64 case C at 7.06e-03 while the other 11 sat at ~1 ULP).
+        ggml_metal_encoder_memory_barrier(enc);
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_paged_attn(lib, op);
+
+    // one thread per head_dim element, rounded up to a power of two for the reduction
+    int nth = 32;
+    while (nth < head_dim) { nth *= 2; }
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(btab),     3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(clens),    4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(boffs),    5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(blens),    6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rel ? rel : q), 7);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),       8);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, nth*sizeof(float), 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, n_heads, 1, nth, 1, 1);
 
     return 1;
 }

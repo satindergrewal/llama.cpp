@@ -2947,6 +2947,131 @@ kernel void kernel_solve_tri_f32(
     }
 }
 
+// Paged attention WRITE phase: k_new/v_new -> kv_cache at write_slots. The CPU
+// reference does this before attending; omitting it left the cache zeroed and the
+// harness reported nmse == 1.000 on every case (the signature of an all-zero output).
+// grid: (n_tokens_total, n_heads_kv, 1); threadgroup: head_dim threads.
+kernel void kernel_paged_attn_write_f32(
+        constant ggml_metal_kargs_paged_attn & args,
+        device const float   * k_new       [[buffer(1)]],
+        device const float   * v_new       [[buffer(2)]],
+        device       half    * kv_cache    [[buffer(3)]],
+        device const int32_t * write_slots [[buffer(4)]],
+        uint3  tgpig  [[threadgroup_position_in_grid]],
+        uint3  tpitg3 [[thread_position_in_threadgroup]]) {
+    const int D    = args.head_dim;
+    const int d    = (int) tpitg3[0];
+    if (d >= D) { return; }
+
+    const int gtok = (int) tgpig[0];
+    const int h    = (int) tgpig[1];
+
+    const int slot           = write_slots[gtok];
+    const int block_id       = slot / args.block_size;
+    const int token_in_block = slot % args.block_size;
+
+    const uint64_t base = (uint64_t) block_id * args.stride_block
+                        + (uint64_t) token_in_block * args.stride_token;
+    const uint64_t in   = (uint64_t) gtok * args.n_heads_kv * D + (uint64_t) h * D;
+
+    kv_cache[base + (uint64_t) h * args.stride_head + d]                        = (half) k_new[in + d];
+    kv_cache[base + (uint64_t) (args.n_heads_kv + h) * args.stride_head + d]    = (half) v_new[in + d];
+}
+
+// ---------------------------------------------------------------------------
+// Paged attention (GGML_OP_PAGED_ATTN) -- SCALAR port of the CPU reference in
+// ggml-cpu/ops.cpp:12101. Functionality before performance: before this, --kv-paged
+// could not run the op on Metal AT ALL (absence, not a slow fallback), so a correct
+// scalar kernel strictly dominates. The simdgroup_matrix fast path is a separate job.
+// Gate: tests/test-paged-vs-cpu.cpp, which compares this against the CPU impl of the
+// same op and needs no CUDA-only reference.
+//
+// grid: (n_tokens_total, n_heads, 1); threadgroup: head_dim threads (one per dim).
+kernel void kernel_paged_attn_f32(
+        constant ggml_metal_kargs_paged_attn & args,
+        device const float   * q             [[buffer(1)]],
+        device const half    * kv_cache      [[buffer(2)]],
+        device const int32_t * block_table   [[buffer(3)]],
+        device const int32_t * ctx_lens      [[buffer(4)]],
+        device const int32_t * batch_offsets [[buffer(5)]],
+        device const int32_t * batch_lens    [[buffer(6)]],
+        device const float   * rel           [[buffer(7)]],
+        device       float   * dst           [[buffer(8)]],
+        threadgroup float    * shmem         [[threadgroup(0)]],
+        // MSL requires every built-in position input to be all-scalar or all-vector of
+        // the SAME width; mixing uint3 with uint fails the whole library, not just this
+        // kernel (a bad shader takes the entire Metal backend down with it).
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  tpitg3 [[thread_position_in_threadgroup]],
+        uint3  ntg3   [[threads_per_threadgroup]]) {
+    const uint tpitg = tpitg3[0];
+    const uint ntg   = ntg3[0];
+
+    const int D        = args.head_dim;
+    const int head_idx = (int) tgpig[1];
+    const int gtok     = (int) tgpig[0];
+
+    int seq = -1, i_local = 0;
+    for (int s = 0; s < args.n_seq; ++s) {
+        const int off = batch_offsets[s];
+        const int len = batch_lens[s];
+        if (gtok >= off && gtok < off + len) { seq = s; i_local = gtok - off; break; }
+    }
+    if (seq < 0) { return; }
+
+    const int num_new = batch_lens[seq];
+    const int kv_h    = head_idx / (args.n_heads / args.n_heads_kv);
+    const int q_pos   = (ctx_lens[seq] - num_new) + i_local;
+    const int n_tok   = q_pos + 1;
+    const int lo      = args.visibility_window > 0
+                      ? max(0, q_pos - args.visibility_window + 1) : 0;
+
+    const uint64_t q_off = (uint64_t) gtok * args.n_heads * D + (uint64_t) head_idx * D;
+    const int d = (int) tpitg;
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+    float acc = 0.0f;
+
+    for (int tok = lo; tok < n_tok; ++tok) {
+        const int pb = block_table[seq * args.max_blocks + tok / args.block_size];
+        const uint64_t b = (uint64_t) (tok % args.block_size) * args.stride_token
+                         + (uint64_t) pb * args.stride_block;
+
+        float part = 0.0f;
+        if (d < D) {
+            part = q[q_off + d] * (float) kv_cache[b + (uint64_t) kv_h * args.stride_head + d];
+        }
+        shmem[tpitg] = part;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ntg / 2; stride > 0; stride >>= 1) {
+            if (tpitg < stride) { shmem[tpitg] += shmem[tpitg + stride]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float sc = shmem[0] * args.scale;
+
+        const int rd = q_pos - tok;
+        if (args.rel_extent > 0 && rd < args.rel_extent) {
+            sc += rel[((uint64_t) gtok * args.n_heads + head_idx) * args.rel_extent + rd];
+        }
+
+        const float m_new = max(m_i, sc);
+        const float resc  = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
+        const float pv    = exp(sc - m_new);
+        l_i = l_i * resc + pv;
+        if (d < D) {
+            acc = acc * resc
+                + pv * (float) kv_cache[b + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head + d];
+        }
+        m_i = m_new;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (d < D) {
+        dst[q_off + d] = acc / (l_i + 1e-6f);
+    }
+}
+
 kernel void kernel_argmax_f32(
         constant ggml_metal_kargs_argmax & args,
         device   const char * src0,

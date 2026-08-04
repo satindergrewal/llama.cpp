@@ -1200,6 +1200,43 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax(ggml_meta
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_write(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_PAGED_ATTN);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_paged_attn_write_f32");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+    res.smem = 0;
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_PAGED_ATTN);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_paged_attn_f32");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    // one float per thread for the QK dot reduction
+    res.smem = 1024*sizeof(float);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_ARGSORT);
 

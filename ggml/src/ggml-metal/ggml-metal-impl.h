@@ -1215,6 +1215,21 @@ typedef struct {
 } ggml_metal_kargs_argmax;
 
 typedef struct {
+    int32_t  head_dim;
+    int32_t  n_heads;
+    int32_t  n_heads_kv;
+    int32_t  n_seq;
+    int32_t  block_size;
+    int32_t  max_blocks;
+    float    scale;
+    int32_t  rel_extent;        // 0 = no rel bias
+    int32_t  visibility_window; // 0 = unbanded
+    uint64_t stride_token;      // in halves
+    uint64_t stride_head;
+    uint64_t stride_block;
+} ggml_metal_kargs_paged_attn;
+
+typedef struct {
     int64_t  np;
 } ggml_metal_kargs_opt_step_adamw;
 
