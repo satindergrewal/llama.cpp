@@ -2009,6 +2009,14 @@ private:
             // generation counter never runs for paged slots; a reused slot would otherwise
             // inherit the previous task's n_decoded and hit "stopped by limit" early
             slot.n_decoded = 0;
+
+            // ...and the SAME site zeroes the prompt counter, which I missed. Measured: a
+            // 2,023-token request followed by a 4,023-token one reported prompt_n = 6,046,
+            // so every paged response after the first has been quoting a prompt-eval rate
+            // computed from a token count that includes previous tasks. Found because the
+            // P1-5 economics gate consumes this number and produced an estimate half the
+            // size it should have been.
+            slot.n_prompt_tokens_processed = 0;
             SLT_INF(slot, "paged: request registered (%zu tokens)\n", toks.size());
         }
 

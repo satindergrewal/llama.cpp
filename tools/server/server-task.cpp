@@ -1838,9 +1838,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     // P1-5: on a RAM miss, probe the disk bank; an admitted entry joins `states` and is
     // used exactly like a RAM hit (P0-2 identity checked inside probe; entry arrives
     // unsealed). Tail beyond the stored prefix replays through the normal prompt path.
+    // P1-5 economics: time the ENTIRE admit -- probe read, entry rebuild, and the state
+    // upload below -- because that whole span is what a warm request pays and what the gate
+    // has to weigh against a prefill. t_admit_start < 0 means this was not a bank admit.
+    int64_t t_admit_start = -1;
+    size_t  admit_bytes   = 0;
+
     if (it_best == states.end() && server_kv_bank::instance().active()) {
+        const int64_t t0 = ggml_time_us();
         server_prompt_cache_state banked;
         if (server_kv_bank::instance().probe(tokens_new, build_identity(ctx_tgt), banked)) {
+            t_admit_start = t0;
+            admit_bytes   = banked.data.main.size() + banked.data.drft.size();
             states.push_back(std::move(banked));
             it_best = std::prev(states.end());
         }
@@ -1916,6 +1925,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
+
+        if (t_admit_start >= 0) {
+            server_kv_bank::instance().note_restore(admit_bytes,
+                                                    (ggml_time_us() - t_admit_start) / 1000.0);
+        }
     }
 
     return true;

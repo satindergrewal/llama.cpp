@@ -268,9 +268,9 @@ bool server_kv_bank::probe(const server_tokens & tokens_new, const std::string &
         const bool   forced = force != nullptr && atoi(force) != 0;
 
         struct stat sb;
-        if (!forced && ewma_read_mib_per_ms > 0.0 && ewma_prefill_ms_per_tok > 0.0 &&
+        if (!forced && ewma_restore_mib_per_ms > 0.0 && ewma_prefill_ms_per_tok > 0.0 &&
             stat(best_path.c_str(), &sb) == 0) {
-            const double restore_ms = ((double) sb.st_size / (1024.0 * 1024.0)) / ewma_read_mib_per_ms;
+            const double restore_ms = ((double) sb.st_size / (1024.0 * 1024.0)) / ewma_restore_mib_per_ms;
             const double prefill_ms = (double) best_lcp * ewma_prefill_ms_per_tok;
 
             if (restore_ms >= prefill_ms) {
@@ -283,8 +283,6 @@ bool server_kv_bank::probe(const server_tokens & tokens_new, const std::string &
             }
         }
     }
-
-    const int64_t t_read_start = ggml_time_us();
 
     // rebuild the entry
     FILE * f = fopen(best_path.c_str(), "rb");
@@ -329,18 +327,10 @@ bool server_kv_bank::probe(const server_tokens & tokens_new, const std::string &
         }
     }
 
-    // measured read bandwidth feeds the gate above -- the estimate a later request is
-    // declined on is this request's own observation, not a constant anybody chose
-    {
-        const double ms  = (ggml_time_us() - t_read_start) / 1000.0;
-        const double mib = (double) (out.data.main.size() + out.data.drft.size()) / (1024.0 * 1024.0);
-        if (ms > 0.0 && mib > 0.0) {
-            const double rate = mib / ms;
-            ewma_read_mib_per_ms = ewma_read_mib_per_ms > 0.0
-                ? 0.7 * ewma_read_mib_per_ms + 0.3 * rate
-                : rate;
-        }
-    }
+    // NOTE: the rate the gate decides on is NOT measured here. Timing this function alone
+    // captures the fread and nothing else -- it reported 711 ms for a restore that cost
+    // ~2,485 ms once the entry rebuild and the state upload were counted. The CALLER times
+    // the whole admit and reports it through note_restore().
 
     n_admitted++;
     SRV_INF(" - kv-bank: admitted %s (lcp = %zu of %zu new tokens, %.3f MiB, admits = %llu)\n",
@@ -362,5 +352,21 @@ void server_kv_bank::note_prefill(size_t n_tokens, double ms) {
 
     ewma_prefill_ms_per_tok = ewma_prefill_ms_per_tok > 0.0
         ? 0.7 * ewma_prefill_ms_per_tok + 0.3 * rate
+        : rate;
+}
+
+// The restore rate the gate decides on. Measured by the CALLER across the whole admit --
+// probe read, entry rebuild and state upload -- because timing the fread alone reported
+// 711 ms for a restore that actually cost ~2,485 ms end to end.
+void server_kv_bank::note_restore(size_t bytes, double ms) {
+    const double mib = (double) bytes / (1024.0 * 1024.0);
+    if (ms <= 0.0 || mib <= 0.0) {
+        return;
+    }
+
+    const double rate = mib / ms;
+
+    ewma_restore_mib_per_ms = ewma_restore_mib_per_ms > 0.0
+        ? 0.7 * ewma_restore_mib_per_ms + 0.3 * rate
         : rate;
 }

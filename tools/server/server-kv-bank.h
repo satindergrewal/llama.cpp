@@ -48,6 +48,14 @@ class server_kv_bank {
     // the estimator learning from the very thing it is deciding about.
     void note_prefill(size_t n_tokens, double ms);
 
+    // The COMPLETE cost of turning a bank file into live KV, measured by the caller: the
+    // read, the 1.6 GB of buffer the entry is rebuilt into, and llama_state_seq_set_data's
+    // upload. Timing only the fread understated it by ~2.6x and would have had the gate
+    // admitting restores it should decline -- a confident wrong answer, which is worse than
+    // the honest bootstrap.
+    void note_restore(size_t bytes, double ms);
+    bool bank_rate_known() const { return ewma_restore_mib_per_ms > 0.0; }
+
   private:
     server_kv_bank();
 
@@ -62,5 +70,5 @@ class server_kv_bank {
 
     // 0 = never measured; until both sides are known the bank admits and learns from it
     double ewma_prefill_ms_per_tok = 0.0;
-    double ewma_read_mib_per_ms    = 0.0;
+    double ewma_restore_mib_per_ms = 0.0;
 };
