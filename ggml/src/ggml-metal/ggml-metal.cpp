@@ -220,6 +220,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
                 res += ggml_metal_op_mul_mat_id_extra_ids(tensor);
             } break;
+        case GGML_OP_PAGED_ATTN:
+            {
+                res += ggml_metal_op_paged_attn_extra_mask(tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 res += ggml_metal_op_flash_attn_ext_extra_pad(tensor);

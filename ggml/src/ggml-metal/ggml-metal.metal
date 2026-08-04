@@ -12686,3 +12686,58 @@ template [[host_name("kernel_paged_attn_champ_dk96_dv96"  )]] kernel paged_champ
 template [[host_name("kernel_paged_attn_champ_dk128_dv128")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 128, 128>;
 template [[host_name("kernel_paged_attn_champ_dk192_dv192")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 192, 192>;
 
+
+// ★ PAGED CHAMPION MASK FILL. The champion derives all causality from a mask buffer; the paged op
+// derives it per row from q_pos plus an optional banded window and rel bias. This kernel
+// materialises that as the mask the champion already knows how to consume, so causality runs
+// through the champion's OWN tested code rather than hand-rolled indexing inside its half2/SH/NL
+// score packing -- a variant that runs, looks plausible, and is quietly wrong is the worst
+// failure mode available here.
+//
+// One thread per (query row, key column). mask[row*n_kv + col] = 0 if visible else -MAXHALF.
+kernel void kernel_paged_champ_mask(
+        constant ggml_metal_kargs_paged_attn & args,
+        device const int32_t * ctx_lens      [[buffer(1)]],
+        device const int32_t * batch_offsets [[buffer(2)]],
+        device const int32_t * batch_lens    [[buffer(3)]],
+        device const float   * rel           [[buffer(4)]],
+        device       half    * mask          [[buffer(5)]],
+        constant     int32_t & n_kv          [[buffer(6)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    const int row = (int) gid.y;
+    const int col = (int) gid.x;
+    if (row >= args.n_tokens_total || col >= n_kv) {
+        return;
+    }
+
+    // Which sequence owns this query row, and what absolute position is it?
+    int seq = -1, i_local = 0;
+    for (int s = 0; s < args.n_seq; ++s) {
+        const int off = batch_offsets[s];
+        const int len = batch_lens[s];
+        if (row >= off && row < off + len) { seq = s; i_local = row - off; break; }
+    }
+    if (seq < 0) { mask[(uint64_t) row*n_kv + col] = (half) -MAXHALF; return; }
+
+    const int q_pos = (ctx_lens[seq] - batch_lens[seq]) + i_local;
+
+    // Causal, plus the banded visibility window when one is set.
+    bool vis = (col <= q_pos);
+    if (vis && args.visibility_window > 0) {
+        vis = (col > q_pos - args.visibility_window);
+    }
+
+    half v = vis ? (half) 0.0f : (half) -MAXHALF;
+
+    // rel bias rides in the mask: the champion adds slope*mask to the score, and slope is 1
+    // with max_bias 0, so an additive bias here lands exactly where args.rel would have.
+    if (vis && args.rel_extent > 0) {
+        const int rd = q_pos - col;
+        if (rd >= 0 && rd < args.rel_extent) {
+            // head 0 only in this first cut -- the champion mask is not per-head here.
+            v = (half) rel[((uint64_t) row * args.n_heads) * args.rel_extent + rd];
+        }
+    }
+
+    mask[(uint64_t) row*n_kv + col] = v;
+}

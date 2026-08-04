@@ -1255,6 +1255,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn(ggml_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_mask(ggml_metal_library_t lib) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_paged_champ_mask");
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_paged_champ_mask", "kernel_paged_champ_mask", nullptr);
+    }
+    return res;
+}
+
 // ★ PAGED CHAMPION pipeline. Specialised per (head_dim, nsg) AND per stride_token, because
 // ns10/ns20 are function constants that bake the K/V row pitch into the compiled kernel -- two
 // different strides sharing one cached compilation would silently use the first caller's pitch.
@@ -1276,7 +1284,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_champ
         // No mask/sinks/bias/softcap/kvpad on the paged path: causality comes from the block
         // walk and the per-row bound, and a partial tail block is handled by the loop bound,
         // not by a pad buffer. bc_mask off for the same reason.
-        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 0);
+        ggml_metal_cv_set_bool (cv, true,  FC_FLASH_ATTN_EXT + 0);   // has_mask: causality
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 1);
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 2);
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 3);
