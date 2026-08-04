@@ -4507,7 +4507,41 @@ int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// ★ AUDIT #2245 FINDING 4: several DS4P_* flags change behaviour with NO marker. A stale env var
+// in a shell silently alters a gate result -- this lane already VOIDED an entire scalar nsg sweep
+// to exactly that (DS4P_METAL_NSG set the dispatch width but not args.nsg). Fixing the CLASS:
+// dump every DS4P_* that is set, once, so no run can be misread later. Costs one line per process.
+static void ds4p_dump_env_once() {
+    static bool done = false;
+    if (done) { return; }
+    done = true;
+
+    static const char * keys[] = {
+        "DS4P_METAL_CHAMP", "DS4P_METAL_LPK", "DS4P_METAL_MMA", "DS4P_METAL_NO_MMA",
+        "DS4P_METAL_NSG", "DS4P_METAL_SB", "DS4P_METAL_SMEM_PAD", "DS4P_METAL_NO_SGBAR",
+        "DS4P_METAL_NOSTAGE_V", "DS4P_METAL_MMA_NOSTAGE_K", "DS4P_METAL_NO_BSFC",
+        "DS4P_CHAMP_NSG", "DS4P_CHAMP_SMEM_FULL", "DS4P_CHAMP_MASK_OPEN",
+        "DS4P_DUMP_BT", "DS4P_KV_POISON", "DS4P_PAGED_HYBRID", "DS4P_PREFILL_QUANTUM",
+    };
+
+    char buf[1024]; int off = 0; int n = 0;
+    for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); ++i) {
+        const char * v = getenv(keys[i]);
+        if (v && *v) {
+            off += snprintf(buf + off, sizeof(buf) - off, "%s%s=%s", n ? " " : "", keys[i], v);
+            ++n;
+            if (off >= (int) sizeof(buf) - 64) { break; }
+        }
+    }
+    if (n > 0) {
+        GGML_LOG_INFO("%s: DS4P-ENV %d set: %s\n", __func__, n, buf);
+    } else {
+        GGML_LOG_INFO("%s: DS4P-ENV none set (clean run)\n", __func__);
+    }
+}
+
 int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
+    ds4p_dump_env_once();
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
