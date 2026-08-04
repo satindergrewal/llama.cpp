@@ -1227,6 +1227,7 @@ typedef struct {
     int32_t  q_parallel;
     int32_t  n_tokens_total;
     int32_t  nsg;
+    int32_t  use_mma;           // 1 = take the simdgroup-matrix prefill path
     uint64_t stride_token;      // in halves
     uint64_t stride_head;
     uint64_t stride_block;

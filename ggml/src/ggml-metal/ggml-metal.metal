@@ -3009,6 +3009,188 @@ kernel void kernel_paged_attn_f32(
 
     const int D        = args.head_dim;
     const int head_idx = (int) tgpig[1];
+
+    // ================= MMA PREFILL PATH (args.use_mma) =================
+    // Separate branch on purpose: the scalar path below stays authoritative, so a defect
+    // here cannot regress it. The host only sets use_mma when the tile provably fits
+    // threadgroup memory (ggml_metal_op_paged_attn computes the SAME expression), and
+    // `args.use_mma` is threadgroup-uniform, so this early return is uniform too.
+    //
+    // Contract measured in ornith tools/ds4-gates/sgload_probe (gates 6/6, 9/9, 12/12):
+    //   simdgroup_load(frag, src, pitch) => frag[r][c] = src[r*pitch + c]; load and store
+    //   pitches are INDEPENDENT; the fragment element type must MATCH the source pointer
+    //   type; ACCUMULATORS must be float (half Q.K cost 2.4e-02 and scaled with D); and P
+    //   must be float (half P compounds along the online rescale chain).
+    // Architecture credit: ggml's Metal flash-attention kernel (kernel_flash_attn_ext),
+    // Georgi Gerganov and the ggml contributors -- in particular that the O accumulator
+    // lives in threadgroup memory and is rescaled by scalar threads, because there is no
+    // per-row scale on a simdgroup_matrix.
+    if (args.use_mma) {
+        const uint tid  = tpitg3[0];
+        const uint nsgm = ntg / 32;
+        const uint sgm  = tid / 32;
+        const uint lnm  = tid % 32;
+
+        const uint QR = 8 * nsgm;          // query rows owned by this threadgroup
+        const int  bs = args.block_size;
+        const uint SH = (uint) bs;         // score-tile row stride  (its OWN stride)
+        const uint PV = (uint) D;          // O accumulator stride   (its OWN stride)
+
+        threadgroup half  * tk = (threadgroup half *) shmem;
+        threadgroup half  * tv = tk + bs*D;
+        threadgroup half  * sq = tv + bs*D;
+        threadgroup float * ss = (threadgroup float *) (sq + QR*D);
+        threadgroup float * sp = ss + QR*SH;
+        threadgroup float * so = sp + QR*SH;
+        threadgroup float * Mr = so + QR*PV;
+        threadgroup float * Sr = Mr + QR;
+
+        const int qbase = (int) tgpig[0] * (int) QR;
+
+        // Which sequence owns the first and last row of this pack? Uniform (tgpig only).
+        const int glast_c = min(qbase + (int) QR, args.n_tokens_total) - 1;
+        int seq_f = -1, seq_l = -1;
+        for (int s2 = 0; s2 < args.n_seq; ++s2) {
+            const int off = batch_offsets[s2];
+            const int len = batch_lens[s2];
+            if (qbase   >= off && qbase   < off + len) { seq_f = s2; }
+            if (glast_c >= off && glast_c < off + len) { seq_l = s2; }
+        }
+        // CROSS-SEQ PACK: rows need different block tables, so a shared staged tile would be
+        // wrong. Fall through to the scalar path, which already handles it per row.
+        if (seq_f >= 0 && seq_f == seq_l) {
+            const int seq   = seq_l;
+            const int kv_h  = head_idx / (args.n_heads / args.n_heads_kv);
+            const int ctx0  = ctx_lens[seq] - batch_lens[seq];   // pos of this batch's tok 0
+            const int off_s = batch_offsets[seq];
+
+            for (uint i = tid; i < QR*PV; i += ntg) { so[i] = 0.0f; }
+            for (uint i = tid; i < QR;    i += ntg) { Mr[i] = -INFINITY; Sr[i] = 0.0f; }
+
+            // Stage Q. Device Q is HEAD-INTERLEAVED (row stride n_heads*D); sq is packed
+            // (row stride D). Gathering here is what makes the fragment pitch D correct --
+            // passing the wrong one of those two is the bug that cost fifteen arms.
+            for (uint i = tid; i < QR*D; i += ntg) {
+                const uint r = i / (uint) D, d = i % (uint) D;
+                const int  qg = qbase + (int) r;
+                sq[i] = (qg < args.n_tokens_total)
+                      ? (half) q[((uint64_t) qg * args.n_heads + head_idx) * D + d]
+                      : (half) 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Highest key position any row in this pack can see -> block count. Uniform.
+            const int q_hi  = ctx0 + (glast_c - off_s);
+            const int nblk  = (q_hi + 1 + bs - 1) / bs;
+
+            for (int bi = 0; bi < nblk; ++bi) {
+                const int pb = block_table[seq * args.max_blocks + bi];
+                const uint64_t kb = (uint64_t) pb * args.stride_block
+                                  + (uint64_t) kv_h * args.stride_head;
+                const uint64_t vb = (uint64_t) pb * args.stride_block
+                                  + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head;
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);   // prev iter's readers
+                for (uint idx = tid; idx < (uint)(bs*D); idx += ntg) {
+                    const uint t = idx / (uint) D, d2 = idx % (uint) D;
+                    tk[idx] = kv_cache[kb + (uint64_t) t * args.stride_token + d2];
+                    tv[idx] = kv_cache[vb + (uint64_t) t * args.stride_token + d2];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // ---- S = Q @ K^T
+                for (int cc = 0; cc < bs/8; ++cc) {
+                    simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                    simdgroup_half8x8  mq, mk;
+                    for (int i = 0; i < D/8; ++i) {
+                        simdgroup_barrier(mem_flags::mem_none);
+                        simdgroup_load(mq, sq + (8*sgm)*D + 8*i, D);
+                        simdgroup_load(mk, tk + cc*8*D + 8*i, D, 0, true);   // -> d x kt
+                        simdgroup_barrier(mem_flags::mem_none);
+                        simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+                    }
+                    simdgroup_store(mqk, ss + (8*sgm)*SH + cc*8, SH);
+                }
+                simdgroup_barrier(mem_flags::mem_none);
+
+                // ---- online softmax, scalar: mask, visibility window and rel bias are all
+                //      trivial here and impossible inside a fragment.
+                for (uint r = 0; r < 8; ++r) {
+                    const uint jl = 8*sgm + r;
+                    const int  qg = qbase + (int) jl;
+                    const bool ok = qg < args.n_tokens_total;
+                    // CLAMP, never early-return: a non-uniform return would leave the
+                    // barriers below with missing threads.
+                    const int  qgc   = ok ? qg : (args.n_tokens_total - 1);
+                    const int  q_pos = ctx0 + (qgc - off_s);
+                    const int  lo    = args.visibility_window > 0
+                                     ? max(0, q_pos - args.visibility_window + 1) : 0;
+
+                    const float m_prev = Mr[jl];
+                    float mx = m_prev;
+                    for (uint c = lnm; c < (uint) bs; c += 32) {
+                        const int kpos = bi*bs + (int) c;
+                        float s = ss[jl*SH + c] * args.scale;
+                        const int rd = q_pos - kpos;
+                        if (args.rel_extent > 0 && rd >= 0 && rd < args.rel_extent) {
+                            s += rel[((uint64_t) qgc * args.n_heads + head_idx) * args.rel_extent + rd];
+                        }
+                        if (kpos > q_pos || kpos < lo) { s = -INFINITY; }
+                        ss[jl*SH + c] = s;
+                        mx = max(mx, s);
+                    }
+                    mx = simd_max(mx);
+
+                    const float ms = (m_prev == -INFINITY) ? 0.0f : exp(m_prev - mx);
+                    float sum = 0.0f;
+                    for (uint c = lnm; c < (uint) bs; c += 32) {
+                        const float s  = ss[jl*SH + c];
+                        const float vs = (s == -INFINITY) ? 0.0f : exp(s - mx);
+                        sp[jl*SH + c] = vs;
+                        sum += vs;
+                    }
+                    sum = simd_sum(sum);
+
+                    if (lnm == 0) { Mr[jl] = mx; Sr[jl] = Sr[jl]*ms + sum; }
+                    // rescale O in THREADGROUP memory -- no per-row fragment scale exists
+                    for (uint i = lnm; i < (uint) D; i += 32) { so[jl*PV + i] *= ms; }
+                }
+                simdgroup_barrier(mem_flags::mem_none);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // ---- O += P @ V
+                for (int dd = 0; dd < D/8; ++dd) {
+                    simdgroup_float8x8 lo8;
+                    simdgroup_load(lo8, so + (8*sgm)*PV + dd*8, PV);
+                    for (int cc = 0; cc < bs/8; ++cc) {
+                        simdgroup_float8x8 mp;
+                        simdgroup_half8x8  mv;
+                        simdgroup_barrier(mem_flags::mem_none);
+                        simdgroup_load(mp, sp + (8*sgm)*SH + cc*8, SH);
+                        simdgroup_load(mv, tv + cc*8*D + dd*8, D);
+                        simdgroup_barrier(mem_flags::mem_none);
+                        simdgroup_multiply_accumulate(lo8, mp, mv, lo8);
+                    }
+                    simdgroup_store(lo8, so + (8*sgm)*PV + dd*8, PV);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            for (uint r = 0; r < 8; ++r) {
+                const uint jl = 8*sgm + r;
+                const int  qg = qbase + (int) jl;
+                if (qg >= args.n_tokens_total) { continue; }   // safe: no barrier below
+                const uint64_t o_off = ((uint64_t) qg * args.n_heads + head_idx) * D;
+                for (uint i = lnm; i < (uint) D; i += 32) {
+                    dst[o_off + i] = so[jl*PV + i] / (Sr[jl] + 1e-6f);
+                }
+            }
+            return;
+        }
+        // cross-seq pack falls through to the scalar path below
+    }
+    // =============== end MMA PREFILL PATH ===============
+
     // Q-block packing: simd group s owns row tgpig[0]*nsg + s. Tail rows past
     // n_tokens_total CLAMP instead of returning: a non-uniform early return would leave
     // the threadgroup's barriers below with missing threads (deadlock/UB on Metal), so an

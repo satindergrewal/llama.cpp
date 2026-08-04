@@ -4504,6 +4504,33 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     const int n_tokens   = (int) q->ne[2];
     const int n_heads_kv = (int) k_new->ne[1];
 
+    // ---- MMA prefill eligibility and TILE SIZING.
+    // The threadgroup-memory budget is what sizes the tile, so it is computed here as
+    // dispatch logic rather than left as a comment: the kernel's layout and this allocation
+    // are ONE decision, and a mismatch between them already cost a crash and a false
+    // "ALL PASSED" (the fallback ran silently while the gate reported success).
+    //   bytes = (2*bs*D + QR*D)*2  +  (2*QR*SH + QR*PV + 2*QR)*4,   QR = 8*nsg, SH = bs, PV = D
+    // Measured fits (ornith tools/ds4-gates/sgload_probe/fa_gate.sh):
+    //   D=64  bs=32 nsg=4 -> 28,928  OK      D=64 bs=32 nsg=8 -> 49,664  DOES NOT FIT
+    //   D=128 bs=16 nsg=2 -> 22,144  OK
+    const int    bs_pa       = ((const int32_t *)(op_params_f + 1))[0];
+    const size_t smem_budget = 32768;
+    auto mma_smem = [&](int nsg_try) -> size_t {
+        const size_t QR = (size_t) 8 * nsg_try;
+        return ((size_t) 2*bs_pa*head_dim + QR*head_dim) * sizeof(uint16_t)
+             + (2*QR*bs_pa + QR*head_dim + 2*QR) * sizeof(float);
+    };
+    int  mma_nsg = 0;
+    bool use_mma = (n_tokens > 1) && (head_dim % 8 == 0) && (bs_pa % 8 == 0) && (bs_pa > 0);
+    if (use_mma) {
+        // largest simd-group count whose tile fits; the kernel reads nsg from the dispatch
+        for (int cand = 8; cand >= 1; cand >>= 1) {
+            if (mma_smem(cand) <= smem_budget) { mma_nsg = cand; break; }
+        }
+        if (mma_nsg == 0) { use_mma = false; }   // no tile fits -> scalar path, no silence
+    }
+    if (getenv("DS4P_METAL_NO_MMA")) { use_mma = false; }   // one-factor arm switch
+
     ggml_metal_kargs_paged_attn args = {
         /*.head_dim          =*/ head_dim,
         /*.n_heads           =*/ n_heads,
@@ -4516,7 +4543,8 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.visibility_window =*/ (int32_t) vis_window,
         /*.q_parallel        =*/ (n_tokens > 1) ? 1 : 0,
         /*.n_tokens_total    =*/ n_tokens,
-        /*.nsg               =*/ (n_tokens > 1) ? 8 : 32,
+        /*.nsg               =*/ use_mma ? mma_nsg : ((n_tokens > 1) ? 8 : 32),
+        /*.use_mma           =*/ use_mma ? 1 : 0,
         /*.stride_token      =*/ kv_cache->nb[1] / sizeof(ggml_fp16_t),
         /*.stride_head       =*/ kv_cache->nb[2] / sizeof(ggml_fp16_t),
         /*.stride_block      =*/ kv_cache->nb[3] / sizeof(ggml_fp16_t),
@@ -4556,7 +4584,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // unlike the CUDA decode split count, which peaked at 64 and got worse after.
     // Prefill goes the other way (3885 -> 4855 ms over the same sweep) because it already
     // has n_tokens*n_heads threadgroups and extra slices only widen the combine.
-    int nsg = n_tokens > 1 ? 8 : 32;
+    int nsg = use_mma ? mma_nsg : (n_tokens > 1 ? 8 : 32);
     // DS4P_METAL_NSG forces the simd-group count so a sweep runs as PAIRED ARMS IN ONE
     // BINARY rather than one rebuild per point -- the discipline that made the CUDA
     // cp.async A/B trustworthy. Decode is the shape worth sweeping: its grid is only
@@ -4583,9 +4611,41 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     const int    bs_stage   = ((const int32_t *)(op_params_f + 1))[0];
     const size_t smem_stage = (size_t) 2 * bs_stage * head_dim * sizeof(uint16_t);
     const size_t smem_comb  = (size_t) (2*nsg + nsg*head_dim) * sizeof(float);
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_stage > smem_comb ? smem_stage : smem_comb, 0);
+    // The MMA tile needs its own (larger) allocation, computed by the SAME expression the
+    // eligibility test used. Layout and allocation move together or not at all.
+    const size_t smem_scal = smem_stage > smem_comb ? smem_stage : smem_comb;
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, use_mma ? mma_smem(mma_nsg) : smem_scal, 0);
 
-    const int n_groups_x = (n_tokens > 1) ? (n_tokens + nsg - 1) / nsg : n_tokens;
+    // PRESENCE MARKER. A float arm once reported "ALL PASSED" while the fallback silently
+    // ran because the tile had quietly exceeded the smem limit -- so which path executed is
+    // never inferred, it is printed. One line per process, and it states the tile as well as
+    // the verdict so a gate log can be read back without guessing the config.
+    // Logging ONCE per process is not enough: a run that sweeps head_dim picks a different
+    // tile per config (D=192 does not fit at nsg=2 and drops to nsg=1), so a single line
+    // proves only that the FIRST config took the path and says nothing about the rest --
+    // which is precisely the "the fallback silently ran" hole this marker exists to close.
+    // Key on the full config and print each distinct one.
+    {
+        static int last_key = -1;
+        const int key = (use_mma ? 1 : 0) | (head_dim << 1) | (bs_pa << 12) | (mma_nsg << 20);
+        if (key != last_key) {
+            last_key = key;
+            if (use_mma) {
+                GGML_LOG_INFO("%s: DS4P-MMA ACTIVE  D=%d bs=%d nsg=%d QR=%d smem=%zu/%zu\n",
+                              __func__, head_dim, bs_pa, mma_nsg, 8*mma_nsg,
+                              mma_smem(mma_nsg), smem_budget);
+            } else {
+                GGML_LOG_INFO("%s: DS4P-MMA OFF (scalar path) D=%d bs=%d n_tokens=%d\n",
+                              __func__, head_dim, bs_pa, n_tokens);
+            }
+        }
+    }
+
+    // MMA owns 8*nsg query rows per threadgroup (one 8-row tile per simd group); the scalar
+    // path owns nsg. Getting this wrong silently drops or duplicates rows.
+    const int n_groups_x = use_mma
+                         ? (n_tokens + 8*nsg - 1) / (8*nsg)
+                         : ((n_tokens > 1) ? (n_tokens + nsg - 1) / nsg : n_tokens);
     ggml_metal_encoder_dispatch_threadgroups(enc, n_groups_x, n_heads, 1, nth, 1, 1);
 
     return 1;
