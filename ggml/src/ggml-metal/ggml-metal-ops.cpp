@@ -2593,10 +2593,23 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
 // paged port must supply one: n_tokens x n_kv halves, carved out of dst the same way
 // flash-attn carves its pad/blk/tmp scratch. Reserved ONLY when the champion path is enabled --
 // it is a real allocation and must not be charged to runs that never take that path.
+// ★ AUDIT #2245 FINDING 3: the workspace is reserved at graph-ALLOC time and the dispatch decides
+// again at ENCODE time. If those two reads of DS4P_METAL_CHAMP ever disagreed, the mask write would
+// land OUTSIDE the allocation -- silent heap corruption. Reading the env twice is the bug; read it
+// ONCE and let both sites share the answer. A comment saying "they agree in practice" is not a
+// guard, and "in practice" is what this lane keeps getting burned by.
+bool ggml_metal_paged_champ_enabled(void) {
+    static const bool en = [] {
+        const char * e = getenv("DS4P_METAL_CHAMP");
+        return e && atoi(e) != 0;
+    }();
+    return en;
+}
+
 size_t ggml_metal_op_paged_attn_extra_mask(const ggml_tensor * op) {
     assert(op->op == GGML_OP_PAGED_ATTN);
 
-    if (!getenv("DS4P_METAL_CHAMP") || atoi(getenv("DS4P_METAL_CHAMP")) == 0) {
+    if (!ggml_metal_paged_champ_enabled()) {
         return 0;
     }
 
@@ -4767,7 +4780,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     //   n_seq == 1      : plen[0] is the single sequence's context length in this first cut.
     //   prefill only    : decode takes the combine path.
     //   head_dim in the instantiated set.
-    if (getenv("DS4P_METAL_CHAMP") && atoi(getenv("DS4P_METAL_CHAMP")) != 0) {
+    if (ggml_metal_paged_champ_enabled()) {
         const int n_seq_c = (int) blens->ne[0];
         const bool hd_ok  = (head_dim == 64 || head_dim == 96 || head_dim == 128 || head_dim == 192);
         const char * why  = bs_pa_lpk != 64 ? "bs!=64"
