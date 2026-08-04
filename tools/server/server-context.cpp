@@ -319,6 +319,19 @@ struct server_slot {
         if (server_prompt_cache::revalidate_enabled()) {
             const llama_pos pos_have = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id) + 1;
             const llama_pos pos_want = prompt.tokens.pos_next();
+
+            // NOTHING RESIDENT is not a MISMATCH. On the paged path the scheduler returns a
+            // finished sequence's blocks to the pool immediately (that promptness is the
+            // point of paging), so the later idle-slot save arrives at a sequence with zero
+            // cells and a stale token record. That is the expected steady state, not a
+            // pairing fault, and counting it as one left a permanent nonzero cell_mismatch
+            // that made the P0-2 guard look like it was firing on real defects.
+            // The record still must not be cached -- there is no KV to bind it to.
+            if (pos_have == 0) {
+                SLT_TRC(*this, "%s", "nothing resident for this sequence, skipping save\n");
+                return false;
+            }
+
             if (pos_have != pos_want) {
                 prompt_cache.n_reval_cell_mismatch++;
                 SLT_WRN(*this, "reval CELL MISMATCH at save: seq pos_max+1 = %d vs tokens pos_next = %d -> not caching (cell_mismatch=%llu)\n",
