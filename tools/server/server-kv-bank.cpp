@@ -268,10 +268,22 @@ bool server_kv_bank::probe(const server_tokens & tokens_new, const std::string &
         const bool   forced = force != nullptr && atoi(force) != 0;
 
         struct stat sb;
+
+        // ALWAYS log what the gate believes, including when it is not armed. A gate that
+        // silently never fires is indistinguishable from one that decided to admit, and I
+        // spent a run unable to tell those apart from the outside.
+        SRV_INF(" - kv-bank: gate: restore_rate = %.3f MiB/ms, prefill_rate = %.4f ms/tok%s\n",
+                ewma_restore_mib_per_ms, ewma_prefill_ms_per_tok,
+                (ewma_restore_mib_per_ms > 0.0 && ewma_prefill_ms_per_tok > 0.0) ? "" : "  (NOT ARMED)");
+
         if (!forced && ewma_restore_mib_per_ms > 0.0 && ewma_prefill_ms_per_tok > 0.0 &&
             stat(best_path.c_str(), &sb) == 0) {
             const double restore_ms = ((double) sb.st_size / (1024.0 * 1024.0)) / ewma_restore_mib_per_ms;
             const double prefill_ms = (double) best_lcp * ewma_prefill_ms_per_tok;
+
+            SRV_INF(" - kv-bank: gate: restore ~%.0f ms vs prefill ~%.0f ms for %zu tokens -> %s\n",
+                    restore_ms, prefill_ms, (size_t) best_lcp,
+                    restore_ms >= prefill_ms ? "DECLINE" : "admit");
 
             if (restore_ms >= prefill_ms) {
                 n_uneconomic++;
