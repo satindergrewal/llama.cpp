@@ -4737,7 +4737,6 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         const bool hd_ok  = (head_dim == 64 || head_dim == 96 || head_dim == 128 || head_dim == 192);
         const char * why  = bs_pa_lpk != 64 ? "bs!=64"
                           : n_seq_c   != 1  ? "n_seq!=1"
-                          : n_tokens  <= 1  ? "decode"
                           : !hd_ok          ? "head_dim" : nullptr;
         if (why) {
             static const char * last_why = nullptr;
@@ -4745,6 +4744,78 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 GGML_LOG_INFO("%s: CHAMP-PAGED REFUSED (%s) D=%d bs=%d n_seq=%d n_tokens=%d\n",
                               __func__, why, head_dim, bs_pa_lpk, n_seq_c, n_tokens);
             }
+        } else if (n_tokens == 1) {
+            // ===== PAGED CHAMPION DECODE (vec) =====
+            // SINGLE dispatch: nwg=1 means the kernel writes dst directly, no vec_reduce stage.
+            // WARNING: the vec threadgroup is 2-D (32, nsg, 1) -- NOT (32*nsg, 1, 1) like the
+            // prefill path. Copying the prefill shape here compiles cleanly and is wrong.
+            const int vec_nsg = 4;
+            auto vp = ggml_metal_library_get_pipeline_paged_champ_vec(lib, op, vec_nsg);
+            const uint64_t st = kv_cache->nb[1] / sizeof(ggml_fp16_t);
+            const uint64_t sh = kv_cache->nb[2] / sizeof(ggml_fp16_t);
+            const uint64_t sb = kv_cache->nb[3] / sizeof(ggml_fp16_t);
+
+            int32_t max_blk_d = ((const int32_t *)(op_params_f + 2))[0];
+            int32_t n_kv_d    = max_blk_d * bs_pa_lpk;
+            ggml_metal_buffer_id bid_mask_d = ggml_metal_get_buffer_id(op);
+            bid_mask_d.offs += ggml_nbytes(op);
+
+            {
+                auto mp = ggml_metal_library_get_pipeline_paged_champ_mask(lib);
+                ggml_metal_encoder_set_pipeline(enc, mp);
+                ggml_metal_kargs_paged_attn margs = args;
+                ggml_metal_encoder_set_bytes (enc, &margs, sizeof(margs), 0);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(clens), 1);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(boffs), 2);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(blens), 3);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(rel ? rel : q), 4);
+                ggml_metal_encoder_set_buffer(enc, bid_mask_d, 5);
+                ggml_metal_encoder_set_bytes (enc, &n_kv_d, sizeof(n_kv_d), 6);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
+                ggml_metal_encoder_set_buffer(enc, bid_mask_d, 8);
+                ggml_metal_encoder_dispatch_threadgroups(enc, (n_kv_d + 31)/32, n_tokens, n_heads, 32, 1, 1);
+            }
+
+            ggml_metal_kargs_flash_attn_ext_vec fa = {};
+            fa.ne01 = n_tokens; fa.ne02 = n_heads; fa.ne03 = 1;
+            fa.nb01 = (uint64_t) n_heads*head_dim*sizeof(float);
+            fa.nb02 = (uint64_t) head_dim*sizeof(float);
+            fa.nb03 = 0;
+            fa.ne11 = n_kv_d;
+            fa.ne_12_2 = n_heads_kv; fa.ne_12_3 = 1;
+            fa.ns10 = (int32_t) st;            fa.ns20 = (int32_t) st;
+            fa.nb11 = st*sizeof(ggml_fp16_t);  fa.nb21 = st*sizeof(ggml_fp16_t);
+            fa.nb12 = sh*sizeof(ggml_fp16_t);  fa.nb22 = sh*sizeof(ggml_fp16_t);
+            fa.nb13 = sb*sizeof(ggml_fp16_t);  fa.nb23 = sb*sizeof(ggml_fp16_t);
+            fa.ne31 = n_tokens; fa.ne32 = n_heads; fa.ne33 = 1;
+            fa.nb31 = (uint64_t) n_kv_d*sizeof(ggml_fp16_t);
+            fa.nb32 = (uint64_t) n_tokens*n_kv_d*sizeof(ggml_fp16_t);
+            fa.nb33 = 0;
+            fa.ne1 = n_heads; fa.ne2 = n_tokens; fa.ne3 = 1;
+            fa.scale = op_params_f[0];
+
+            GGML_ASSERT(vp.smem <= 32768);
+            ggml_metal_encoder_set_pipeline(enc, vp);
+            ggml_metal_encoder_set_bytes   (enc, &fa, sizeof(fa), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache), 2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache), 3);
+            ggml_metal_encoder_set_buffer  (enc, bid_mask_d,                         4);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        5);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        6);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(btab),     7);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(clens),    8);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),       9);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, vp.smem, 0);
+            {
+                static int lastd = -1;
+                if (head_dim != lastd) { lastd = head_dim;
+                    GGML_LOG_INFO("%s: CHAMP-VEC ACTIVE (decode) D=%d bs=%d nsg=%d nwg=1 smem=%zu/32768\n",
+                                  __func__, head_dim, bs_pa_lpk, vec_nsg, vp.smem);
+                }
+            }
+            ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, n_heads, 1, 32, vec_nsg, 1);
+            return 1;
         } else {
             // Champion smem is nsg-INVARIANT for f16 KV (10,240 B at any nsg), so more simd
             // groups are free -- the knob our own layouts could never turn, because theirs all
