@@ -3087,6 +3087,38 @@ private:
                 slot->print_timings();
                 send_final_response(*slot);
                 metrics.on_prediction(*slot);
+
+                // P1-5 ON THE PAGED PATH: capture this sequence's KV to the prompt cache
+                // (and thence the disk bank) RIGHT HERE -- the only window where it is
+                // possible. Both later opportunities are too late:
+                //   - slot->release() below clears slot->task;
+                //   - llama_paged_scheduler_update() further down runs finish() ->
+                //     free_blocks() and returns the blocks to the pool, after which
+                //     state_write has nothing to serialise (measured: 0.000 MiB and
+                //     seq pos_max+1 = 0, which is what the empty bank was reporting).
+                // NOT block retention: holding a finished sequence's blocks would fight
+                // the entire point of paging, where returning the scarce pool promptly is
+                // the feature. Capturing to disk at finish buys the reuse without holding
+                // the scarce resource.
+                if (prompt_cache && slot->task != nullptr) {
+                    // Align the token record to what the KV ACTUALLY holds before saving.
+                    // The mirror pushes each sampled token at accept time, but that token's
+                    // KV is not written until the NEXT decode -- so at finish the record
+                    // runs ahead of the cache by the sampled-but-not-yet-decoded tail
+                    // (measured: pos_max+1 = 2012 vs tokens pos_next = 2014). P0-2's
+                    // revalidate guard correctly refuses that pairing, and it is right to:
+                    // a record longer than its KV would restore tokens with no cells behind
+                    // them. Trim, do not loosen the guard.
+                    const llama_pos pmax =
+                        llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                    if (pmax >= 0 && (llama_pos) slot->prompt.tokens.size() > pmax + 1) {
+                        slot->prompt.tokens.keep_first((size_t) (pmax + 1));
+                    }
+                    if (slot->prompt_save(*prompt_cache)) {
+                        prompt_cache->update();
+                    }
+                }
+
                 slot->release();
                 finished_seqs.push_back(request_id);
             }

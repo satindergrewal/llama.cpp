@@ -1,4 +1,6 @@
 #include "llama-io.h"
+
+#include <stdexcept>
 #include "llama-kv-cache-paged.h"
 
 #include <algorithm>
@@ -585,9 +587,17 @@ void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_i
 // So: refuse, loudly, with the reason. A no-op here would let a restore appear to
 // succeed and then serve another request's KV -- strictly worse than not restoring.
 void llama_kv_cache_paged::state_read(llama_io_read_i &, llama_seq_id, llama_state_seq_flags) {
-    GGML_ABORT("paged KV state_read is not implemented: restoring a sequence requires "
-               "repopulating its scheduler group's block_table, which the cache cannot do "
-               "on its own. Writing state is supported; reading it back is not yet.");
+    // THROW, do not abort. Measured: aborting here killed the server the moment a spilled
+    // entry was admitted -- and a spilled entry is ALWAYS admitted eventually, so the
+    // abort turned a working server into a crashing one. llama_context::state_seq_set_data
+    // wraps this in try/catch and returns 0, which the server's prompt_load treats as a
+    // failed restore -> prompt_clear() -> normal recompute. That is the correct
+    // degradation: LOUD (the error is logged) but not fatal, and never silently wrong.
+    throw std::runtime_error(
+        "paged KV state_read is not implemented: restoring a sequence requires repopulating "
+        "its scheduler group's block_table, which the cache cannot do on its own. Writing "
+        "state (spill) is supported; reading it back (admit) is not yet -- falling back to "
+        "recompute.");
 }
 
 bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos /*p0*/, llama_pos /*p1*/) {
