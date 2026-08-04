@@ -1,3 +1,4 @@
+#include "llama-io.h"
 #include "llama-kv-cache-paged.h"
 
 #include <algorithm>
@@ -521,6 +522,72 @@ int32_t llama_kv_cache_paged::debug_seq_kv_checksum(const llama_sequence_group &
 
 void llama_kv_cache_paged::clear(bool /*data*/) {
     sequence_positions.clear();
+}
+
+// P1-5: serialise ONE sequence's KV out of the paged cache.
+//
+// This is now possible because sequence_blocks records which physical blocks the
+// sequence owns; before that map existed the cache could not enumerate them, which is
+// why this body was `{}` and why llama_state_seq_get_size_ext returned 0 (so the disk
+// KV bank could never spill a byte).
+//
+// Format: a small header, then for every layer, every block's raw bytes in the
+// sequence's block-table ORDER (not physical id order) -- so a restore does not need the
+// original physical ids to be free, only the same count. Blocks may live on GPU or CPU;
+// the id space is global with CPU ids >= num_gpu_blocks, which is why the local index is
+// recomputed per block exactly as do_block_copy does.
+void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags) const {
+    const auto it = sequence_blocks.find(seq_id);
+    if (seq_id < 0 || it == sequence_blocks.end() || it->second.empty()) {
+        return;   // nothing resident for this sequence: write nothing, size stays 0
+    }
+
+    const llama_block_ids & blocks = it->second;
+
+    const uint32_t n_blocks = (uint32_t) blocks.size();
+    io.write(&n_blocks,    sizeof(n_blocks));
+    io.write(&block_size,  sizeof(block_size));
+    io.write(&head_dim,    sizeof(head_dim));
+    io.write(&n_heads_kv,  sizeof(n_heads_kv));
+    io.write(&n_layers,    sizeof(n_layers));
+    io.write(&block_bytes, sizeof(block_bytes));
+
+    auto pos = sequence_positions.find(seq_id);
+    const llama_pos p_min = pos != sequence_positions.end() ? pos->second.min : -1;
+    const llama_pos p_max = pos != sequence_positions.end() ? pos->second.max : -1;
+    io.write(&p_min, sizeof(p_min));
+    io.write(&p_max, sizeof(p_max));
+
+    std::vector<uint8_t> staging(block_bytes);
+
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        for (uint32_t i = 0; i < n_blocks; ++i) {
+            const uint32_t gid = blocks[i];
+            const bool     gpu = block_manager.is_gpu(gid);
+
+            struct ggml_tensor * layer = gpu ? kv_gpu_layers[il] : kv_cpu_layers[il];
+            const uint32_t local = gpu ? gid : gid - num_gpu_blocks;
+
+            ggml_backend_tensor_get(layer, staging.data(), (size_t) local * block_bytes, block_bytes);
+            io.write(staging.data(), block_bytes);
+        }
+    }
+}
+
+// P1-5 RESTORE -- deliberately NOT implemented, and failing loudly rather than silently.
+//
+// Reading the bytes back is the easy half; the hard half is that a restored sequence
+// needs BLOCKS ALLOCATED and, critically, its SCHEDULER GROUP's block_table repopulated.
+// The cache can allocate (block_manager.checkout_*) but it cannot reach into the
+// scheduler's group records, and a sequence whose cache map and group table disagree is
+// exactly the silent-wrong-reuse that P0-2's revalidate guard exists to catch.
+//
+// So: refuse, loudly, with the reason. A no-op here would let a restore appear to
+// succeed and then serve another request's KV -- strictly worse than not restoring.
+void llama_kv_cache_paged::state_read(llama_io_read_i &, llama_seq_id, llama_state_seq_flags) {
+    GGML_ABORT("paged KV state_read is not implemented: restoring a sequence requires "
+               "repopulating its scheduler group's block_table, which the cache cannot do "
+               "on its own. Writing state is supported; reading it back is not yet.");
 }
 
 bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos /*p0*/, llama_pos /*p1*/) {

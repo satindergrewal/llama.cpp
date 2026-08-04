@@ -101,14 +101,14 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
-    // state write/load
-    void state_write(llama_io_write_i & /*io*/,
-                     llama_seq_id /*seq_id*/         = -1,
-                     llama_state_seq_flags /*flags*/ = 0) const override {}
+    // state write/load -- see the .cpp for what is implemented and what is not.
+    void state_write(llama_io_write_i & io,
+                     llama_seq_id seq_id             = -1,
+                     llama_state_seq_flags flags     = 0) const override;
 
-    void state_read(llama_io_read_i & /*io*/,
-                    llama_seq_id /*seq_id*/         = -1,
-                    llama_state_seq_flags /*flags*/ = 0) override {}
+    void state_read(llama_io_read_i & io,
+                    llama_seq_id seq_id             = -1,
+                    llama_state_seq_flags flags     = 0) override;
 
     //
     // Helpers to llama_memory_i
