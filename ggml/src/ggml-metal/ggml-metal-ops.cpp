@@ -4782,7 +4782,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                               mma_smem(mma_nsg, mma_sb), pe ? pe : "0", smem_budget);
             } else if (use_lpk) {
                 GGML_LOG_INFO("%s: DS4P-LPK ACTIVE (lane-per-key two-phase) D=%d bs=%d nsg=%d "
-                              "TKP=%d%s VSTAGE=%s smem=%zu/%zu\n",
+                              "TKP=%d%s VSTAGE=%s BSFC=%s smem=%zu/%zu\n",
                               __func__, head_dim, bs_pa, (int) nsg, TKP,
                               lpk_mode == 2 ? " UNPADDED" : "", stage_v ? "on" : "OFF", bs_fc ? "on" : "OFF", smem_lpk, smem_budget);
             } else {
