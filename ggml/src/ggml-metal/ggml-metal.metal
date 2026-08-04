@@ -12703,8 +12703,7 @@ kernel void kernel_paged_champ_mask(
         device const float   * rel           [[buffer(4)]],
         device       half    * mask          [[buffer(5)]],
         constant     int32_t & n_kv          [[buffer(6)]],
-        device       float   * dst_sentinel  [[buffer(7)]],
-        device       char    * blk_skip     [[buffer(8)]],
+        device       char    * blk_skip     [[buffer(7)]],
         uint3 gid [[thread_position_in_grid]]) {
     const int row  = (int) gid.y;
     const int col  = (int) gid.x;
@@ -12737,7 +12736,7 @@ kernel void kernel_paged_champ_mask(
     // visible. If output goes non-zero, the mask PLUMBING is sound and the visibility logic is
     // the bug. If it stays zero, the plumbing is wrong. One binary discriminator instead of
     // adjusting strides until numbers move.
-    half v = (args.lpk == 99) ? (half) 0.0f : (vis ? (half) 0.0f : (half) -MAXHALF);
+    half v = (args.probe == 1) ? (half) 0.0f : (vis ? (half) 0.0f : (half) -MAXHALF);
 
     // rel bias rides in the mask: the champion adds slope*mask to the score, and slope is 1
     // with max_bias 0, so an additive bias here lands exactly where args.rel would have.
@@ -12757,13 +12756,8 @@ kernel void kernel_paged_champ_mask(
     if (col < 64 && head == 0) {
         blk_skip[(uint64_t) row*64 + col] = 1;
     }
-
-    // SEPARATOR: "loop never ran" and "dst never written" both give all-zero output. Stamp dst
-    // with a sentinel here; if it SURVIVES the champion dispatch, the champion never wrote. If
-    // it is gone, the champion ran and its loop produced nothing. Two suspects, one arm.
-    if (args.lpk == 98 && col < args.head_dim) {
-        dst_sentinel[(uint64_t) row*args.n_heads*args.head_dim + col] = 7.0f;
-    }
+    // (sentinel dst-write probe REMOVED in the self-audit: it wrote 7.0f into dst and would
+    //  have silently corrupted real output if ever enabled. It found its bug; it is gone.)
 }
 
 

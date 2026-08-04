@@ -1235,6 +1235,7 @@ typedef struct {
     int32_t  stage_v;           // 1 = stage V in threadgroup memory; 0 = read V from device
     int32_t  mma_stage_k;       // MMA path: 1 = stage K in threadgroup memory; 0 = device
     int32_t  bs_fc;             // 1 = block_size from the function constant; 0 = runtime arg
+    int32_t  probe;             // diagnostics ONLY; 0 = off. Never overload a semantic field.
     uint64_t stride_token;      // in halves
     uint64_t stride_head;
     uint64_t stride_block;
