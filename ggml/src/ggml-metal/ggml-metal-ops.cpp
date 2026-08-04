@@ -4754,7 +4754,9 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 // tested masking code provides correctness rather than hand-rolled indexing.
                 auto mp = ggml_metal_library_get_pipeline_paged_champ_mask(lib);
                 ggml_metal_encoder_set_pipeline(enc, mp);
-                ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+                ggml_metal_kargs_paged_attn margs = args;
+                if (getenv("DS4P_CHAMP_MASK_OPEN")) { margs.lpk = 99; }   // diagnostic probe
+                ggml_metal_encoder_set_bytes (enc, &margs, sizeof(margs), 0);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(clens), 1);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(boffs), 2);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(blens), 3);

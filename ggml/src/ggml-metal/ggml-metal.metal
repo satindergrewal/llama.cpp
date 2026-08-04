@@ -12727,7 +12727,11 @@ kernel void kernel_paged_champ_mask(
         vis = (col > q_pos - args.visibility_window);
     }
 
-    half v = vis ? (half) 0.0f : (half) -MAXHALF;
+    // DIAGNOSTIC (args.lpk reused as a probe flag on this kernel only): force every element
+    // visible. If output goes non-zero, the mask PLUMBING is sound and the visibility logic is
+    // the bug. If it stays zero, the plumbing is wrong. One binary discriminator instead of
+    // adjusting strides until numbers move.
+    half v = (args.lpk == 99) ? (half) 0.0f : (vis ? (half) 0.0f : (half) -MAXHALF);
 
     // rel bias rides in the mask: the champion adds slope*mask to the score, and slope is 1
     // with max_bias 0, so an additive bias here lands exactly where args.rel would have.
