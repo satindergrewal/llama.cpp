@@ -160,6 +160,25 @@ class llama_kv_cache_paged : public llama_memory_i {
     };
 
     std::unordered_map<llama_seq_id, seq_range> sequence_positions;
+
+    // P1-5 PREREQUISITE: which physical blocks each sequence owns.
+    //
+    // Why this has to exist: state_write/state_read are CACHE-level interface methods,
+    // but until now the cache could not answer "which blocks hold sequence N's KV". It
+    // held only sequence_positions (min/max pos) and a NON-OWNING pointer to the CURRENT
+    // batch's block table -- so a sequence's blocks were unknowable outside the batch it
+    // happened to be in. That is precisely why state_write/state_read were empty stubs,
+    // and why the disk KV bank (P1-5) could never spill: llama_state_seq_get_size_ext
+    // returned 0 because there was nothing the cache could enumerate.
+    //
+    // Maintained at the six points where the cache already sees a group's request_id and
+    // block_table together (allocate / free_blocks / fork_blocks / swap_in / swap_out),
+    // so it stays exact across preemption and forking rather than being rebuilt by
+    // guesswork. Kept private to the cache: the scheduler remains the owner of policy,
+    // this is only the cache's record of physical residency.
+    std::unordered_map<llama_seq_id, llama_block_ids> sequence_blocks;
+
+    void note_seq_blocks(const llama_sequence_group & group);
 };
 
 class llama_kv_cache_paged_context : public llama_memory_context_i {

@@ -216,6 +216,7 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
 
     llama_block_ids new_ids = block_manager.checkout_gpu_blocks(num_requested_blocks);
     concat_block_ids(group.block_table, new_ids);
+    note_seq_blocks(group);
     LLAMA_LOG_DEBUG("%s: successfully allocated %d.\n", __func__, num_requested_blocks);
     return true;
 }
@@ -240,6 +241,7 @@ uint32_t llama_kv_cache_paged::fork_blocks(const llama_sequence_group & src, lla
     dst.block_table.insert(dst.block_table.end(), src.block_table.begin(),
                            src.block_table.begin() + n_full_blocks);
     block_manager.share_blocks(dst.block_table);
+    note_seq_blocks(dst);   // a fork's child owns (shares) the inherited blocks
 
     uint32_t n_inherited = n_full_blocks * block_size;
 
@@ -257,6 +259,17 @@ uint32_t llama_kv_cache_paged::fork_blocks(const llama_sequence_group & src, lla
                    __func__, src.request_id, dst.request_id, n_full_blocks, n_inherited, tail_fill);
 
     return n_inherited;
+}
+
+// P1-5 prerequisite: record (or clear) a sequence's physical block residency. Called
+// wherever the cache already observes a group's request_id and block_table together, so
+// the map tracks reality across preemption, swap and fork instead of being reconstructed.
+void llama_kv_cache_paged::note_seq_blocks(const llama_sequence_group & group) {
+    if (group.block_table.empty()) {
+        sequence_blocks.erase(group.request_id);
+    } else {
+        sequence_blocks[group.request_id] = group.block_table;
+    }
 }
 
 void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
@@ -284,6 +297,8 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
 
     group.block_table.clear();
     seq_rm(group.request_id, llama_pos{}, llama_pos{});
+
+    sequence_blocks.erase(group.request_id);
 }
 
 void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
@@ -345,6 +360,7 @@ bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
 
     free_blocks(group);
     group.block_table = new_ids;
+    note_seq_blocks(group);
     return true;
 }
 
@@ -363,6 +379,7 @@ bool llama_kv_cache_paged::swap_out(llama_sequence_group & group) {
 
     free_blocks(group);
     group.block_table = new_ids;
+    note_seq_blocks(group);
     return true;
 }
 
@@ -508,6 +525,7 @@ void llama_kv_cache_paged::clear(bool /*data*/) {
 
 bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos /*p0*/, llama_pos /*p1*/) {
     sequence_positions.erase(seq_id);
+    sequence_blocks.erase(seq_id);
     return true;
 }
 
