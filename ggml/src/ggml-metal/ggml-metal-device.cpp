@@ -1263,6 +1263,48 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_mask
     return res;
 }
 
+// ★ PAGED CHAMPION VEC (decode) pipeline. Mirrors the champion's vec FC set exactly.
+// nwg is pinned to 1: at nwg==1 the kernel writes dst DIRECTLY and there is NO vec_reduce
+// stage, so decode is a SINGLE dispatch. The reduce only parallelises across workgroups for
+// long KV -- an optimisation, not a requirement, and correctness comes first.
+// ⚠ The vec threadgroup is 2-D (32, nsg, 1), NOT (32*nsg, 1, 1) like the prefill port.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_vec(
+        ggml_metal_library_t lib, const ggml_tensor * op, int nsg) {
+    char base[256];
+    char name[256];
+
+    const int32_t head_dim = (int32_t) op->src[0]->ne[0];
+    const ggml_tensor * kvc = op->src[3];
+    const int32_t ns10 = (int32_t) (kvc->nb[1] / sizeof(ggml_fp16_t));   // stride_token, elements
+
+    snprintf(base, 256, "kernel_paged_champ_vec_dk%d_dv%d", head_dim, head_dim);
+    snprintf(name, 256, "%s_ns%d_nsg%d_nwg1", base, ns10, nsg);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_bool (cv, true,  FC_FLASH_ATTN_EXT_VEC + 0);   // has_mask: causality
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT_VEC + 1);
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT_VEC + 2);
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT_VEC + 3);
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT_VEC + 4);   // kvpad: block walk handles the tail
+        ggml_metal_cv_set_int32(cv, ns10,  FC_FLASH_ATTN_EXT_VEC + 20);
+        ggml_metal_cv_set_int32(cv, ns10,  FC_FLASH_ATTN_EXT_VEC + 21);  // K and V share the pitch
+        ggml_metal_cv_set_int32(cv, nsg,   FC_FLASH_ATTN_EXT_VEC + 22);
+        ggml_metal_cv_set_int32(cv, 1,     FC_FLASH_ATTN_EXT_VEC + 23);  // nwg = 1 -> single dispatch
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+
+    // vec smem: PAD(((PAD(ne00,128) + 4*ncpsg + 2*PAD(ne20,128))*nsg)*2, 16), ncpsg = C = 64.
+    {
+        const int pk128 = ((head_dim + 127) / 128) * 128;
+        res.smem = GGML_PAD((size_t)((pk128 + 4*64 + 2*pk128) * nsg) * (sizeof(float)/2), 16);
+    }
+
+    return res;
+}
+
 // ★ PAGED CHAMPION pipeline. Specialised per (head_dim, nsg) AND per stride_token, because
 // ns10/ns20 are function constants that bake the K/V row pitch into the compiled kernel -- two
 // different strides sharing one cached compilation would silently use the first caller's pitch.
