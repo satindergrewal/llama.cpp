@@ -132,6 +132,10 @@ class llama_kv_cache_paged : public llama_memory_i {
 
   private:
     void concat_block_ids(llama_block_ids & to_block_table, const llama_block_ids & from_block_table);
+
+    // maximal runs of consecutive same-device block ids, as (first_id, count) -- lets the
+    // state serdes move a whole run per backend call instead of one call per block
+    std::vector<std::pair<uint32_t, uint32_t>> contiguous_runs(const llama_block_ids & blocks) const;
     void do_block_copy(const llama_block_ids & src_ids, const llama_block_ids & new_ids, bool to_gpu);
 
     // Master physical buffer

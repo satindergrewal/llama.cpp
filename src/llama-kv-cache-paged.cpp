@@ -564,20 +564,59 @@ void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_i
     io.write(&p_min, sizeof(p_min));
     io.write(&p_max, sizeof(p_max));
 
+    // COALESCED. A freshly checked-out block table is mostly CONSECUTIVE ids, so copying
+    // block-at-a-time turns one large transfer into n_blocks * n_layers small ones -- 5,688
+    // separate 64 KiB device copies for a 2K prompt, measured at 1.7 GB/s where the link
+    // does far better in bulk. Runs of consecutive ids on the same device move in one call.
+    const auto runs = contiguous_runs(blocks);
+
     std::vector<uint8_t> staging(block_bytes);
 
     for (uint32_t il = 0; il < n_layers; ++il) {
-        for (uint32_t i = 0; i < n_blocks; ++i) {
-            const uint32_t gid = blocks[i];
-            const bool     gpu = block_manager.is_gpu(gid);
+        for (const auto & run : runs) {
+            const bool     gpu   = block_manager.is_gpu(run.first);
+            const uint32_t local = gpu ? run.first : run.first - num_gpu_blocks;
+            const size_t   bytes = (size_t) run.second * block_bytes;
 
             struct ggml_tensor * layer = gpu ? kv_gpu_layers[il] : kv_cpu_layers[il];
-            const uint32_t local = gpu ? gid : gid - num_gpu_blocks;
 
-            ggml_backend_tensor_get(layer, staging.data(), (size_t) local * block_bytes, block_bytes);
-            io.write(staging.data(), block_bytes);
+            if (staging.size() < bytes) {
+                staging.resize(bytes);
+            }
+            ggml_backend_tensor_get(layer, staging.data(), (size_t) local * block_bytes, bytes);
+            io.write(staging.data(), bytes);
         }
     }
+}
+
+// Split a block table into maximal runs of consecutive ids that live on the same device,
+// as (first_id, count) pairs. The order of bytes on the wire is unchanged -- a run is just
+// a batch of the same per-block copies -- so a state written by one build restores on
+// another regardless of how the pool happened to fragment.
+std::vector<std::pair<uint32_t, uint32_t>> llama_kv_cache_paged::contiguous_runs(const llama_block_ids & blocks) const {
+    std::vector<std::pair<uint32_t, uint32_t>> runs;
+    if (blocks.empty()) {
+        return runs;
+    }
+
+    uint32_t first = blocks[0];
+    uint32_t count = 1;
+
+    for (size_t i = 1; i < blocks.size(); ++i) {
+        const bool consecutive = blocks[i] == blocks[i - 1] + 1;
+        const bool same_device = block_manager.is_gpu(blocks[i]) == block_manager.is_gpu(first);
+
+        if (consecutive && same_device) {
+            count++;
+        } else {
+            runs.emplace_back(first, count);
+            first = blocks[i];
+            count = 1;
+        }
+    }
+    runs.emplace_back(first, count);
+
+    return runs;
 }
 
 // P1-5 RESTORE. The mirror image of state_write: check the geometry, take real blocks,
@@ -647,18 +686,26 @@ void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
 
     llama_block_ids ids = block_manager.checkout_gpu_blocks(r_n_blocks);
 
+    // COALESCED, same reason as state_write: measured 204 ms to upload 355 MiB as 5,688
+    // separate 64 KiB copies (~1.7 GB/s), which is most of why a warm admit lost to a cold
+    // prefill at 2K. Consecutive ids on the same device go up in one call.
+    const auto runs = contiguous_runs(ids);
+
     std::vector<uint8_t> staging(block_bytes);
 
     for (uint32_t il = 0; il < n_layers; ++il) {
-        for (uint32_t i = 0; i < r_n_blocks; ++i) {
-            io.read(staging.data(), block_bytes);
+        for (const auto & run : runs) {
+            const bool     gpu   = block_manager.is_gpu(run.first);
+            const uint32_t local = gpu ? run.first : run.first - num_gpu_blocks;
+            const size_t   bytes = (size_t) run.second * block_bytes;
 
-            const uint32_t gid   = ids[i];
-            const bool     gpu   = block_manager.is_gpu(gid);
             struct ggml_tensor * layer = gpu ? kv_gpu_layers[il] : kv_cpu_layers[il];
-            const uint32_t local = gpu ? gid : gid - num_gpu_blocks;
 
-            ggml_backend_tensor_set(layer, staging.data(), (size_t) local * block_bytes, block_bytes);
+            if (staging.size() < bytes) {
+                staging.resize(bytes);
+            }
+            io.read(staging.data(), bytes);
+            ggml_backend_tensor_set(layer, staging.data(), (size_t) local * block_bytes, bytes);
         }
     }
 
