@@ -2995,6 +2995,38 @@ private:
         sampled.reserve(info->n_seq);
         stops.reserve(info->n_seq);
 
+        // P1-5: mirror the committed prompt tokens into the slot BEFORE the sampling
+        // branch, so mid-prompt chunks (which `continue` below) are mirrored too.
+        // context_lens[i] is the authoritative committed length for the sequence after
+        // this decode, which is what makes this IDEMPOTENT: on a recompute-preemption
+        // replay the scheduler rewinds context_lens and the mirror truncates to follow,
+        // instead of double-appending. A desynced mirror would be worse than an empty one.
+        for (int32_t i = 0; i < info->n_seq; ++i) {
+            const int32_t rid = pbatch.seq_id[info->batch_offsets[i]][0];
+            server_slot * ms = nullptr;
+            for (auto & s : slots) {
+                if (s.id == rid && s.is_processing()) { ms = &s; break; }
+            }
+            if (ms == nullptr || ms->task == nullptr) { continue; }
+
+            const int32_t ctx_len   = info->context_lens ? info->context_lens[i] : 0;
+            const int32_t n_prompt  = (int32_t) ms->task->n_tokens();
+            const int32_t want      = std::min(ctx_len, n_prompt);   // prompt portion only
+            const int32_t have      = (int32_t) ms->prompt.tokens.size();
+
+            if (have > ctx_len) {
+                ms->prompt.tokens.keep_first((size_t) ctx_len);      // replay rewound us
+            } else if (want > have) {
+                llama_tokens add;
+                add.reserve((size_t) (want - have));
+                for (int32_t t = have; t < want; ++t) {
+                    add.push_back(ms->task->tokens[t]);
+                }
+                ms->prompt.tokens.insert(add);
+                ms->n_prompt_tokens_processed += want - have;
+            }
+        }
+
         for (int32_t i = 0; i < info->n_seq; ++i) {
             const int32_t request_id = pbatch.seq_id[info->batch_offsets[i]][0];
 
@@ -3021,6 +3053,12 @@ private:
 
             const llama_token id = common_sampler_sample(slot->smpl.get(), ctx_tgt, tok_idx);
             common_sampler_accept(slot->smpl.get(), id, true);
+
+            // P1-5: the sampled token is now part of this sequence's KV, so it belongs in
+            // the prompt-token mirror too -- otherwise the mirror would stop matching the
+            // KV the moment decoding starts, and prompt_save()'s revalidate check exists
+            // precisely to refuse a record that does not match.
+            slot->prompt.tokens.push_back(id);
 
             const int64_t t_now = ggml_time_us();
             slot->n_decoded += 1;
