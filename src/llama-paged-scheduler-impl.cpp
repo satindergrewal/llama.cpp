@@ -115,8 +115,12 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                 group.block_table = std::move(restored);
                 group.n_past      = n_past;
 
-                LLAMA_LOG_INFO("%s: request %d admitted WARM: %u of %u prompt tokens restored from the "
-                               "KV bank (%zu blocks), %u left to prefill\n",
+                // "cached state", NOT "the KV bank": by this point the bytes are just bytes.
+                // Whether they came from the RAM prompt cache or off disk is known only to
+                // the server layer that fetched them, and a log line that names a source it
+                // cannot see is how a RAM hit gets read as proof the disk path works.
+                LLAMA_LOG_INFO("%s: request %d admitted WARM: %u of %u prompt tokens restored from "
+                               "cached state (%zu blocks), %u left to prefill\n",
                                __func__, group.request_id, n_past, group.n_prompt,
                                group.block_table.size(), group.n_prompt - n_past);
             }
