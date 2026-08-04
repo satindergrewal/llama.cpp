@@ -3027,28 +3027,37 @@ kernel void kernel_paged_attn_f32(
                       ? max(0, q_pos - args.visibility_window + 1) : 0;
 
     const uint64_t q_off = (uint64_t) gtok * args.n_heads * D + (uint64_t) head_idx * D;
-    const int d = (int) tpitg;
+    const int NPT = (D + 31) / 32;
+    const uint nsg  = ntg / 32;
+    const uint sg   = tpitg / 32;
+    const uint lane = tpitg % 32;
+
+    float qv[8]; float accv[8];
+    for (int i = 0; i < NPT; ++i) {
+        const int d = (int) lane + i*32;
+        qv[i] = (d < D) ? q[q_off + d] : 0.0f;
+        accv[i] = 0.0f;
+    }
 
     float m_i = -INFINITY;
     float l_i = 0.0f;
-    float acc = 0.0f;
 
-    for (int tok = lo; tok < n_tok; ++tok) {
+    // ARM B: CONTIGUOUS split -- sg s takes [lo + s*chunk, lo + (s+1)*chunk).
+    // Two NON-TRIVIAL slices, which arm A (full/empty) never produced. If this passes, the
+    // merge is fine for real slices and STRIDING is the defect. If it fails, the merge of
+    // two non-trivial slices is the defect and arm A only ever tested the degenerate case.
+    for (int tok = lo + (int) sg; tok < n_tok; tok += (int) nsg) {
         const int pb = block_table[seq * args.max_blocks + tok / args.block_size];
         const uint64_t b = (uint64_t) (tok % args.block_size) * args.stride_token
                          + (uint64_t) pb * args.stride_block;
 
+        const uint64_t k_off = b + (uint64_t) kv_h * args.stride_head;
         float part = 0.0f;
-        if (d < D) {
-            part = q[q_off + d] * (float) kv_cache[b + (uint64_t) kv_h * args.stride_head + d];
+        for (int i = 0; i < NPT; ++i) {
+            const int d = (int) lane + i*32;
+            if (d < D) { part += qv[i] * (float) kv_cache[k_off + d]; }
         }
-        shmem[tpitg] = part;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = ntg / 2; stride > 0; stride >>= 1) {
-            if (tpitg < stride) { shmem[tpitg] += shmem[tpitg + stride]; }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        float sc = shmem[0] * args.scale;
+        float sc = simd_sum(part) * args.scale;
 
         const int rd = q_pos - tok;
         if (args.rel_extent > 0 && rd < args.rel_extent) {
@@ -3059,16 +3068,42 @@ kernel void kernel_paged_attn_f32(
         const float resc  = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
         const float pv    = exp(sc - m_new);
         l_i = l_i * resc + pv;
-        if (d < D) {
-            acc = acc * resc
-                + pv * (float) kv_cache[b + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head + d];
+        const uint64_t v_off = b + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head;
+        for (int i = 0; i < NPT; ++i) {
+            const int d = (int) lane + i*32;
+            if (d < D) { accv[i] = accv[i] * resc + pv * (float) kv_cache[v_off + d]; }
         }
         m_i = m_new;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (d < D) {
-        dst[q_off + d] = acc / (l_i + 1e-6f);
+    threadgroup float * sh_m   = shmem;
+    threadgroup float * sh_l   = shmem + nsg;
+    threadgroup float * sh_acc = shmem + 2*nsg;
+
+    if (lane == 0) { sh_m[sg] = m_i; sh_l[sg] = l_i; }
+    for (int i = 0; i < NPT; ++i) {
+        const int d = (int) lane + i*32;
+        if (d < D) { sh_acc[sg*D + d] = accv[i]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg == 0) {
+        float m_all = -INFINITY;
+        for (uint t = 0; t < nsg; ++t) { m_all = max(m_all, sh_m[t]); }
+        float l_all = 0.0f;
+        for (uint t = 0; t < nsg; ++t) {
+            l_all += sh_l[t] * ((sh_m[t] == -INFINITY) ? 0.0f : exp(sh_m[t] - m_all));
+        }
+        for (int i = 0; i < NPT; ++i) {
+            const int d = (int) lane + i*32;
+            if (d < D) {
+                float a = 0.0f;
+                for (uint t = 0; t < nsg; ++t) {
+                    a += sh_acc[t*D + d] * ((sh_m[t] == -INFINITY) ? 0.0f : exp(sh_m[t] - m_all));
+                }
+                dst[q_off + d] = a / (l_all + 1e-6f);
+            }
+        }
     }
 }
 

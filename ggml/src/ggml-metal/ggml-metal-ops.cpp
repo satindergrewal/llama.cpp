@@ -4544,9 +4544,11 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_paged_attn(lib, op);
 
-    // one thread per head_dim element, rounded up to a power of two for the reduction
-    int nth = 32;
-    while (nth < head_dim) { nth *= 2; }
+    // decode has ONE query token, so its grid is only (1, n_heads) threadgroups and needs
+    // simd groups to create parallelism; prefill already has n_tokens*n_heads threadgroups
+    // and extra slices there only widen the combine.
+    const int nsg = n_tokens > 1 ? 2 : 8;
+    const int nth = 32 * nsg;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -4559,7 +4561,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rel ? rel : q), 7);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),       8);
 
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, nth*sizeof(float), 0);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, (2*nsg + nsg*head_dim)*sizeof(float), 0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, n_heads, 1, nth, 1, 1);
 
