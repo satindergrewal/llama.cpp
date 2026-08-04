@@ -3786,3 +3786,38 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
 
     return relative_bucket;
 }
+
+// ★ Generic paged capability test. See the header for why this is a capability check and not an
+// architecture allow-list.
+bool llm_graph_context::paged_cache_type_supported(ggml_type type, bool allow_quant) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 ||
+           (allow_quant && type == GGML_TYPE_Q8_0);
+}
+
+bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context * pctx, int il) const {
+    if (pctx == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * kv = pctx->get_k(il);
+    if (kv == nullptr) {
+        return false;
+    }
+
+    const int64_t head_dim = hparams.n_embd_head_v(il);
+
+    // Head geometry the banded/paged kernels actually implement. Widening this set is a KERNEL
+    // change, not a model change -- which is exactly why it is asked of the layer and not of a
+    // model name.
+    if (!(head_dim == 64 || head_dim == 128)) {
+        return false;
+    }
+
+    if (hparams.n_head_kv(il) == 0 || hparams.n_head(il) % hparams.n_head_kv(il) != 0) {
+        return false;
+    }
+
+    const bool allow_quant = getenv("LLAMA_BANDED_QUANT_KV") != nullptr;
+
+    return paged_cache_type_supported(kv->type, allow_quant);
+}

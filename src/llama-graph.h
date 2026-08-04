@@ -1096,6 +1096,19 @@ struct llm_graph_context {
     //
     // attention
     //
+    // ★ CAPABILITY TEST for the paged path -- deliberately NOT an architecture check.
+    // the owner's bar is "I load ANY model, it works as I expect", and an arch allow-list can
+    // never satisfy that; a capability test can. This asks ONLY what the LAYER reports: does it
+    // have a paged K tensor, is the head geometry one the kernel handles, is GQA evenly
+    // divisible, is the cache type supported. No arch name appears anywhere in it.
+    //
+    // Hoisted verbatim from inkling.cpp, which was the ONLY arch with a paged read path. The
+    // predicate was already capability-shaped ("Only the kernel's own shape/type contract
+    // belongs here" -- its own comment); it was arch-local by ACCIDENT, not by design.
+    static bool paged_cache_type_supported(ggml_type type, bool allow_quant);
+
+    bool paged_layer_supported(const llama_kv_cache_paged_context * pctx, int il) const;
+
     ggml_tensor * build_attn_mha_paged(
              ggml_tensor * q,               // [n_embd_head, n_head, n_tokens]
              ggml_tensor * k_cur,           // [n_embd_head, n_head_kv, n_tokens]

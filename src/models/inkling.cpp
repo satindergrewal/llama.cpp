@@ -295,13 +295,17 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
     // on use_banded_flash silently rerouted ALL scheduler-driven hybrid decode to the
     // static unfused path (caught op-level by hybrid_paged_gate, 2026-08-04). Only the
     // kernel's own shape/type contract belongs here.
+    // Now the SHARED capability test (llm_graph_context::paged_layer_supported). Hoisted so
+    // every architecture can ask the same question -- this predicate was already
+    // capability-shaped, it was arch-local by accident.
+    //
+    // ⚠ ONE DELIBERATE SEMANTIC CHANGE, stated rather than hidden: the old lambda required the
+    // MODEL-level head_dim to be 64/128 AND the layer to match it. The shared version asks the
+    // LAYER's own head dim directly. For a uniform-head model (Inkling included) these are
+    // identical; for a mixed-head model the shared version is the more correct test, because a
+    // supported layer should not be refused for a sibling layer's geometry.
     const auto use_paged_banded = [&](const llama_kv_cache_paged_context * pctx, int il) {
-        ggml_tensor * kv = pctx->get_k(il);
-        return kv != nullptr &&
-            (head_dim == 64 || head_dim == 128) &&
-            hparams.n_embd_head_v(il) == head_dim &&
-            hparams.n_head(il) % hparams.n_head_kv(il) == 0 &&
-            banded_cache_type_supported(kv->type);
+        return paged_layer_supported(pctx, il);
     };
 
     // a layer that will take the 4c-1 paged branch consumes neither the static rel-idx
