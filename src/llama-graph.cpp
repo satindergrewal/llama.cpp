@@ -3821,3 +3821,54 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
 
     return paged_cache_type_supported(kv->type, allow_quant);
 }
+
+// ★ Generic paged consumer -- see the header. Ported from the inkling.cpp block that was the only
+// paged read path in the tree (credit: that block is where this logic was proven).
+ggml_tensor * llm_graph_context::build_attn_paged_or_null(
+        const llama_kv_cache_paged_context * paged_ctx,
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        float         kq_scale,
+        int           il,
+        int64_t       visibility_window,
+        ggml_tensor * rel,
+        int64_t       rel_extent) const {
+    if (paged_ctx == nullptr) {
+        return nullptr;
+    }
+
+    if (!paged_layer_supported(paged_ctx, il)) {
+        // NEVER fall back silently: a scheduler-driven decode landing on the static cache defeats
+        // the paged design while producing correct-LOOKING tokens. That indistinguishability is
+        // exactly what made audit finding 5 survive as long as it did.
+        LLAMA_LOG_WARN("%s: paged pool active but layer %d fails the paged capability contract "
+                       "-- this layer takes the static path\n", __func__, il);
+        return nullptr;
+    }
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+
+    ggml_tensor * kv_cache_l = paged_ctx->get_k(il);   // interleaved K+V heads (src[3] contract)
+    GGML_ASSERT(kv_cache_l != nullptr);
+
+    auto * inp_paged = build_attn_inp_kv_paged(paged_ctx);
+
+    ggml_tensor * rel_p = rel ? ggml_cont(ctx0, rel) : nullptr;
+
+    ggml_tensor * cur_p = ggml_paged_attn_banded(ctx0,
+            q, k, v, kv_cache_l, kv_cache_l,
+            inp_paged->paged_block_table, inp_paged->paged_write_slots,
+            inp_paged->paged_context_lens, inp_paged->paged_batch_offsets,
+            inp_paged->paged_batch_lens, rel_p,
+            kq_scale, (int) cparams.block_size, (int) inp_paged->paged_block_table->ne[0],
+            rel_extent, visibility_window);
+
+    ggml_tensor * cur = ggml_reshape_2d(ctx0, cur_p, cur_p->ne[0]*cur_p->ne[1], cur_p->ne[2]);
+
+    // The op fuses the KV write, so this output MUST be expanded into the graph or the scheduler
+    // never computes it -- the exact failure DSpark hit on the deepseek4 capture hook today.
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}

@@ -1,5 +1,7 @@
 #pragma once
 
+class llama_kv_cache_paged_context;
+
 #include "llama-model.h"
 #include "llama-graph.h"
 #include "llama-model-loader.h"
@@ -2039,7 +2041,8 @@ struct llama_model_qwen35 : public llama_model_base {
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+        const llama_kv_cache_paged_context * paged_ctx);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

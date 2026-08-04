@@ -1109,6 +1109,29 @@ struct llm_graph_context {
 
     bool paged_layer_supported(const llama_kv_cache_paged_context * pctx, int il) const;
 
+    // ★ GENERIC PAGED CONSUMER. Returns the paged attention output for layer `il`, or nullptr if
+    // this layer cannot be paged (caller then takes its normal static path).
+    //
+    // This is the piece audit findings 5 and 7 proved missing: the paged POOL was built for
+    // non-SWA hybrids but no graph ever READ it, because the paged attention block lived inside
+    // inkling.cpp. Hand-copying that block into qwen35, then jamba, then nemotron-h would be the
+    // arch-allow-list problem in a new costume -- so it lives here ONCE and every arch calls it
+    // in two lines:
+    //     cur = build_attn_paged_or_null(paged_ctx, Qcur, Kcur, Vcur, kq_scale, il);
+    //     if (!cur) { cur = build_attn(inp, ...); }
+    //
+    // Eligibility is paged_layer_supported() -- a capability test on the LAYER, never an arch name.
+    ggml_tensor * build_attn_paged_or_null(
+            const llama_kv_cache_paged_context * paged_ctx,
+            ggml_tensor * q,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            float         kq_scale,
+            int           il,
+            int64_t       visibility_window = 0,
+            ggml_tensor * rel               = nullptr,
+            int64_t       rel_extent        = 0) const;
+
     ggml_tensor * build_attn_mha_paged(
              ggml_tensor * q,               // [n_embd_head, n_head, n_tokens]
              ggml_tensor * k_cur,           // [n_embd_head, n_head_kv, n_tokens]

@@ -1,4 +1,6 @@
 #include "models.h"
+#include "../llama-kv-cache-paged.h"
+#include "../llama-memory-hybrid.h"   // llm_graph_input_mem_hybrid::mctx is a forward decl in the header
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -172,7 +174,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+            // ★ findings 5+7: the paged POOL was built for non-SWA hybrids but no graph ever
+            // READ it -- this line passed the STATIC context and nothing else asked for paged.
+            // paged_ctx is nullptr unless a paged pool is live, so the default path is unchanged.
+            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il,
+                                   inp->mctx ? inp->mctx->get_attn_paged() : nullptr);
         }
 
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
@@ -260,7 +266,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
-        int                       il) {
+        int                       il,
+        const llama_kv_cache_paged_context * paged_ctx) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -319,10 +326,20 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-    cb(cur, "attn_pregate", il);
+    // ★ GENERIC PAGED CONSUMER (llm_graph_context::build_attn_paged_or_null). Two lines, and the
+    // paged logic lives ONCE for every arch -- not copied per model, which is the arch-allow-list
+    // problem in a new costume. Returns nullptr when the layer is not pageable or no pool is live,
+    // so the static path below is the unchanged default.
+    // Ornith's attention layers are full-causal: visibility_window 0, no rel bias.
+    cur = build_attn_paged_or_null(paged_ctx, Qcur, Kcur, Vcur, kq_scale, il);
+    if (cur != nullptr) {
+        cb(cur, "attn_pregate_paged", il);
+    } else {
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        cb(cur, "attn_pregate", il);
+    }
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
