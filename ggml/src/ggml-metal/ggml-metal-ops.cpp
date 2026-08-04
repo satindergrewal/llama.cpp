@@ -4689,6 +4689,35 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(btab),     3);
+    // ★ BLOCK-TABLE STRUCTURE PROBE (DS4P_DUMP_BT=1). Not a timing arm -- a STRUCTURAL check.
+    // If the pool hands out blocks 0,1,2,... for a single sequence, then paged is already doing
+    // near-identical memory access to static, and gather/indirection cannot be the prefill gap
+    // in ANY wall run so far. That eliminates a suspect by construction rather than by timing,
+    // which is the cheapest kind of elimination there is.
+    if (getenv("DS4P_DUMP_BT")) {
+        static bool bt_done = false;
+        if (!bt_done && n_tokens > 1) {
+            bt_done = true;
+            const int32_t * bt = (const int32_t *) btab->data;   // host-visible on unified memory
+            if (bt) {
+                const int mb   = ((const int32_t *)(op_params_f + 2))[0];
+                const int nblk = mb < 64 ? mb : 64;
+                bool contig = true;
+                for (int i = 1; i < nblk; ++i) {
+                    if (bt[i] != bt[i-1] + 1) { contig = false; break; }
+                }
+                char buf[512]; int off = 0;
+                for (int i = 0; i < (nblk < 16 ? nblk : 16); ++i) {
+                    off += snprintf(buf + off, sizeof(buf) - off, "%d ", bt[i]);
+                }
+                GGML_LOG_INFO("%s: DS4P-BT %s  max_blocks=%d  first16: %s\n",
+                              __func__, contig ? "CONTIGUOUS" : "SCATTERED", mb, buf);
+            } else {
+                GGML_LOG_INFO("%s: DS4P-BT UNREADABLE (btab->data null)\n", __func__);
+            }
+        }
+    }
+
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(clens),    4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(boffs),    5);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(blens),    6);
