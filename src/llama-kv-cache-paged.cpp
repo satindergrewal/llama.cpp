@@ -709,6 +709,23 @@ void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
         }
     }
 
+    // ★ SYNCHRONIZE. ggml_backend_tensor_set is ASYNCHRONOUS on CUDA, so without this the
+    // function returns once the copies are ENQUEUED, not once the KV is resident. Two
+    // consequences, one measurable and one latent:
+    //   - the caller's admit timer stopped early, so the economics gate believed a restore
+    //     cost ~208 ms when the wall clock put it near 615 ms, and it therefore admitted
+    //     restores it should have declined. I was timing the enqueue and calling it the
+    //     transfer -- the same class as trusting a log line that prints before the work.
+    //   - correctness rests on the copies landing before the first decode reads them, which
+    //     is true only while they share a stream. Making it explicit costs nothing here
+    //     (this path already moved hundreds of MiB) and removes the assumption.
+    if (gpu_backend != nullptr) {
+        ggml_backend_synchronize(gpu_backend);
+    }
+    if (cpu_backend != nullptr) {
+        ggml_backend_synchronize(cpu_backend);
+    }
+
     sequence_positions[seq_id]  = seq_range{ p_min, p_max };
     restored_seqs[seq_id]       = restored_seq{ std::move(ids), p_min, p_max };
 
