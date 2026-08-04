@@ -12794,7 +12794,7 @@ template<
     short DV,       // V head size
     short NE = 4,   // head elements per thread
     short Q  = OP_FLASH_ATTN_EXT_VEC_NQPSG,  // queries per threadgroup
-    short C  = OP_FLASH_ATTN_EXT_VEC_NCPSG>  // cache items per threadgroup
+    short C  = 64>   // PAGED: C MUST equal paged block_size  // cache items per threadgroup
 kernel void kernel_paged_champ_vec(
         constant ggml_metal_kargs_flash_attn_ext_vec & args,
         device const char * q,
@@ -13231,3 +13231,23 @@ kernel void kernel_paged_champ_vec(
 #undef NS10
 #undef NS20
 }
+
+// PAGED VEC instantiations.
+// ROOT CAUSE of three earlier shader breaks: FA_TYPES is #undef'd at :7909 and REDEFINED at
+// :8382 with a SEVEN-type list for the vec kernel. My earlier macro copied the MMA-era
+// SEVENTEEN-type definition from :7750, so nothing could resolve. The template header was
+// correct all along -- I misdiagnosed it as a bad extraction. This macro mirrors :8382 exactly.
+#define FA_TYPES_PVEC \
+           half4,  \
+           half4,  \
+           half4,  \
+    float,         \
+    float, float4, \
+           float4
+
+typedef decltype(kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 128, 128, 4>) paged_champ_vec_t;
+
+template [[host_name("kernel_paged_champ_vec_dk64_dv64"  )]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4,  64,  64, 4>;
+template [[host_name("kernel_paged_champ_vec_dk96_dv96"  )]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4,  96,  96, 4>;
+template [[host_name("kernel_paged_champ_vec_dk128_dv128")]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 128, 128, 4>;
+template [[host_name("kernel_paged_champ_vec_dk192_dv192")]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 192, 192, 4>;
