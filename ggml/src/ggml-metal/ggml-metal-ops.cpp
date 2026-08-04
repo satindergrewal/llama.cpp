@@ -4694,6 +4694,80 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     const bool bs_fc = !(getenv("DS4P_METAL_NO_BSFC") && atoi(getenv("DS4P_METAL_NO_BSFC")) != 0);
     args.bs_fc       = bs_fc ? 1 : 0;
 
+    // ================= PAGED CHAMPION PATH (DS4P_METAL_CHAMP=1) =================
+    // Ported ggml kernel_flash_attn_ext_impl with block-table K/V addressing. Preconditions are
+    // HARD and each is stated in the marker when it refuses -- a silent fallback here would look
+    // exactly like a working port that happens to be slow.
+    //   bs == C == 64   : the champion walks rows contiguously across its whole C-key chunk and
+    //                     paged rows are contiguous only WITHIN a block.
+    //   n_seq == 1      : plen[0] is the single sequence's context length in this first cut.
+    //   prefill only    : decode takes the combine path.
+    //   head_dim in the instantiated set.
+    if (getenv("DS4P_METAL_CHAMP") && atoi(getenv("DS4P_METAL_CHAMP")) != 0) {
+        const int n_seq_c = (int) blens->ne[0];
+        const bool hd_ok  = (head_dim == 64 || head_dim == 96 || head_dim == 128 || head_dim == 192);
+        const char * why  = bs_pa_lpk != 64 ? "bs!=64"
+                          : n_seq_c   != 1  ? "n_seq!=1"
+                          : n_tokens  <= 1  ? "decode"
+                          : !hd_ok          ? "head_dim" : nullptr;
+        if (why) {
+            static const char * last_why = nullptr;
+            if (why != last_why) { last_why = why;
+                GGML_LOG_INFO("%s: CHAMP-PAGED REFUSED (%s) D=%d bs=%d n_seq=%d n_tokens=%d\n",
+                              __func__, why, head_dim, bs_pa_lpk, n_seq_c, n_tokens);
+            }
+        } else {
+            const int champ_nsg = 4;
+            auto cp = ggml_metal_library_get_pipeline_paged_attn_champ(lib, op, champ_nsg);
+            const uint64_t st = kv_cache->nb[1] / sizeof(ggml_fp16_t);   // stride_token, elements
+            const uint64_t sh = kv_cache->nb[2] / sizeof(ggml_fp16_t);
+            const uint64_t sb = kv_cache->nb[3] / sizeof(ggml_fp16_t);
+
+            ggml_metal_kargs_flash_attn_ext fa = {};
+            fa.ne01 = n_tokens;  fa.ne02 = n_heads;  fa.ne03 = 1;   // ne03=1 pins ikv3=0
+            fa.nb01 = (uint64_t) n_heads*head_dim*sizeof(float);
+            fa.nb02 = (uint64_t) head_dim*sizeof(float);
+            fa.nb03 = 0;
+            fa.ne11 = 0;                       // unused: the port bounds on plen[0]
+            fa.ne_12_2 = n_heads_kv;           // ALSO carries the V head offset in the port
+            fa.ne_12_3 = 1;
+            fa.ns10 = (int32_t) st;            fa.ns20 = (int32_t) st;
+            fa.nb11 = st*sizeof(ggml_fp16_t);  fa.nb21 = st*sizeof(ggml_fp16_t);
+            fa.nb12 = sh*sizeof(ggml_fp16_t);  fa.nb22 = sh*sizeof(ggml_fp16_t);
+            fa.nb13 = sb*sizeof(ggml_fp16_t);  fa.nb23 = sb*sizeof(ggml_fp16_t);  // BLOCK stride
+            fa.ne1 = n_tokens; fa.ne2 = n_heads; fa.ne3 = 1;
+            fa.scale = op_params_f[0];
+
+            GGML_ASSERT(cp.smem <= 32768);
+            ggml_metal_encoder_set_pipeline(enc, cp);
+            ggml_metal_encoder_set_bytes   (enc, &fa, sizeof(fa), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache), 2);  // k
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache), 3);  // v
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        4);  // mask (unused)
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        5);  // sinks (unused)
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        6);  // pad (unused)
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        7);  // blk (unused)
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(btab),     8);  // ptab
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(clens),    9);  // plen
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),      10);  // dst
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, cp.smem, 0);
+            {
+                static int last = -1;
+                const int key = head_dim | (champ_nsg<<16);
+                if (key != last) { last = key;
+                    GGML_LOG_INFO("%s: CHAMP-PAGED ACTIVE D=%d bs=%d nsg=%d Q=%d C=%d smem=%zu/32768\n",
+                                  __func__, head_dim, bs_pa_lpk, champ_nsg,
+                                  OP_FLASH_ATTN_EXT_NQPSG, OP_FLASH_ATTN_EXT_NCPSG, cp.smem);
+                }
+            }
+            const int nqptg = OP_FLASH_ATTN_EXT_NQPSG;
+            ggml_metal_encoder_dispatch_threadgroups(enc,
+                (n_tokens + nqptg - 1)/nqptg, n_heads, 1, 32*champ_nsg, 1, 1);
+            return 1;
+        }
+    }
+
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        1);
