@@ -3039,9 +3039,13 @@ kernel void kernel_paged_attn_f32(
         threadgroup half  * tk = (threadgroup half *) shmem;
         threadgroup half  * tv = tk + bs*D;
         threadgroup half  * sq = tv + bs*D;
+        // ss holds the SCORES and is then overwritten IN PLACE with P. They were two
+        // buffers only while P was half and the scores were float; both are float now, so
+        // the split cost QR*SH floats for nothing. Safe in place: each lane owns distinct
+        // columns of a row its own simd group owns, and the write follows the read.
+        // This saving is what lets a larger staged tile fit -- smem is the binding constraint.
         threadgroup float * ss = (threadgroup float *) (sq + QR*D);
-        threadgroup float * sp = ss + QR*SH;
-        threadgroup float * so = sp + QR*SH;
+        threadgroup float * so = ss + QR*SH;
         threadgroup float * Mr = so + QR*PV;
         threadgroup float * Sr = Mr + QR;
 
@@ -3146,7 +3150,7 @@ kernel void kernel_paged_attn_f32(
                     for (uint c = lnm; c < (uint) bs; c += 32) {
                         const float s  = ss[jl*SH + c];
                         const float vs = (s == -INFINITY) ? 0.0f : exp(s - mx);
-                        sp[jl*SH + c] = vs;
+                        ss[jl*SH + c] = vs;             // scores -> P, in place
                         sum += vs;
                     }
                     sum = simd_sum(sum);
@@ -3166,7 +3170,7 @@ kernel void kernel_paged_attn_f32(
                         simdgroup_float8x8 mp;
                         simdgroup_half8x8  mv;
                         simdgroup_barrier(mem_flags::mem_none);
-                        simdgroup_load(mp, sp + (8*sgm)*SH + cc*8, SH);
+                        simdgroup_load(mp, ss + (8*sgm)*SH + cc*8, SH);
                         simdgroup_load(mv, tv + cc*8*D + dd*8, D);
                         simdgroup_barrier(mem_flags::mem_none);
                         simdgroup_multiply_accumulate(lo8, mp, mv, lo8);

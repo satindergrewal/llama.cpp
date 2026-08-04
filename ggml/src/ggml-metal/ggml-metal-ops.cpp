@@ -4509,7 +4509,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // dispatch logic rather than left as a comment: the kernel's layout and this allocation
     // are ONE decision, and a mismatch between them already cost a crash and a false
     // "ALL PASSED" (the fallback ran silently while the gate reported success).
-    //   bytes = (2*bs*D + QR*D)*2  +  (2*QR*SH + QR*PV + 2*QR)*4,   QR = 8*nsg, SH = bs, PV = D
+    //   bytes = (2*bs*D + QR*D)*2  +  (QR*SH + QR*PV + 2*QR)*4,   QR = 8*nsg, SH = bs, PV = D
     // Measured fits (ornith tools/ds4-gates/sgload_probe/fa_gate.sh):
     //   D=64  bs=32 nsg=4 -> 28,928  OK      D=64 bs=32 nsg=8 -> 49,664  DOES NOT FIT
     //   D=128 bs=16 nsg=2 -> 22,144  OK
@@ -4517,8 +4517,9 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     const size_t smem_budget = 32768;
     auto mma_smem = [&](int nsg_try) -> size_t {
         const size_t QR = (size_t) 8 * nsg_try;
+        // ss is reused in place as P (both float), so ONE score tile, not two.
         return ((size_t) 2*bs_pa*head_dim + QR*head_dim) * sizeof(uint16_t)
-             + (2*QR*bs_pa + QR*head_dim + 2*QR) * sizeof(float);
+             + (QR*bs_pa + QR*head_dim + 2*QR) * sizeof(float);
     };
     int  mma_nsg = 0;
     bool use_mma = (n_tokens > 1) && (head_dim % 8 == 0) && (bs_pa % 8 == 0) && (bs_pa > 0);
