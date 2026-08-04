@@ -12083,8 +12083,11 @@ void kernel_paged_champ_impl(
         const short ikv2 = iq2/(args.ne02/args.ne_12_2);
         const short ikv3 = iq3/(args.ne03/args.ne_12_3);
 
-        k += ikv2*args.nb12 + ikv3*args.nb13;
-        v += ikv2*args.nb22 + ikv3*args.nb23;
+        // ★ PAGED: nb13/nb23 are REPURPOSED as the block stride, so the ikv3 terms must not be
+        // used -- the host pins ne03 = ne_12_3 = 1 so ikv3 is always 0. V additionally lives at
+        // head (n_heads_kv + kv_h) in our cache layout, which ne_12_2 carries.
+        k += ikv2*args.nb12;
+        v += (ikv2 + args.ne_12_2)*args.nb22;
     }
 
     // load heads from Q to shared memory
