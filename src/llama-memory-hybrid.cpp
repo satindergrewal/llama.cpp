@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-kv-cache-paged.h"
 
 //
 // llama_memory_hybrid
@@ -64,6 +65,16 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_recr
     )) {}
 
+llama_memory_hybrid::~llama_memory_hybrid() = default;
+
+void llama_memory_hybrid::set_attn_paged(llama_kv_cache_paged * paged) {
+    mem_attn_paged.reset(paged);
+}
+
+llama_kv_cache_paged * llama_memory_hybrid::get_mem_attn_paged() const {
+    return mem_attn_paged.get();
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         balloc.split_reset();
@@ -115,8 +126,23 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        return std::make_unique<llama_memory_hybrid_context>(
+        // When the paged pool is active AND its scheduler has set batch info, carry the paged
+        // context alongside (same ubatches -- the recurrent split constraints win). Dark until
+        // the scheduler drives it: has_paged_batch_info() is false without that, so this cannot
+        // trip the init ordering assert. Mirrors llama_memory_hybrid_iswa::init_batch.
+        llama_memory_context_ptr paged_ctx;
+        if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
+            paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches); // copy: hybrid ctx owns the originals
+        }
+
+        auto ctx = std::make_unique<llama_memory_hybrid_context>(
                 this, std::move(heads_attn), std::move(ubatches));
+
+        if (paged_ctx) {
+            ctx->set_attn_paged_ctx(std::move(paged_ctx));
+        }
+
+        return ctx;
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -276,4 +302,8 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
+}
+
+const llama_kv_cache_paged_context * llama_memory_hybrid_context::get_attn_paged() const {
+    return static_cast<const llama_kv_cache_paged_context *>(ctx_attn_paged.get());
 }

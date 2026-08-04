@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "llama-context.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-hybrid.h"
 #include "llama-impl.h"
 #include "llama-paged-scheduler-impl.h"
 
@@ -20,8 +21,17 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
     bool   is_hybrid = false;
     auto * paged_kv  = dynamic_cast<llama_kv_cache_paged *>(ctx->get_memory());
     if (!paged_kv) {
-        // 3b hybrid archs: the pool lives inside the hybrid wrapper, not as the whole memory
-        if (auto * hyb = dynamic_cast<llama_memory_hybrid_iswa *>(ctx->get_memory())) {
+        // Hybrid archs: the pool lives inside the hybrid wrapper, not as the whole memory.
+        // BOTH wrappers must be tried. Resolving only the ISWA type meant a hybrid WITHOUT SWA
+        // fell through to the error below and was told SWA was unsupported -- on Ornith, which
+        // reports n_swa = 0. Checked ISWA first only because it is the narrower type.
+        if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(ctx->get_memory())) {
+            paged_kv = hyb_iswa->get_mem_attn_paged();
+            if (paged_kv) {
+                LLAMA_LOG_INFO("%s: using the hybrid-iswa wrapper's paged attention pool\n", __func__);
+                is_hybrid = true;
+            }
+        } else if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(ctx->get_memory())) {
             paged_kv = hyb->get_mem_attn_paged();
             if (paged_kv) {
                 LLAMA_LOG_INFO("%s: using the hybrid wrapper's paged attention pool\n", __func__);
@@ -30,12 +40,19 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
         }
     }
     if (!paged_kv) {
+        // Report WHICH precondition failed. The old text blamed SWA unconditionally, which
+        // sent a debugging session down an SWA path on a model with n_swa = 0. Name what was
+        // actually found instead of guessing at the cause.
+        const char * kind =
+            dynamic_cast<llama_memory_hybrid_iswa *>(ctx->get_memory()) ? "hybrid-iswa wrapper, but it holds no paged pool" :
+            dynamic_cast<llama_memory_hybrid      *>(ctx->get_memory()) ? "hybrid wrapper, but it holds no paged pool"      :
+                                                                         "a non-paged memory type";
         LLAMA_LOG_ERROR(
-            "%s: context does not have a paged KV cache. "
-            "Make sure to pass --kv-paged (-kvp) and use a "
-            "supported architecture. SWA architectures (gemma3, llama4, etc.) "
-            "are not yet supported.\n",
-            __func__);
+            "%s: context does not have a paged KV cache: found %s. "
+            "Pass --kv-paged (-kvp); if you did, this model's memory was built without a paged "
+            "attention pool (hybrid bring-up requires DS4P_PAGED_HYBRID=1; SWA archs such as "
+            "gemma3/llama4 are not wired yet).\n",
+            __func__, kind);
         return nullptr;
     }
 

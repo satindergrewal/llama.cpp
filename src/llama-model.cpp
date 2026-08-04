@@ -2261,7 +2261,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                         res = hybrid_iswa;
                     } else {
-                        res = new llama_memory_hybrid(
+                        auto * hybrid = new llama_memory_hybrid(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
@@ -2279,6 +2279,42 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
+
+                        // NON-SWA twin of the ISWA bring-up above. Without this a hybrid that has
+                        // no SWA (Ornith reports n_swa = 0) built no pool at all, and the
+                        // scheduler then reported a missing paged cache while blaming SWA.
+                        // Pool spans all layers for now, matching the ISWA path; the attn-only
+                        // filter refinement comes with the graph path.
+                        if (cparams.kv_paged && paged_hybrid_dev) {
+                            LLAMA_LOG_INFO("%s: DS4P_PAGED_HYBRID: constructing the paged attention pool "
+                                    "for a non-SWA hybrid (hybrid DECODE gate pending)\n", __func__);
+
+                            const uint32_t pg_head_dim   = hparams.n_embd_head_v();
+                            const uint32_t pg_n_head     = hparams.n_head_kv();
+                            const uint32_t pg_n_layers   = hparams.n_layer();
+                            const uint32_t pg_block_size = cparams.block_size;
+
+                            auto * paged_attn = new llama_kv_cache_paged(pg_head_dim, pg_n_head,
+                                    pg_block_size, pg_n_layers, cparams.n_ubatch, cparams.n_seq_max);
+
+                            bool pg_multi_dev = false;
+                            if (layer_backends.size() == pg_n_layers) {
+                                for (uint32_t il = 1; il < pg_n_layers; ++il) {
+                                    if (layer_backends[il] != layer_backends[0]) { pg_multi_dev = true; break; }
+                                }
+                            }
+                            if (pg_multi_dev) {
+                                paged_attn->init_multi(layer_backends, backend_cpu, params.type_k,
+                                        cparams.n_gpu_blocks, cparams.n_cpu_blocks, cparams.kv_paged_watermark);
+                            } else {
+                                paged_attn->init(backend_gpu, backend_cpu, params.type_k,
+                                        cparams.n_gpu_blocks, cparams.n_cpu_blocks, cparams.kv_paged_watermark);
+                            }
+
+                            hybrid->set_attn_paged(paged_attn);
+                        }
+
+                        res = hybrid;
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;

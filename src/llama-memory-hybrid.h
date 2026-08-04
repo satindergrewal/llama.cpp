@@ -9,6 +9,8 @@
 #include <memory>
 #include <vector>
 
+class llama_kv_cache_paged;
+
 //
 // llama_memory_hybrid
 //
@@ -41,7 +43,18 @@ public:
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr);
 
-    ~llama_memory_hybrid() = default;
+    // defined in the .cpp where llama_kv_cache_paged is complete (unique_ptr member)
+    ~llama_memory_hybrid();
+
+    // hand ownership of a constructed+init'd paged attention pool to this wrapper. Built by
+    // create_memory, where the backends are in scope (same shape as the flat-arch paged path
+    // and as llama_memory_hybrid_iswa). The graph path reads it via the context's
+    // get_attn_paged. This is the NON-SWA twin of the ISWA bring-up: without it a hybrid that
+    // has no SWA builds no pool at all, and the scheduler then reports a missing paged cache
+    // while blaming SWA -- measured on Ornith (qwen35, n_swa=0).
+    void set_attn_paged(llama_kv_cache_paged * paged);
+
+    llama_kv_cache_paged * get_mem_attn_paged() const;
 
     //
     // llama_memory_i
@@ -88,6 +101,10 @@ private:
 
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+
+    // optional paged attention pool (replaces mem_attn's role when active); see
+    // set_attn_paged. Not const: handed in post-construction by create_memory.
+    std::unique_ptr<llama_kv_cache_paged> mem_attn_paged;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
@@ -127,6 +144,10 @@ public:
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
 
+    // the paged attention context when the wrapper's paged pool is active AND the scheduler
+    // has set batch info for it; nullptr otherwise (static path unaffected)
+    const llama_kv_cache_paged_context * get_attn_paged() const;
+
 private:
     // the index of the next ubatch to process
     size_t i_next = 0;
@@ -136,5 +157,12 @@ private:
     const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;
 
+    // set post-construction by the wrapper's init_batch when the paged pool is active and
+    // scheduler batch info is present; see set_attn_paged_ctx
+    llama_memory_context_ptr ctx_attn_paged;
+
     const llama_memory_status status;
+
+public:
+    void set_attn_paged_ctx(llama_memory_context_ptr ctx) { ctx_attn_paged = std::move(ctx); }
 };
