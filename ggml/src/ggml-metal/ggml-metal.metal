@@ -3042,10 +3042,11 @@ kernel void kernel_paged_attn_f32(
     float m_i = -INFINITY;
     float l_i = 0.0f;
 
-    // ARM B: CONTIGUOUS split -- sg s takes [lo + s*chunk, lo + (s+1)*chunk).
-    // Two NON-TRIVIAL slices, which arm A (full/empty) never produced. If this passes, the
-    // merge is fine for real slices and STRIDING is the defect. If it fails, the merge of
-    // two non-trivial slices is the defect and arm A only ever tested the degenerate case.
+    // Split-K over the key range: simd group s walks tokens s, s+nsg, s+2*nsg, ... Strided
+    // rather than contiguous because a strided walk keeps every group's loads inside the
+    // same neighbourhood of the block table, and because contiguous chunking leaves the last
+    // group short whenever the span does not divide evenly.
+    // (Both distributions were measured equivalent for correctness -- arms B and C.)
     for (int tok = lo + (int) sg; tok < n_tok; tok += (int) nsg) {
         const int pb = block_table[seq * args.max_blocks + tok / args.block_size];
         const uint64_t b = (uint64_t) (tok % args.block_size) * args.stride_token
