@@ -3321,7 +3321,10 @@ kernel void kernel_paged_attn_f32(
         // Q must be STAGED, not held in registers: phase A needs every lane to see the whole
         // Q row, and D floats per lane blows the register file (fatal at D=256). bs is even
         // and TKP+D = 2D+2 is even, so this half* -> float* cast is always 4-byte aligned.
-        threadgroup float * sq = (threadgroup float *) (tv + bs*D);
+        // When V is NOT staged, tv occupies no smem and sq starts right after K. Getting this
+        // wrong would silently overlap sq with a tv nobody writes -- so the base is derived from
+        // the SAME flag the staging loop reads, never assumed.
+        threadgroup float * sq = (threadgroup float *) (args.stage_v ? (tv + bs*D) : (tk + bs*TKP));
         threadgroup float * sp = sq + nsg*D;   // 32 scores per simd group, broadcast phase A->B
 
         if (seq_f == seq_l && seq_l >= 0) {
@@ -3351,7 +3354,12 @@ kernel void kernel_paged_attn_f32(
                     const uint t  = idx / (uint) D;
                     const uint d2 = idx % (uint) D;
                     tk[t*(uint) TKP + d2] = kv_cache[kb + (uint64_t) t * args.stride_token + d2];
-                    tv[idx]               = kv_cache[vb + (uint64_t) t * args.stride_token + d2];
+                    // ★ STAGING ARM: V read straight from device is the champion shape
+                    // (ggml-metal.metal kernel_flash_attn_ext, `device const v_t * pv`). Halves
+                    // device->threadgroup staging traffic; ONE variable, K staging untouched.
+                    if (args.stage_v) {
+                        tv[idx]           = kv_cache[vb + (uint64_t) t * args.stride_token + d2];
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -3394,11 +3402,25 @@ kernel void kernel_paged_attn_f32(
                         // loop because resc is now per BLOCK, not per key.
                         for (int i = 0; i < NPT; ++i) { accv[i] *= resc; }
                         const int kmax = min(32, tend - tb);
-                        for (int k = 0; k < kmax; ++k) {
-                            const float pk = sp[sg*32 + k];
-                            for (int i = 0; i < NPT; ++i) {
-                                const int d2 = (int) lane + i*32;
-                                if (d2 < D) { accv[i] += pk * (float) tv[(tb+k)*D + d2]; }
+                        // args.stage_v is threadgroup-uniform, so this branch is hoisted out of
+                        // the key loop rather than tested per key -- a per-key ternary would add
+                        // cost to the very thing being measured and confound the arm.
+                        if (args.stage_v) {
+                            for (int k = 0; k < kmax; ++k) {
+                                const float pk = sp[sg*32 + k];
+                                for (int i = 0; i < NPT; ++i) {
+                                    const int d2 = (int) lane + i*32;
+                                    if (d2 < D) { accv[i] += pk * (float) tv[(tb+k)*D + d2]; }
+                                }
+                            }
+                        } else {
+                            for (int k = 0; k < kmax; ++k) {
+                                const float pk = sp[sg*32 + k];
+                                const uint64_t vo = vb + (uint64_t)(tb+k) * args.stride_token;
+                                for (int i = 0; i < NPT; ++i) {
+                                    const int d2 = (int) lane + i*32;
+                                    if (d2 < D) { accv[i] += pk * (float) kv_cache[vo + d2]; }
+                                }
                             }
                         }
                         m_i = m_new;
@@ -3420,9 +3442,17 @@ kernel void kernel_paged_attn_f32(
                     const float resc  = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
                     const float pv    = (sc  == -INFINITY) ? 0.0f : exp(sc - m_new);
                     l_i = l_i * resc + pv;
-                    for (int i = 0; i < NPT; ++i) {
-                        const int d2 = (int) lane + i*32;
-                        if (d2 < D) { accv[i] = accv[i] * resc + pv * (float) tv[t*D + d2]; }
+                    if (args.stage_v) {
+                        for (int i = 0; i < NPT; ++i) {
+                            const int d2 = (int) lane + i*32;
+                            if (d2 < D) { accv[i] = accv[i] * resc + pv * (float) tv[t*D + d2]; }
+                        }
+                    } else {
+                        const uint64_t vo = vb + (uint64_t) t * args.stride_token;
+                        for (int i = 0; i < NPT; ++i) {
+                            const int d2 = (int) lane + i*32;
+                            if (d2 < D) { accv[i] = accv[i] * resc + pv * (float) kv_cache[vo + d2]; }
+                        }
                     }
                     m_i = m_new;
                 }
