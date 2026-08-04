@@ -3090,6 +3090,14 @@ private:
                 slot->n_decoded_last       = 0;
                 slot->t_prompt_processing  = (slot->t_start_generation - slot->t_start_process_prompt) / 1e3;
                 metrics.on_prompt_eval(*slot);
+
+                // P1-5 economics: teach the bank what a prefill actually costs on THIS
+                // model, so it can decline restores that would cost more than recomputing.
+                // note_prefill ignores anything under 256 tokens, which is what keeps a
+                // warm request (1 token, in a window containing its own restore) from
+                // poisoning the estimate it is being judged against.
+                server_kv_bank::instance().note_prefill(slot->n_prompt_tokens_processed,
+                                                        slot->t_prompt_processing);
             }
             slot->t_token_generation = std::max<int64_t>(1, t_now - slot->t_start_generation) / 1e3;
 

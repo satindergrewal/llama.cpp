@@ -253,6 +253,39 @@ bool server_kv_bank::probe(const server_tokens & tokens_new, const std::string &
         return false;
     }
 
+    // ★ ECONOMICS GATE -- the difference between a cache and a liability.
+    // Measured: on qwen3-4b IQ4_KT an unconditional admit made the warm request 1.64x
+    // SLOWER than the cold one, because reading 1.59 GiB of KV back costs roughly what
+    // recomputing 11K tokens costs on a 4B model at 4 bits. The SAME restore is a large win
+    // on a 600B model, where prefill per token is orders of magnitude dearer and the KV per
+    // token is not. So this compares two MEASURED rates rather than assuming either.
+    //
+    // Until both rates are known the bank admits anyway and learns from the result: one
+    // possibly-slow request buys the measurement that protects every later one.
+    // DS4P_BANK_FORCE=1 skips the gate, for A/B arms that need the admit to happen.
+    {
+        const char * force  = getenv("DS4P_BANK_FORCE");
+        const bool   forced = force != nullptr && atoi(force) != 0;
+
+        struct stat sb;
+        if (!forced && ewma_read_mib_per_ms > 0.0 && ewma_prefill_ms_per_tok > 0.0 &&
+            stat(best_path.c_str(), &sb) == 0) {
+            const double restore_ms = ((double) sb.st_size / (1024.0 * 1024.0)) / ewma_read_mib_per_ms;
+            const double prefill_ms = (double) best_lcp * ewma_prefill_ms_per_tok;
+
+            if (restore_ms >= prefill_ms) {
+                n_uneconomic++;
+                SRV_INF(" - kv-bank: DECLINING %s -- restoring costs ~%.0f ms but prefilling those "
+                        "%zu tokens costs ~%.0f ms (declines = %llu)\n",
+                        best_path.c_str(), restore_ms, (size_t) best_lcp, prefill_ms,
+                        (unsigned long long) n_uneconomic);
+                return false;
+            }
+        }
+    }
+
+    const int64_t t_read_start = ggml_time_us();
+
     // rebuild the entry
     FILE * f = fopen(best_path.c_str(), "rb");
     if (f == nullptr) { n_probe_miss++; return false; }
@@ -296,9 +329,38 @@ bool server_kv_bank::probe(const server_tokens & tokens_new, const std::string &
         }
     }
 
+    // measured read bandwidth feeds the gate above -- the estimate a later request is
+    // declined on is this request's own observation, not a constant anybody chose
+    {
+        const double ms  = (ggml_time_us() - t_read_start) / 1000.0;
+        const double mib = (double) (out.data.main.size() + out.data.drft.size()) / (1024.0 * 1024.0);
+        if (ms > 0.0 && mib > 0.0) {
+            const double rate = mib / ms;
+            ewma_read_mib_per_ms = ewma_read_mib_per_ms > 0.0
+                ? 0.7 * ewma_read_mib_per_ms + 0.3 * rate
+                : rate;
+        }
+    }
+
     n_admitted++;
     SRV_INF(" - kv-bank: admitted %s (lcp = %zu of %zu new tokens, %.3f MiB, admits = %llu)\n",
             best_path.c_str(), best_lcp, new_toks.size(),
             (main_sz + drft_sz) / (1024.0 * 1024.0), (unsigned long long) n_admitted);
     return true;
+}
+
+// P1-5 ECONOMICS: the prefill side of the comparison. Only genuinely cold prefills are
+// admissible evidence -- see the header for why a warm request must never be counted here.
+void server_kv_bank::note_prefill(size_t n_tokens, double ms) {
+    // a handful of tokens is dominated by fixed per-request overhead and says nothing about
+    // the per-token rate the gate needs
+    if (n_tokens < 256 || ms <= 0.0) {
+        return;
+    }
+
+    const double rate = ms / (double) n_tokens;
+
+    ewma_prefill_ms_per_tok = ewma_prefill_ms_per_tok > 0.0
+        ? 0.7 * ewma_prefill_ms_per_tok + 0.3 * rate
+        : rate;
 }

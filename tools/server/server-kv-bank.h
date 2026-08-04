@@ -34,6 +34,20 @@ class server_kv_bank {
     bool probe(const server_tokens & tokens_new, const std::string & identity_cur,
                server_prompt_cache_state & out);
 
+    // P1-5 ECONOMICS. A restore is only worth doing when reading the state back is cheaper
+    // than recomputing it, and which way that goes is a property of the MODEL, not of the
+    // feature: state bytes per token are fixed by the architecture, while prefill cost per
+    // token scales with parameter count. Measured on qwen3-4b IQ4_KT, reading 1.59 GiB of
+    // KV costs about what prefilling 11K tokens costs, so admitting unconditionally made
+    // the warm request 1.64x SLOWER than the cold one (2,862 vs 1,742 ms wall). Both rates
+    // are therefore measured at runtime and each request decides for itself -- there is no
+    // constant here to get wrong on the next model.
+    //
+    // Feed ONLY genuinely cold prefills in here. A warm request prefills a single token in
+    // a window that contains its own restore, and letting that into the estimate would have
+    // the estimator learning from the very thing it is deciding about.
+    void note_prefill(size_t n_tokens, double ms);
+
   private:
     server_kv_bank();
 
@@ -44,4 +58,9 @@ class server_kv_bank {
     uint64_t    n_spilled = 0;
     uint64_t    n_admitted = 0;
     uint64_t    n_probe_miss = 0;
+    uint64_t    n_uneconomic = 0;
+
+    // 0 = never measured; until both sides are known the bank admits and learns from it
+    double ewma_prefill_ms_per_tok = 0.0;
+    double ewma_read_mib_per_ms    = 0.0;
 };
