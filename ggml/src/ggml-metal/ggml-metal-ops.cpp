@@ -4529,22 +4529,20 @@ static void ds4p_dump_env_once() {
     if (done) { return; }
     done = true;
 
-    static const char * keys[] = {
-        "DS4P_METAL_CHAMP", "DS4P_METAL_LPK", "DS4P_METAL_MMA", "DS4P_METAL_NO_MMA",
-        "DS4P_METAL_NSG", "DS4P_METAL_SB", "DS4P_METAL_SMEM_PAD", "DS4P_METAL_NO_SGBAR",
-        "DS4P_METAL_NOSTAGE_V", "DS4P_METAL_MMA_NOSTAGE_K", "DS4P_METAL_NO_BSFC",
-        "DS4P_CHAMP_NSG", "DS4P_CHAMP_SMEM_FULL", "DS4P_CHAMP_MASK_OPEN",
-        "DS4P_DUMP_BT", "DS4P_KV_POISON", "DS4P_PAGED_HYBRID", "DS4P_PREFILL_QUANTUM",
-    };
+    // ⚠ WAS A HARDCODED KEY LIST -- i.e. an ALLOW-LIST, which rots the instant a flag is added.
+    // Caught red-handed: DS4P_PAGED_TAINT=1 was set and this printed "none set (clean run)".
+    // That is the SAME defect class as the arch allow-list fixed in 78a397d1, on the same day.
+    // Now enumerates the real environment and matches by PREFIX, so a new flag cannot be missed.
+    extern char ** environ;
 
-    char buf[1024]; int off = 0; int n = 0;
-    for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); ++i) {
-        const char * v = getenv(keys[i]);
-        if (v && *v) {
-            off += snprintf(buf + off, sizeof(buf) - off, "%s%s=%s", n ? " " : "", keys[i], v);
-            ++n;
-            if (off >= (int) sizeof(buf) - 64) { break; }
+    char buf[2048]; int off = 0; int n = 0;
+    for (char ** e = environ; *e != nullptr; ++e) {
+        if (strncmp(*e, "DS4P_", 5) != 0) {
+            continue;
         }
+        off += snprintf(buf + off, sizeof(buf) - off, "%s%s", n ? " " : "", *e);
+        ++n;
+        if (off >= (int) sizeof(buf) - 64) { break; }
     }
     if (n > 0) {
         GGML_LOG_INFO("%s: DS4P-ENV %d set: %s\n", __func__, n, buf);
@@ -4685,6 +4683,19 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.stride_head       =*/ kv_cache->nb[2] / sizeof(ggml_fp16_t),
         /*.stride_block      =*/ kv_cache->nb[3] / sizeof(ggml_fp16_t),
     };
+
+    // ★ CONSUMER PROBE: DS4P_PAGED_TAINT scales what the write kernel stores into the pool.
+    // A graph that genuinely READS the paged cache must produce different output; bit-identical
+    // output with the taint on proves the graph is NOT reading it. This is the test that would
+    // have caught audit finding 5, and the one I did not run.
+    if (getenv("DS4P_PAGED_TAINT")) {
+        args.probe = 2;
+        static bool said = false;
+        if (!said) { said = true;
+            GGML_LOG_INFO("%s: DS4P-PAGED-TAINT active (KV writes scaled x1.5) -- output MUST "
+                          "change if the graph reads the paged pool\n", __func__);
+        }
+    }
 
     // WRITE PHASE FIRST -- k_new/v_new into the cache at write_slots. Omitting this left
     // the cache zeroed and every harness case reported nmse == 1.000 (all-zero output).

@@ -2974,8 +2974,21 @@ kernel void kernel_paged_attn_write_f32(
                         + (uint64_t) token_in_block * args.stride_token;
     const uint64_t in   = (uint64_t) gtok * args.n_heads_kv * D + (uint64_t) h * D;
 
-    kv_cache[base + (uint64_t) h * args.stride_head + d]                        = (half) k_new[in + d];
-    kv_cache[base + (uint64_t) (args.n_heads_kv + h) * args.stride_head + d]    = (half) v_new[in + d];
+    // ★ CONSUMER PROBE (args.probe == 1, set by DS4P_PAGED_TAINT). Scales what we WRITE into the
+    // paged pool. If a graph genuinely READS the paged cache, its output MUST change; if the
+    // output is bit-identical with the taint on, the graph is not reading the pool -- no matter
+    // what a presence marker says.
+    //
+    // Why the write path and not the init-poison: init fill is overwritten by the first prefill,
+    // so "no divergence" there is a FALSE NEGATIVE. Tainting the write survives every write.
+    // Why a scale and not NaN: NaN propagates through unrelated paths and mask arithmetic, so it
+    // can diverge for reasons other than consumption. A finite scale diverges only if consumed.
+    // probe==2, not 1: value 1 is already the CHAMP mask-open probe. Two diagnostics
+    // sharing one sentinel value is how args.lpk got overloaded (audit finding 1).
+    const float taint = (args.probe == 2) ? 1.5f : 1.0f;
+
+    kv_cache[base + (uint64_t) h * args.stride_head + d]                        = (half) (taint * k_new[in + d]);
+    kv_cache[base + (uint64_t) (args.n_heads_kv + h) * args.stride_head + d]    = (half) (taint * v_new[in + d]);
 }
 
 // ---------------------------------------------------------------------------
