@@ -2007,11 +2007,23 @@ private:
                 n_warm = (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
                 n_warm = std::min(n_warm, (int32_t) toks.size() - 1);
                 n_warm = std::max(n_warm, 0);
-
-                // keep the slot's token mirror equal to what the KV will actually hold, so
-                // the save-side revalidate (P0-2) is comparing like with like from token 0
-                slot.prompt.tokens.keep_first((size_t) n_warm);
             }
+
+            // TRIM UNCONDITIONALLY. This used to live inside the `if (prompt_cache)` above,
+            // so with no prompt cache configured the mirror kept the PREVIOUS request's
+            // record and the new request started with `have` already at ~1,555 instead of 0.
+            // The mirror loop then spent its first chunks shrinking that stale record rather
+            // than counting tokens, and n_prompt_tokens_processed came out 1,011 instead of
+            // 1,523 -- exactly 512 + 499, the two chunks after the truncation.
+            //
+            // ⚠ THIS IS THE SAME COUNTER FAILING A SECOND TIME. 173f4c0f zeroed it at launch
+            // and I called that the fix; zeroing the counter while leaving the RECORD it
+            // counts against stale only moved the error. The counter and the record it
+            // measures have to be reset together, because one is derived from the other.
+            //
+            // n_warm is 0 whenever nothing was restored, so this empties the mirror on every
+            // cold request and preserves exactly the restored prefix on a warm one.
+            slot.prompt.tokens.keep_first((size_t) n_warm);
 
             if (!llama_paged_scheduler_add_request(paged_sched, toks.data(), (int32_t) toks.size(), slot.id, n_warm)) {
                 SLT_ERR(slot, "%s", "paged scheduler rejected the request\n");
