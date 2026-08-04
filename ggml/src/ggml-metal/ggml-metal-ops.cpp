@@ -4517,12 +4517,17 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     const size_t smem_budget = 32768;
     // sb = paged blocks staged per iteration; KT = sb*bs key tokens, and the score tile
     // stride SH is KT, so sb scales the staged K/V AND the score tile together.
+    // MILESTONE 2: destaging K frees KT*head_dim halves. Requires bs % 8 == 0 so an 8-row
+    // fragment never straddles two physical blocks.
+    const int  bs_pa0     = ((const int32_t *)(op_params_f + 1))[0];
+    const bool mma_stg_k  = !(getenv("DS4P_METAL_MMA_NOSTAGE_K") &&
+                              atoi(getenv("DS4P_METAL_MMA_NOSTAGE_K")) != 0 && (bs_pa0 % 8) == 0);
     auto mma_smem = [&](int nsg_try, int sb_try) -> size_t {
         const size_t QR = (size_t) 8 * nsg_try;
         const size_t KT = (size_t) sb_try * bs_pa;
         // ss is reused in place as P (both float), so ONE score tile, not two.
         // K only: V is read directly from device, which is what lets KT double at flat cost.
-        return (KT*head_dim + QR*head_dim) * sizeof(uint16_t)
+        return ((mma_stg_k ? KT*head_dim : 0) + QR*head_dim) * sizeof(uint16_t)
              + (QR*KT + QR*head_dim + 2*QR) * sizeof(float);
     };
     int  mma_nsg = 0, mma_sb = 0;
@@ -4597,6 +4602,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.sg_barriers       =*/ getenv("DS4P_METAL_NO_SGBAR") ? 0 : 1,
         /*.lpk               =*/ 0,   // set below, once nsg is final and before set_bytes
         /*.stage_v           =*/ 1,   // set below alongside lpk
+        /*.mma_stage_k       =*/ 1,   // set below alongside lpk
         /*.stride_token      =*/ kv_cache->nb[1] / sizeof(ggml_fp16_t),
         /*.stride_head       =*/ kv_cache->nb[2] / sizeof(ggml_fp16_t),
         /*.stride_block      =*/ kv_cache->nb[3] / sizeof(ggml_fp16_t),
@@ -4682,7 +4688,8 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // this is ONE variable. Set here for the same reason lpk is: after nsg is final and BEFORE
     // args is uploaded at set_bytes, or the field is a silent no-op.
     args.lpk     = use_lpk ? lpk_mode : 0;
-    args.stage_v = stage_v ? 1 : 0;
+    args.stage_v     = stage_v ? 1 : 0;
+    args.mma_stage_k = mma_stg_k ? 1 : 0;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -4766,9 +4773,10 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             last_key = key;
             if (use_mma) {
                 const char * pe = getenv("DS4P_METAL_SMEM_PAD");
-                GGML_LOG_INFO("%s: DS4P-MMA ACTIVE  D=%d bs=%d sb=%d KT=%d nsg=%d QR=%d smem=%zu(+pad %s)/%zu\n",
+                GGML_LOG_INFO("%s: DS4P-MMA ACTIVE  D=%d bs=%d sb=%d KT=%d nsg=%d QR=%d KSTAGE=%s smem=%zu(+pad %s)/%zu\n",
                               __func__, head_dim, bs_pa, mma_sb, mma_sb*bs_pa, mma_nsg,
-                              8*mma_nsg, mma_smem(mma_nsg, mma_sb), pe ? pe : "0", smem_budget);
+                              8*mma_nsg, mma_stg_k ? "on" : "OFF",
+                              mma_smem(mma_nsg, mma_sb), pe ? pe : "0", smem_budget);
             } else if (use_lpk) {
                 GGML_LOG_INFO("%s: DS4P-LPK ACTIVE (lane-per-key two-phase) D=%d bs=%d nsg=%d "
                               "TKP=%d%s VSTAGE=%s smem=%zu/%zu\n",

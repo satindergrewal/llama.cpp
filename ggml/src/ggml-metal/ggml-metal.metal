@@ -3060,7 +3060,12 @@ kernel void kernel_paged_attn_f32(
         // footprint is what costs 18.4% (measured, DS4P_METAL_SMEM_PAD). Staging still pays
         // for K, which every one of the KT/8 score tiles re-reads with a transpose.
         threadgroup half  * tk = (threadgroup half *) shmem;
-        threadgroup half  * sq = tk + KT*D;
+        // ALLOCATION AND LAYOUT MOVE TOGETHER OR NOT AT ALL. When K is not staged the host
+        // stops allocating KT*D halves for tk, so every pointer after it must shift too --
+        // I wrote that invariant in mma_smem's comment and then broke it here on the first
+        // try. 12/12 caught it as 1e+13 nmse before any wall ran, which is the whole reason
+        // correctness gates run FIRST.
+        threadgroup half  * sq = args.mma_stage_k ? (tk + KT*D) : tk;
         // ss holds the SCORES and is then overwritten IN PLACE with P. They were two
         // buffers only while P was half and the scores were float; both are float now, so
         // the split cost QR*SH floats for nothing. Safe in place: each lane owns distinct
@@ -3111,7 +3116,11 @@ kernel void kernel_paged_attn_f32(
 
             for (int bg = 0; bg < nblk; bg += SB) {
                 threadgroup_barrier(mem_flags::mem_threadgroup);   // prev iter's readers
-                for (uint idx = tid; idx < (uint)(KT*D); idx += ntg) {
+                // ★ MILESTONE 2: K staged (default) vs read straight from device. Destaging K
+                // frees KT*D halves -- at D=128 that is 8,192 B, the single biggest fixed term --
+                // which is what lets nsg go 2 -> 4. Arithmetic says nsg=8 is UNREACHABLE either
+                // way, because the O accumulator `so` costs QR*D floats and QR = 8*nsg.
+                for (uint idx = args.mma_stage_k ? tid : (uint)(KT*D); idx < (uint)(KT*D); idx += ntg) {
                     const uint t_all = idx / (uint) D, d2 = idx % (uint) D;
                     const int  sub   = (int) (t_all / (uint) bs);
                     const int  t     = (int) (t_all % (uint) bs);
@@ -3142,7 +3151,28 @@ kernel void kernel_paged_attn_f32(
                     for (int i = 0; i < D/8; ++i) {
                         if (args.sg_barriers) { simdgroup_barrier(mem_flags::mem_none); }
                         simdgroup_load(mq, sq + (8*sgm)*D + 8*i, D);
-                        simdgroup_load(mk, tk + cc*8*D + 8*i, D, 0, true);   // -> d x kt
+                        if (args.mma_stage_k) {
+                            simdgroup_load(mk, tk + cc*8*D + 8*i, D, 0, true);   // -> d x kt
+                        } else {
+                            // Device K, pitch = stride_token. The 8 rows of a fragment are
+                            // cc*8 .. cc*8+7 within the staged window; they stay inside ONE
+                            // paged block only while bs % 8 == 0, which the host enforces --
+                            // otherwise a fragment would straddle two physical blocks and the
+                            // single base pointer would be wrong for its tail rows.
+                            const int  t_all = cc*8;
+                            const int  sub   = t_all / bs;
+                            const int  t0f   = t_all % bs;
+                            const int  bif   = bg + sub;
+                            const int  pbf   = (bif < nblk) ? block_table[seq * args.max_blocks + bif] : 0;
+                            const uint64_t kbf = (uint64_t) pbf * args.stride_block
+                                               + (uint64_t) kv_h * args.stride_head
+                                               + (uint64_t) t0f * args.stride_token;
+                            if (bif < nblk) {
+                                simdgroup_load(mk, kv_cache + kbf + 8*i, args.stride_token, 0, true);
+                            } else {
+                                mk = make_filled_simdgroup_matrix<half, 8>((half) 0.0f);
+                            }
+                        }
                         if (args.sg_barriers) { simdgroup_barrier(mem_flags::mem_none); }
                         simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
                     }
