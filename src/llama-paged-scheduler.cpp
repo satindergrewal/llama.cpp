@@ -100,7 +100,8 @@ LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler 
 LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * sched,
                                                  const llama_token *            tokens,
                                                  int32_t                        n_tokens,
-                                                 int32_t                        request_id) {
+                                                 int32_t                        request_id,
+                                                 int32_t                        n_warm) {
     if (!sched || !tokens) {
         return false;
     }
@@ -115,7 +116,7 @@ LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * 
     }
     group.t_arrival_time = ggml_time_us();  // int64_t milliseconds
 
-    return sched->impl.queue_request(group);
+    return sched->impl.queue_request(group, n_warm > 0 ? (uint32_t) n_warm : 0u);
 }
 
 LLAMA_API bool llama_paged_scheduler_fork_request(struct llama_paged_scheduler * sched,

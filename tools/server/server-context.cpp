@@ -1978,7 +1978,29 @@ private:
         // chunking and KV allocation all happen inside the scheduler from here on
         if (paged_sched) {
             const llama_tokens toks = slot.task->tokens.get_text_tokens();
-            if (!llama_paged_scheduler_add_request(paged_sched, toks.data(), (int32_t) toks.size(), slot.id)) {
+
+            // P1-5 WARM ADMIT. get_available_slot() has already run prompt_load(), so if
+            // this prompt hit the RAM cache or the disk bank, slot.prompt.tokens is the
+            // RESTORED record and its KV is parked in the paged cache waiting to be
+            // adopted. Only the common prefix of that record and the new prompt is
+            // reusable, and the cap belongs here rather than in the scheduler because this
+            // is the layer that holds both token sequences.
+            //
+            // The -1 is not cosmetic: at least one prompt token has to go through the
+            // model to produce the logits the first sample reads. A fully-restored prompt
+            // with nothing left to decode would admit a sequence that can never emit.
+            int32_t n_warm = 0;
+            if (prompt_cache) {
+                n_warm = (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+                n_warm = std::min(n_warm, (int32_t) toks.size() - 1);
+                n_warm = std::max(n_warm, 0);
+
+                // keep the slot's token mirror equal to what the KV will actually hold, so
+                // the save-side revalidate (P0-2) is comparing like with like from token 0
+                slot.prompt.tokens.keep_first((size_t) n_warm);
+            }
+
+            if (!llama_paged_scheduler_add_request(paged_sched, toks.data(), (int32_t) toks.size(), slot.id, n_warm)) {
                 SLT_ERR(slot, "%s", "paged scheduler rejected the request\n");
                 return false;
             }

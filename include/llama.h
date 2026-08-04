@@ -1671,10 +1671,16 @@ extern "C" {
                                                      int32_t                        request_id,
                                                      int32_t                        parent_request_id);
 
+    // n_warm (P1-5): how many LEADING tokens of `tokens` are already resident in the paged
+    // cache because an earlier llama_state_seq_set_data restored them for this request_id.
+    // The caller owns this cap because the caller is what knows the restored record really
+    // is a prefix of THIS prompt; pass 0 for a normal cold request. Anything restored but
+    // not claimed here goes back to the block pool.
     LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * sched,
                                                      const llama_token *            tokens,
                                                      int32_t                        n_tokens,
-                                                     int32_t                        request_id);
+                                                     int32_t                        request_id,
+                                                     int32_t                        n_warm);
 
     LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler * sched,
                                                        struct llama_batch *           batch);

@@ -83,12 +83,48 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
     return llama_scheduler_status::OK;
 }
 
-bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group) {
+bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint32_t n_warm) {
     // Rejecting any requests that exceeds max context for a seq
     if (group.n_prompt >= n_seq_max_ctx) {
+        if (kv_cache_manager != nullptr) {
+            kv_cache_manager->discard_restored(group.request_id);
+        }
         LLAMA_LOG_ERROR("%s: request %d exceeds max context (%d > %d).\n", __func__, group.request_id, group.n_prompt,
                         n_seq_max_ctx);
         return false;
+    }
+
+    // P1-5 WARM ADMIT. state_read has already written this sequence's KV into real blocks
+    // and parked them in the cache; THIS is where they become the group's block_table --
+    // the step that made the restore half impossible before, because the cache has no way
+    // to reach a scheduler group that does not exist yet.
+    //
+    // The resulting group has exactly the shape a COW fork produces (inherited block_table
+    // + n_past > 0 + full logical_seq), so it flows through the SAME prefill-from-n_past
+    // path that P1-6's fork gate already proved correct. Nothing new to schedule: the disk
+    // bank is just another source of a prefix.
+    //
+    // n_warm is the caller's cap -- only the span it has verified to be a prefix of THIS
+    // request's prompt may be reused. Blocks beyond it are released inside
+    // take_restored_blocks rather than handed over and silently attended to.
+    if (kv_cache_manager != nullptr) {
+        if (n_warm > 0 && group.block_table.empty()) {
+            llama_block_ids restored;
+            const uint32_t n_past = kv_cache_manager->take_restored_blocks(group.request_id, n_warm, restored);
+            if (n_past > 0) {
+                group.block_table = std::move(restored);
+                group.n_past      = n_past;
+
+                LLAMA_LOG_INFO("%s: request %d admitted WARM: %u of %u prompt tokens restored from the "
+                               "KV bank (%zu blocks), %u left to prefill\n",
+                               __func__, group.request_id, n_past, group.n_prompt,
+                               group.block_table.size(), group.n_prompt - n_past);
+            }
+        } else {
+            // cold request (or a fork, which brings its own blocks): nothing may be left
+            // parked under this id or it pins pool blocks nobody is ever going to claim
+            kv_cache_manager->discard_restored(group.request_id);
+        }
     }
 
     auto group_ptr = std::make_unique<llama_sequence_group>(std::move(group));

@@ -15,7 +15,10 @@ class llama_paged_scheduler_impl {
     llama_paged_scheduler_impl(uint32_t n_ctx, uint32_t block_sz, int32_t n_batch, llama_kv_cache_paged * kv_manager);
 
     llama_scheduler_status step(llama_batch & batch);
-    bool                   queue_request(llama_sequence_group group);
+
+    // n_warm: how many leading tokens of group.logical_seq the caller has already restored
+    // into the paged cache (P1-5 admit). 0 = a cold request, which is the normal case.
+    bool                   queue_request(llama_sequence_group group, uint32_t n_warm = 0);
 
     // P1-6: queue `group` as a COW fork of an existing request -- it inherits the parent's
     // prefix blocks by reference (fork_blocks) instead of prefilling them again.

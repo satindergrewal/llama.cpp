@@ -110,6 +110,20 @@ class llama_kv_cache_paged : public llama_memory_i {
                     llama_seq_id seq_id             = -1,
                     llama_state_seq_flags flags     = 0) override;
 
+    // P1-5 ADMIT handshake. state_read materialises a restored sequence's KV into real
+    // blocks but has no scheduler group to attach them to yet (it runs on the server's
+    // admit path, before the request is queued). These two calls are how the blocks get
+    // from the cache to the group -- or back to the pool if nobody wants them.
+    //
+    // take_restored_blocks: hand over at most n_tokens_wanted tokens' worth of restored
+    // blocks, exactly once. Blocks covering tokens beyond the cap are released here (the
+    // admitted prompt diverged before the end of the stored KV). Returns tokens handed
+    // over, 0 if there is no parked restore for this sequence.
+    uint32_t take_restored_blocks(llama_seq_id seq_id, uint32_t n_tokens_wanted, llama_block_ids & out_blocks);
+
+    // release a parked restore nobody adopted -- unadopted blocks are a leak, not a cache
+    void discard_restored(llama_seq_id seq_id);
+
     //
     // Helpers to llama_memory_i
     //
@@ -179,6 +193,20 @@ class llama_kv_cache_paged : public llama_memory_i {
     std::unordered_map<llama_seq_id, llama_block_ids> sequence_blocks;
 
     void note_seq_blocks(const llama_sequence_group & group);
+
+    // P1-5 RESTORE: KV that state_read has already written into real blocks, parked until
+    // the scheduler queues the matching request and adopts it. The park exists because the
+    // two halves run in different places: state_read is driven by the server's prompt-cache
+    // admit (llama_state_seq_set_data_ext), which happens BEFORE llama_paged_scheduler_-
+    // add_request creates the group. Holding the blocks across that gap is the whole
+    // handshake -- see take_restored_blocks / discard_restored.
+    struct restored_seq {
+        llama_block_ids blocks;
+        llama_pos       p_min = -1;
+        llama_pos       p_max = -1;
+    };
+
+    std::unordered_map<llama_seq_id, restored_seq> restored_seqs;
 };
 
 class llama_kv_cache_paged_context : public llama_memory_context_i {

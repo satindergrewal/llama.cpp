@@ -524,6 +524,10 @@ int32_t llama_kv_cache_paged::debug_seq_kv_checksum(const llama_sequence_group &
 
 void llama_kv_cache_paged::clear(bool /*data*/) {
     sequence_positions.clear();
+
+    while (!restored_seqs.empty()) {
+        discard_restored(restored_seqs.begin()->first);
+    }
 }
 
 // P1-5: serialise ONE sequence's KV out of the paged cache.
@@ -576,33 +580,173 @@ void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_i
     }
 }
 
-// P1-5 RESTORE -- deliberately NOT implemented, and failing loudly rather than silently.
+// P1-5 RESTORE. The mirror image of state_write: check the geometry, take real blocks,
+// fill them with the stored bytes, and PARK them under seq_id.
 //
-// Reading the bytes back is the easy half; the hard half is that a restored sequence
-// needs BLOCKS ALLOCATED and, critically, its SCHEDULER GROUP's block_table repopulated.
-// The cache can allocate (block_manager.checkout_*) but it cannot reach into the
-// scheduler's group records, and a sequence whose cache map and group table disagree is
-// exactly the silent-wrong-reuse that P0-2's revalidate guard exists to catch.
+// Why parking instead of installing: this runs from the server's prompt-cache admit
+// (server_prompt_cache::load -> llama_state_seq_set_data_ext), which happens BEFORE the
+// request is queued -- there is no scheduler group yet, so there is no block_table to
+// write into. The cache therefore materialises the KV and holds it for the short window
+// until llama_paged_scheduler_impl::queue_request adopts it via take_restored_blocks.
+// That is the same handover a COW fork already does, with the disk bank standing in for
+// the live parent, which is why this reuses the proven path instead of inventing one.
 //
-// So: refuse, loudly, with the reason. A no-op here would let a restore appear to
-// succeed and then serve another request's KV -- strictly worse than not restoring.
-void llama_kv_cache_paged::state_read(llama_io_read_i &, llama_seq_id, llama_state_seq_flags) {
-    // THROW, do not abort. Measured: aborting here killed the server the moment a spilled
-    // entry was admitted -- and a spilled entry is ALWAYS admitted eventually, so the
-    // abort turned a working server into a crashing one. llama_context::state_seq_set_data
-    // wraps this in try/catch and returns 0, which the server's prompt_load treats as a
-    // failed restore -> prompt_clear() -> normal recompute. That is the correct
-    // degradation: LOUD (the error is logged) but not fatal, and never silently wrong.
-    throw std::runtime_error(
-        "paged KV state_read is not implemented: restoring a sequence requires repopulating "
-        "its scheduler group's block_table, which the cache cannot do on its own. Writing "
-        "state (spill) is supported; reading it back (admit) is not yet -- falling back to "
-        "recompute.");
+// Every failure below THROWS rather than returning a partial restore. llama_context::
+// state_seq_set_data catches it and returns 0, the server's prompt_load treats that as a
+// failed restore and recomputes. Loud, not fatal, never silently wrong -- the earlier
+// GGML_ABORT here was the right principle with the wrong mechanism (it killed the server
+// on the first admit, and an admit always comes eventually).
+void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags) {
+    if (seq_id < 0) {
+        throw std::runtime_error("paged KV state_read: needs a concrete sequence id");
+    }
+
+    // an earlier admit for this slot that was never queued would otherwise pin its blocks
+    discard_restored(seq_id);
+
+    uint32_t r_n_blocks = 0, r_block_size = 0, r_head_dim = 0, r_heads_kv = 0, r_layers = 0, r_block_bytes = 0;
+    io.read(&r_n_blocks,    sizeof(r_n_blocks));
+    io.read(&r_block_size,  sizeof(r_block_size));
+    io.read(&r_head_dim,    sizeof(r_head_dim));
+    io.read(&r_heads_kv,    sizeof(r_heads_kv));
+    io.read(&r_layers,      sizeof(r_layers));
+    io.read(&r_block_bytes, sizeof(r_block_bytes));
+
+    llama_pos p_min = -1;
+    llama_pos p_max = -1;
+    io.read(&p_min, sizeof(p_min));
+    io.read(&p_max, sizeof(p_max));
+
+    // GEOMETRY IS IDENTITY. A bank file written under a different model, KV quant, head
+    // count or block size is still a pile of bytes that would load without complaint and
+    // then serve another model's attention. P0-2's revalidate checks the TOKEN claim; this
+    // checks the PHYSICAL layout, and neither one substitutes for the other.
+    if (r_block_size != block_size || r_head_dim != head_dim || r_heads_kv != n_heads_kv ||
+        r_layers != n_layers || r_block_bytes != block_bytes) {
+        throw std::runtime_error(
+            "paged KV state_read: geometry mismatch (stored block_size/head_dim/n_heads_kv/"
+            "n_layers/block_bytes = " + std::to_string(r_block_size) + "/" + std::to_string(r_head_dim) +
+            "/" + std::to_string(r_heads_kv) + "/" + std::to_string(r_layers) + "/" + std::to_string(r_block_bytes) +
+            ", cache = " + std::to_string(block_size) + "/" + std::to_string(head_dim) + "/" +
+            std::to_string(n_heads_kv) + "/" + std::to_string(n_layers) + "/" + std::to_string(block_bytes) +
+            ") -- refusing to reinterpret it, falling back to recompute");
+    }
+
+    if (r_n_blocks == 0 || p_max < 0) {
+        return;   // a well-formed entry that holds nothing: no restore, no error
+    }
+
+    // A restore competes for the same scarce pool as live requests. If it does not fit,
+    // the request must prefill normally -- never evict someone else to make room for a
+    // cache hit, which would turn a latency win into a latency loss for another agent.
+    if (!block_manager.has_free_gpu_blocks(r_n_blocks)) {
+        throw std::runtime_error("paged KV state_read: only " + std::to_string(r_n_blocks) +
+                                 " blocks would fit the restore and the pool cannot spare them"
+                                 " -- falling back to recompute");
+    }
+
+    llama_block_ids ids = block_manager.checkout_gpu_blocks(r_n_blocks);
+
+    std::vector<uint8_t> staging(block_bytes);
+
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        for (uint32_t i = 0; i < r_n_blocks; ++i) {
+            io.read(staging.data(), block_bytes);
+
+            const uint32_t gid   = ids[i];
+            const bool     gpu   = block_manager.is_gpu(gid);
+            struct ggml_tensor * layer = gpu ? kv_gpu_layers[il] : kv_cpu_layers[il];
+            const uint32_t local = gpu ? gid : gid - num_gpu_blocks;
+
+            ggml_backend_tensor_set(layer, staging.data(), (size_t) local * block_bytes, block_bytes);
+        }
+    }
+
+    sequence_positions[seq_id]  = seq_range{ p_min, p_max };
+    restored_seqs[seq_id]       = restored_seq{ std::move(ids), p_min, p_max };
+
+    LLAMA_LOG_INFO("%s: seq %d: restored %u blocks (%u tokens) from state -- awaiting adoption\n",
+                   __func__, seq_id, r_n_blocks, (uint32_t) (p_max + 1));
+}
+
+uint32_t llama_kv_cache_paged::take_restored_blocks(llama_seq_id seq_id, uint32_t n_tokens_wanted,
+                                                   llama_block_ids & out_blocks) {
+    auto it = restored_seqs.find(seq_id);
+    if (it == restored_seqs.end()) {
+        return 0;
+    }
+
+    const uint32_t n_have = it->second.p_max >= 0 ? (uint32_t) (it->second.p_max + 1) : 0;
+    const uint32_t n_take = std::min(n_have, n_tokens_wanted);
+
+    if (n_take == 0) {
+        discard_restored(seq_id);
+        return 0;
+    }
+
+    llama_block_ids & blocks = it->second.blocks;
+
+    // The caller's prompt may diverge from the stored one before the end of the stored KV.
+    // Blocks past the agreed span hold tokens this request will never ask for, so they go
+    // straight back to the pool rather than riding along in the block table -- allocate()
+    // derives its request count from block_table.size(), so an over-long table would make
+    // it compute a NEGATIVE need in unsigned arithmetic and refuse every future block.
+    const uint32_t n_keep = (n_take + block_size - 1) / block_size;
+    if (n_keep < blocks.size()) {
+        llama_block_ids tail(blocks.begin() + n_keep, blocks.end());
+        llama_block_ids tail_gpu;
+        llama_block_ids tail_cpu;
+        for (uint32_t b : tail) {
+            (block_manager.is_gpu(b) ? tail_gpu : tail_cpu).push_back(b);
+        }
+        if (!tail_gpu.empty()) {
+            block_manager.release_gpu_blocks(tail_gpu);
+        }
+        if (!tail_cpu.empty()) {
+            block_manager.release_cpu_blocks(tail_cpu);
+        }
+        blocks.resize(n_keep);
+    }
+
+    out_blocks = blocks;
+
+    sequence_blocks[seq_id]    = blocks;
+    sequence_positions[seq_id] = seq_range{ 0, (llama_pos) (n_take - 1) };
+
+    restored_seqs.erase(it);
+
+    return n_take;
+}
+
+void llama_kv_cache_paged::discard_restored(llama_seq_id seq_id) {
+    auto it = restored_seqs.find(seq_id);
+    if (it == restored_seqs.end()) {
+        return;
+    }
+
+    llama_block_ids gpu;
+    llama_block_ids cpu;
+    for (uint32_t b : it->second.blocks) {
+        (block_manager.is_gpu(b) ? gpu : cpu).push_back(b);
+    }
+    if (!gpu.empty()) {
+        block_manager.release_gpu_blocks(gpu);
+    }
+    if (!cpu.empty()) {
+        block_manager.release_cpu_blocks(cpu);
+    }
+
+    LLAMA_LOG_DEBUG("%s: seq %d: released %zu unadopted restored blocks\n",
+                    __func__, seq_id, it->second.blocks.size());
+
+    restored_seqs.erase(it);
 }
 
 bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos /*p0*/, llama_pos /*p1*/) {
     sequence_positions.erase(seq_id);
     sequence_blocks.erase(seq_id);
+    // a parked restore for a sequence being torn down is dead weight holding real blocks
+    discard_restored(seq_id);
     return true;
 }
 

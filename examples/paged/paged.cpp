@@ -54,7 +54,7 @@ static void add_request_from_pool(struct llama_paged_scheduler * scheduler,
     const std::string        input_prompt = k_prompts[pool_index % k_n_prompts];
     std::vector<llama_token> tokens       = common_tokenize(ctx, input_prompt, true);
 
-    bool success = llama_paged_scheduler_add_request(scheduler, tokens.data(), tokens.size(), seq_id);
+    bool success = llama_paged_scheduler_add_request(scheduler, tokens.data(), tokens.size(), seq_id, 0);
     if (!success) {
         LOG_ERR("Failed to add request %ld from pool\n", pool_index);
     }
@@ -170,7 +170,7 @@ int main(int argc, char ** argv) {
 
         // fork a LIVE sequence: the parent must have prefilled (own blocks) before the
         // children can inherit them -- forking at queue time inherits nothing
-        llama_paged_scheduler_add_request(scheduler, t_par.data(), t_par.size(), 0);
+        llama_paged_scheduler_add_request(scheduler, t_par.data(), t_par.size(), 0, 0);
         for (int i = 0; i < 3; ++i) {
             samplers[i] = common_sampler_init(model, params.sampling);
         }
@@ -179,8 +179,8 @@ int main(int argc, char ** argv) {
             fork_pending_b = t_b;
         } else if (fork_independent) {
             // control arm: identical prompts, queued as ordinary independent requests
-            llama_paged_scheduler_add_request(scheduler, t_a.data(), t_a.size(), 1);
-            llama_paged_scheduler_add_request(scheduler, t_b.data(), t_b.size(), 2);
+            llama_paged_scheduler_add_request(scheduler, t_a.data(), t_a.size(), 1, 0);
+            llama_paged_scheduler_add_request(scheduler, t_b.data(), t_b.size(), 2, 0);
         } else {
             fork_pending_a = t_a;
             fork_pending_b = t_b;
@@ -329,8 +329,8 @@ int main(int argc, char ** argv) {
         if (!fork_pending_a.empty() && !accumulated_responses[0].empty()) {
             // parent has decoded at least one token -> its prefix blocks exist
             if (fork_deferred_indep) {
-                llama_paged_scheduler_add_request(scheduler, fork_pending_a.data(), fork_pending_a.size(), 1);
-                llama_paged_scheduler_add_request(scheduler, fork_pending_b.data(), fork_pending_b.size(), 2);
+                llama_paged_scheduler_add_request(scheduler, fork_pending_a.data(), fork_pending_a.size(), 1, 0);
+                llama_paged_scheduler_add_request(scheduler, fork_pending_b.data(), fork_pending_b.size(), 2, 0);
             } else {
                 llama_paged_scheduler_fork_request(scheduler, fork_pending_a.data(), fork_pending_a.size(), 1, 0);
                 llama_paged_scheduler_fork_request(scheduler, fork_pending_b.data(), fork_pending_b.size(), 2, 0);

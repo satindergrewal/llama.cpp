@@ -135,7 +135,7 @@ static path_result run_paged(const std::string & model_path) {
     std::vector<llama_token> prompt_tokens = common_tokenize(ctx, TEST_PROMPT, true);
     EXPECT_TRUE(!prompt_tokens.empty());
 
-    bool ok = llama_paged_scheduler_add_request(sched, prompt_tokens.data(), prompt_tokens.size(), 0);
+    bool ok = llama_paged_scheduler_add_request(sched, prompt_tokens.data(), prompt_tokens.size(), 0, 0);
     EXPECT_TRUE(ok);
 
     common_sampler * smpl = common_sampler_init(model, params.sampling);
