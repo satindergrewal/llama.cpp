@@ -35,10 +35,16 @@ static float val_r(int e, int h, int tok)  { return 0.50f * cosf(0.8f*e + 0.6f*h
 static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel, int64_t window) {
     const int H   = 4;    // query heads
     const int HKV = 2;    // kv heads (GQA 2:1)
-    const int N   = 24;   // tokens, spans two blocks
     const int E   = 8;    // rel_extent
-    const int BS  = 16;   // block_size
-    const int NB  = 2;    // blocks
+    // block_size / block count are env-overridable so a gate can exercise a path that has a
+    // block-size PRECONDITION (the lane-per-key loop needs bs >= 32). Hard-coded at BS=16,
+    // DS4P_METAL_LPK=1 would have printed "ALL PASSED" for a path that never ran -- the
+    // presence marker caught exactly that, which is why this knob exists.
+    const int BS  = getenv("DS4P_TEST_BS") ? atoi(getenv("DS4P_TEST_BS")) : 16;   // block_size
+    const int NB  = getenv("DS4P_TEST_NB") ? atoi(getenv("DS4P_TEST_NB")) : 2;    // blocks
+    // Ends MID-block on purpose: a token count that lands exactly on a block boundary never
+    // tests the partial-tile tail, where the lane-per-key masking lives.
+    const int N   = BS*NB - BS/2;   // tokens, spans every block
     const float scale = 1.0f / sqrtf((float) D);
 
     ggml_init_params ip = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), nullptr, /*no_alloc*/ true };

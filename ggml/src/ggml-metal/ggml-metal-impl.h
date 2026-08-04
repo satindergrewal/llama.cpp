@@ -1231,6 +1231,7 @@ typedef struct {
     int32_t  use_mma;           // 1 = take the simdgroup-matrix prefill path
     int32_t  stage_blocks;      // paged blocks staged per MMA iteration
     int32_t  sg_barriers;       // 1 = simdgroup_barrier around every fragment load group
+    int32_t  lpk;               // 1 = lane-per-KEY two-phase scalar loop (needs block_size >= 32)
     uint64_t stride_token;      // in halves
     uint64_t stride_head;
     uint64_t stride_block;

@@ -4595,6 +4595,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.use_mma           =*/ use_mma ? 1 : 0,
         /*.stage_blocks      =*/ mma_sb,
         /*.sg_barriers       =*/ getenv("DS4P_METAL_NO_SGBAR") ? 0 : 1,
+        /*.lpk               =*/ 0,   // set below, once nsg is final and before set_bytes
         /*.stride_token      =*/ kv_cache->nb[1] / sizeof(ggml_fp16_t),
         /*.stride_head       =*/ kv_cache->nb[2] / sizeof(ggml_fp16_t),
         /*.stride_block      =*/ kv_cache->nb[3] / sizeof(ggml_fp16_t),
@@ -4654,6 +4655,28 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     }
     const int nth = 32 * nsg;
 
+    // ★ LANE-PER-KEY eligibility. Computed HERE, after the nsg knob and before args is
+    // uploaded at the set_bytes below -- the smem it needs depends on the FINAL nsg, and an
+    // args field written after its own upload is a silent no-op (exactly the class of defect
+    // that made a whole scalar nsg sweep void). Three hard preconditions, each measured:
+    //   bs >= 32   -- the key loop is bounded by bs, so at bs=16 half the lanes idle. The
+    //                 block-size sweep found no speed win but DID prove bs=32 free on BOTH
+    //                 axes (latency 1,559.7 vs 1,568.5; pool 3.46 GiB either way).
+    //   n_tokens>1 -- prefill only; decode takes the combine path, a different shape.
+    //   smem fits  -- padded K tile + staged Q + score broadcast. A tile that quietly
+    //                 exceeded the limit once exited 77 and nearly read as a pass.
+    const int    bs_pa_lpk = ((const int32_t *)(op_params_f + 1))[0];
+    const int    lpk_mode  = getenv("DS4P_METAL_LPK") ? atoi(getenv("DS4P_METAL_LPK")) : 0;
+    const bool   lpk_req   = lpk_mode != 0;
+    // mode 2 = lane-per-key with the padding REMOVED. One factor, so the bank-conflict
+    // claim is measured rather than assumed -- "the fix is obvious" was wrong three times.
+    const int    TKP       = (lpk_mode == 1) ? head_dim + 2 : head_dim;
+    const size_t smem_lpk  = (size_t) bs_pa_lpk * (TKP + head_dim) * sizeof(uint16_t)
+                           + (size_t) (nsg*head_dim + nsg*32)      * sizeof(float);
+    const bool   use_lpk   = lpk_req && !use_mma && n_tokens > 1 && bs_pa_lpk >= 32
+                          && smem_lpk <= smem_budget;
+    args.lpk = use_lpk ? lpk_mode : 0;
+
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        1);
@@ -4668,7 +4691,8 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // prefill stages K+V tiles (2 * block_size * head_dim halves); decode keeps its
     // combine area. Take the max so either path fits.
     const int    bs_stage   = ((const int32_t *)(op_params_f + 1))[0];
-    const size_t smem_stage = (size_t) 2 * bs_stage * head_dim * sizeof(uint16_t);
+    const size_t smem_stage = use_lpk ? smem_lpk
+                            : (size_t) 2 * bs_stage * head_dim * sizeof(uint16_t);
     const size_t smem_comb  = (size_t) (2*nsg + nsg*head_dim) * sizeof(float);
     // The MMA tile needs its own (larger) allocation, computed by the SAME expression the
     // eligibility test used. Layout and allocation move together or not at all.
@@ -4701,7 +4725,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // Key on the full config and print each distinct one.
     {
         static int last_key = -1;
-        const int key = (use_mma ? 1 : 0) | (head_dim << 1) | (bs_pa << 12) | (mma_nsg << 20) | (mma_sb << 24);
+         const int key = (use_mma ? 1 : 0) | (use_lpk ? 1<<28 : 0) | (head_dim << 1) | (bs_pa << 12) | (mma_nsg << 20) | (mma_sb << 24);
         if (key != last_key) {
             last_key = key;
             if (use_mma) {
@@ -4709,9 +4733,21 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 GGML_LOG_INFO("%s: DS4P-MMA ACTIVE  D=%d bs=%d sb=%d KT=%d nsg=%d QR=%d smem=%zu(+pad %s)/%zu\n",
                               __func__, head_dim, bs_pa, mma_sb, mma_sb*bs_pa, mma_nsg,
                               8*mma_nsg, mma_smem(mma_nsg, mma_sb), pe ? pe : "0", smem_budget);
+            } else if (use_lpk) {
+                GGML_LOG_INFO("%s: DS4P-LPK ACTIVE (lane-per-key two-phase) D=%d bs=%d nsg=%d "
+                              "TKP=%d%s smem=%zu/%zu\n",
+                              __func__, head_dim, bs_pa, (int) nsg, TKP,
+                              lpk_mode == 2 ? " UNPADDED" : "", smem_lpk, smem_budget);
             } else {
-                GGML_LOG_INFO("%s: DS4P-MMA OFF (scalar path) D=%d bs=%d n_tokens=%d\n",
-                              __func__, head_dim, bs_pa, n_tokens);
+                // State WHY, not just that it is off. A silent fallback is how a "PASS" once
+                // got reported for a path that never executed.
+                GGML_LOG_INFO("%s: DS4P-MMA OFF (scalar path) D=%d bs=%d n_tokens=%d "
+                              "lpk=off(%s)\n",
+                              __func__, head_dim, bs_pa, n_tokens,
+                              !lpk_req      ? "not requested" :
+                              n_tokens <= 1 ? "decode"        :
+                              bs_pa < 32    ? "bs<32"         :
+                              smem_lpk > smem_budget ? "smem" : "mma");
             }
         }
     }

@@ -3299,14 +3299,47 @@ kernel void kernel_paged_attn_f32(
             if (glast  >= off && glast  < off + len) { seq_l = s2; il_l = glast - off; }
         }
 
+        // ★ LANE-PER-KEY (args.lpk): the scalar loop below runs a FULL 32-lane simd_sum once
+        // per (query row, key) pair -- ~160 shuffle-equivalents against ~128 MACs per 32 keys.
+        // Tile WIDTH was refuted three ways (sb, nsg, block_size), so by elimination the
+        // reduction count is the cost. Two-phase form: phase A scores 32 keys at once with
+        // TWO reductions total (simd_max + simd_sum); phase B accumulates V in the ORIGINAL
+        // lane-per-head-dim layout, which is why the pure inversion is dead -- V accumulation
+        // is indexed by head-dim to match the dst write, so lane-per-key there would need a
+        // reduction PER d, strictly worse.
+        //
+        // K TILE IS PADDED. Phase A has lane l read tk[l*TKP + d]: at TKP = D = 128 halves the
+        // lanes are 64 words apart and 64 % 32 == 0, so all 32 land in ONE bank and the whole
+        // saving evaporates. +2 halves makes the word stride odd. V keeps stride D: phase B
+        // reads lane->d2 which is contiguous across lanes and already conflict-free.
+        // lpk==1 padded, lpk==2 UNPADDED -- the one-factor arm that tests whether the bank conflict
+        // is real. If padded == unpadded, the conflict story is wrong and the arm stops.
+        const int TKP = (args.lpk == 1) ? (D + 2) : D;
+
         threadgroup half * tk = (threadgroup half *) shmem;
-        threadgroup half * tv = tk + bs*D;
+        threadgroup half * tv = tk + bs*TKP;
+        // Q must be STAGED, not held in registers: phase A needs every lane to see the whole
+        // Q row, and D floats per lane blows the register file (fatal at D=256). bs is even
+        // and TKP+D = 2D+2 is even, so this half* -> float* cast is always 4-byte aligned.
+        threadgroup float * sq = (threadgroup float *) (tv + bs*D);
+        threadgroup float * sp = sq + nsg*D;   // 32 scores per simd group, broadcast phase A->B
 
         if (seq_f == seq_l && seq_l >= 0) {
             // SHARED-TILE PATH (same seq for the whole pack -- the common case)
             const int n_tok_u = (ctx_lens[seq_l] - batch_lens[seq_l]) + il_l + 1;
             const int nblk    = (n_tok_u + bs - 1) / bs;
             const uint tid    = tpitg3[0];
+
+            // Stage this simd group's Q row ONCE, outside the block loop. Written only by the
+            // owning simd group and read only by it, so a simdgroup_barrier suffices -- and it
+            // lives in its own smem region, so it cannot race the K/V staging below.
+            if (args.lpk) {
+                for (int i = 0; i < NPT; ++i) {
+                    const int d = (int) lane + i*32;
+                    if (d < D) { sq[sg*D + d] = qv[i]; }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
 
             for (int bi = 0; bi < nblk; ++bi) {
                 const int pb = block_table[seq_l * args.max_blocks + bi];
@@ -3317,19 +3350,66 @@ kernel void kernel_paged_attn_f32(
                 for (uint idx = tid; idx < (uint)(bs*D); idx += ntg) {
                     const uint t  = idx / (uint) D;
                     const uint d2 = idx % (uint) D;
-                    tk[idx] = kv_cache[kb + (uint64_t) t * args.stride_token + d2];
-                    tv[idx] = kv_cache[vb + (uint64_t) t * args.stride_token + d2];
+                    tk[t*(uint) TKP + d2] = kv_cache[kb + (uint64_t) t * args.stride_token + d2];
+                    tv[idx]               = kv_cache[vb + (uint64_t) t * args.stride_token + d2];
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 const int t0   = bi*bs;
                 const int tend = min(bs, n_tok - t0);   // this ROW's bound; may diverge per sg
                 const int tbeg = max(0, lo - t0);
+
+                if (args.lpk) {
+                    // PHASE A: lane l scores key tb+l. Every lane in this simd group owns the
+                    // SAME query row (simd group s owns row tgpig[0]*nsg + s), so tbeg/tend/
+                    // m_i/l_i are lane-uniform and the two reductions below are well-formed
+                    // even where the per-row bounds diverge across simd groups.
+                    for (int tb = tbeg; tb < tend; tb += 32) {
+                        const int t = tb + (int) lane;
+                        float sc = -INFINITY;
+                        if (t < tend) {
+                            float dot = 0.0f;
+                            for (int d = 0; d < D; ++d) {
+                                dot += sq[sg*D + d] * (float) tk[t*TKP + d];
+                            }
+                            sc = dot * args.scale;
+                            const int rd = q_pos - (t0 + t);
+                            if (args.rel_extent > 0 && rd >= 0 && rd < args.rel_extent) {
+                                sc += rel[((uint64_t) gtok * args.n_heads + head_idx) * args.rel_extent + rd];
+                            }
+                        }
+                        // Block-wise online softmax -- the standard flash form, identical in
+                        // shape to what the MMA path above already does. TWO reductions for
+                        // the whole 32-key group, against 32 in the loop below.
+                        const float m_new = max(m_i, simd_max(sc));
+                        const float resc  = (m_i == -INFINITY) ? 0.0f : exp(m_i - m_new);
+                        const float p     = (sc  == -INFINITY) ? 0.0f : exp(sc - m_new);
+                        l_i = l_i * resc + simd_sum(p);
+
+                        sp[sg*32 + lane] = p;
+                        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                        // PHASE B: layout UNCHANGED from the scalar loop -- lane owns head-dims,
+                        // V read is contiguous across lanes. Rescale is hoisted out of the key
+                        // loop because resc is now per BLOCK, not per key.
+                        for (int i = 0; i < NPT; ++i) { accv[i] *= resc; }
+                        const int kmax = min(32, tend - tb);
+                        for (int k = 0; k < kmax; ++k) {
+                            const float pk = sp[sg*32 + k];
+                            for (int i = 0; i < NPT; ++i) {
+                                const int d2 = (int) lane + i*32;
+                                if (d2 < D) { accv[i] += pk * (float) tv[(tb+k)*D + d2]; }
+                            }
+                        }
+                        m_i = m_new;
+                        simdgroup_barrier(mem_flags::mem_threadgroup);   // sp reused next iter
+                    }
+                } else
                 for (int t = tbeg; t < tend; ++t) {
                     float part = 0.0f;
                     for (int i = 0; i < NPT; ++i) {
                         const int d2 = (int) lane + i*32;
-                        if (d2 < D) { part += qv[i] * (float) tk[t*D + d2]; }
+                        if (d2 < D) { part += qv[i] * (float) tk[t*TKP + d2]; }
                     }
                     float sc = simd_sum(part) * args.scale;
                     const int rd = q_pos - (t0 + t);
