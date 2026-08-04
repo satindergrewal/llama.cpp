@@ -1304,7 +1304,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_champ
         const int nqptg = OP_FLASH_ATTN_EXT_NQPSG;
         const int ncpsg = OP_FLASH_ATTN_EXT_NCPSG;
         const int pv64  = ((head_dim + 63) / 64) * 64;
-        res.smem = GGML_PAD((size_t)(nqptg*(head_dim + 2*pv64 + 2*(2*ncpsg))) * (sizeof(float)/2), 16);
+        // is_q=0 for f16 KV drops the 16*32*nsg term. DS4P_CHAMP_SMEM_FULL adds it back as a
+        // one-factor test of whether nsg=8's 6/12 failure is a silent threadgroup overrun --
+        // the ONLY remaining suspect after row indexing was refuted by reading.
+        const int is_q = getenv("DS4P_CHAMP_SMEM_FULL") ? 1 : 0;
+        res.smem = GGML_PAD((size_t)(nqptg*(head_dim + 2*pv64 + 2*(2*ncpsg)) + is_q*(16*32*nsg)) * (sizeof(float)/2), 16);
     }
 
     return res;
