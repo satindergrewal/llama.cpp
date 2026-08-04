@@ -1255,6 +1255,53 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn(ggml_
     return res;
 }
 
+// ★ PAGED CHAMPION pipeline. Specialised per (head_dim, nsg) AND per stride_token, because
+// ns10/ns20 are function constants that bake the K/V row pitch into the compiled kernel -- two
+// different strides sharing one cached compilation would silently use the first caller's pitch.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_champ(
+        ggml_metal_library_t lib, const ggml_tensor * op, int nsg) {
+    char base[256];
+    char name[256];
+
+    const int32_t head_dim = (int32_t) op->src[0]->ne[0];
+    const ggml_tensor * kvc = op->src[3];
+    const int32_t ns10 = (int32_t) (kvc->nb[1] / sizeof(ggml_fp16_t));   // stride_token, elements
+
+    snprintf(base, 256, "kernel_paged_attn_champ_dk%d_dv%d", head_dim, head_dim);
+    snprintf(name, 256, "%s_nsg%d_ns%d", base, nsg, ns10);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        // No mask/sinks/bias/softcap/kvpad on the paged path: causality comes from the block
+        // walk and the per-row bound, and a partial tail block is handled by the loop bound,
+        // not by a pad buffer. bc_mask off for the same reason.
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 0);
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 1);
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 2);
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 3);
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 4);
+        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 10);
+        ggml_metal_cv_set_int32(cv, ns10,  FC_FLASH_ATTN_EXT + 20);
+        ggml_metal_cv_set_int32(cv, ns10,  FC_FLASH_ATTN_EXT + 21);   // K and V share the pitch
+        ggml_metal_cv_set_int32(cv, nsg,   FC_FLASH_ATTN_EXT + 22);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+
+    // Champion smem: PAD((nqptg*(ne00 + 2*PAD(ne20,64) + 2*(2*ncpsg)) + is_q*(16*32*nsg))*2, 16)
+    // is_q = 0 -- our paged KV is f16. Measured 10,240 B at D=128/C=64, FLAT in nsg, which is the
+    // whole reason this port exists.
+    {
+        const int nqptg = OP_FLASH_ATTN_EXT_NQPSG;
+        const int ncpsg = OP_FLASH_ATTN_EXT_NCPSG;
+        const int pv64  = ((head_dim + 63) / 64) * 64;
+        res.smem = GGML_PAD((size_t)(nqptg*(head_dim + 2*pv64 + 2*(2*ncpsg))) * (sizeof(float)/2), 16);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_ARGSORT);
 
