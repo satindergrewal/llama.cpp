@@ -4515,18 +4515,42 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     //   D=128 bs=16 nsg=2 -> 22,144  OK
     const int    bs_pa       = ((const int32_t *)(op_params_f + 1))[0];
     const size_t smem_budget = 32768;
-    auto mma_smem = [&](int nsg_try) -> size_t {
+    // sb = paged blocks staged per iteration; KT = sb*bs key tokens, and the score tile
+    // stride SH is KT, so sb scales the staged K/V AND the score tile together.
+    auto mma_smem = [&](int nsg_try, int sb_try) -> size_t {
         const size_t QR = (size_t) 8 * nsg_try;
+        const size_t KT = (size_t) sb_try * bs_pa;
         // ss is reused in place as P (both float), so ONE score tile, not two.
-        return ((size_t) 2*bs_pa*head_dim + QR*head_dim) * sizeof(uint16_t)
-             + (QR*bs_pa + QR*head_dim + 2*QR) * sizeof(float);
+        return (2*KT*head_dim + QR*head_dim) * sizeof(uint16_t)
+             + (QR*KT + QR*head_dim + 2*QR) * sizeof(float);
     };
-    int  mma_nsg = 0;
+    int  mma_nsg = 0, mma_sb = 0;
     bool use_mma = (n_tokens > 1) && (head_dim % 8 == 0) && (bs_pa % 8 == 0) && (bs_pa > 0);
     if (use_mma) {
-        // largest simd-group count whose tile fits; the kernel reads nsg from the dispatch
-        for (int cand = 8; cand >= 1; cand >>= 1) {
-            if (mma_smem(cand) <= smem_budget) { mma_nsg = cand; break; }
+        // Which of (more staged blocks) vs (more simd groups) wins is a MEASUREMENT, not a
+        // guess, so DS4P_METAL_SB forces sb and the sweep runs as paired arms in ONE binary
+        // -- the discipline that made the earlier nsg and cp.async sweeps trustworthy.
+        // MEASURED, not assumed: staging more blocks is WORSE, monotonically.
+        //   sb=1 KT=16 nsg=2 -> 2,298 ms   sb=2 KT=32 nsg=2 -> 2,561   sb=3 KT=48 nsg=1 -> 4,228
+        // (one binary, fresh server per point, best of 5, marker verified per point; sb=4 did
+        // not fit at D=128 and the marker correctly showed the scalar fallback at 2,952,
+        // matching the known scalar 2,944.)
+        // I had predicted the opposite -- that at bs=16 the half-idle softmax lanes and the
+        // barrier every 16 keys made two blocks "the single most likely remaining win". It
+        // costs 11%. The likely reason is that a wider tile computes more MASKED columns: the
+        // Q@K^T MMA evaluates the whole KT width regardless of how much of it the causal mask
+        // then discards, so widening the tile buys arithmetic that is thrown away. Default
+        // stays 1; the knob stays so the trade can be re-measured on other shapes.
+        int sb_lo = 1, sb_hi = 1;
+        if (const char * e = getenv("DS4P_METAL_SB")) {
+            const int v = atoi(e);
+            if (v >= 1 && v <= 8) { sb_lo = v; sb_hi = v; }
+        }
+        // prefer more staged blocks, then the largest simd-group count that still fits
+        for (int sb = sb_hi; sb >= sb_lo && mma_nsg == 0; --sb) {
+            for (int cand = 8; cand >= 1; cand >>= 1) {
+                if (mma_smem(cand, sb) <= smem_budget) { mma_nsg = cand; mma_sb = sb; break; }
+            }
         }
         if (mma_nsg == 0) { use_mma = false; }   // no tile fits -> scalar path, no silence
     }
@@ -4546,6 +4570,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.n_tokens_total    =*/ n_tokens,
         /*.nsg               =*/ use_mma ? mma_nsg : ((n_tokens > 1) ? 8 : 32),
         /*.use_mma           =*/ use_mma ? 1 : 0,
+        /*.stage_blocks      =*/ mma_sb,
         /*.stride_token      =*/ kv_cache->nb[1] / sizeof(ggml_fp16_t),
         /*.stride_head       =*/ kv_cache->nb[2] / sizeof(ggml_fp16_t),
         /*.stride_block      =*/ kv_cache->nb[3] / sizeof(ggml_fp16_t),
@@ -4615,7 +4640,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // The MMA tile needs its own (larger) allocation, computed by the SAME expression the
     // eligibility test used. Layout and allocation move together or not at all.
     const size_t smem_scal = smem_stage > smem_comb ? smem_stage : smem_comb;
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, use_mma ? mma_smem(mma_nsg) : smem_scal, 0);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, use_mma ? mma_smem(mma_nsg, mma_sb) : smem_scal, 0);
 
     // PRESENCE MARKER. A float arm once reported "ALL PASSED" while the fallback silently
     // ran because the tile had quietly exceeded the smem limit -- so which path executed is
@@ -4628,13 +4653,13 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // Key on the full config and print each distinct one.
     {
         static int last_key = -1;
-        const int key = (use_mma ? 1 : 0) | (head_dim << 1) | (bs_pa << 12) | (mma_nsg << 20);
+        const int key = (use_mma ? 1 : 0) | (head_dim << 1) | (bs_pa << 12) | (mma_nsg << 20) | (mma_sb << 24);
         if (key != last_key) {
             last_key = key;
             if (use_mma) {
-                GGML_LOG_INFO("%s: DS4P-MMA ACTIVE  D=%d bs=%d nsg=%d QR=%d smem=%zu/%zu\n",
-                              __func__, head_dim, bs_pa, mma_nsg, 8*mma_nsg,
-                              mma_smem(mma_nsg), smem_budget);
+                GGML_LOG_INFO("%s: DS4P-MMA ACTIVE  D=%d bs=%d sb=%d KT=%d nsg=%d QR=%d smem=%zu/%zu\n",
+                              __func__, head_dim, bs_pa, mma_sb, mma_sb*bs_pa, mma_nsg,
+                              8*mma_nsg, mma_smem(mma_nsg, mma_sb), smem_budget);
             } else {
                 GGML_LOG_INFO("%s: DS4P-MMA OFF (scalar path) D=%d bs=%d n_tokens=%d\n",
                               __func__, head_dim, bs_pa, n_tokens);

@@ -3033,12 +3033,18 @@ kernel void kernel_paged_attn_f32(
 
         const uint QR = 8 * nsgm;          // query rows owned by this threadgroup
         const int  bs = args.block_size;
-        const uint SH = (uint) bs;         // score-tile row stride  (its OWN stride)
+        // SB consecutive paged blocks are staged per iteration. At bs=16 a single block gives
+        // the softmax stage only 16 columns to spread over 32 lanes -- half the lanes idle --
+        // and costs a threadgroup barrier every 16 keys. Staging SB blocks multiplies both the
+        // column count and the work per barrier. The host picks SB from the smem budget.
+        const int  SB = args.stage_blocks;
+        const int  KT = SB * bs;           // key tokens staged per iteration
+        const uint SH = (uint) KT;         // score-tile row stride  (its OWN stride)
         const uint PV = (uint) D;          // O accumulator stride   (its OWN stride)
 
         threadgroup half  * tk = (threadgroup half *) shmem;
-        threadgroup half  * tv = tk + bs*D;
-        threadgroup half  * sq = tv + bs*D;
+        threadgroup half  * tv = tk + KT*D;
+        threadgroup half  * sq = tv + KT*D;
         // ss holds the SCORES and is then overwritten IN PLACE with P. They were two
         // buffers only while P was half and the scores were float; both are float now, so
         // the split cost QR*SH floats for nothing. Safe in place: each lane owns distinct
@@ -3087,23 +3093,33 @@ kernel void kernel_paged_attn_f32(
             const int q_hi  = ctx0 + (glast_c - off_s);
             const int nblk  = (q_hi + 1 + bs - 1) / bs;
 
-            for (int bi = 0; bi < nblk; ++bi) {
-                const int pb = block_table[seq * args.max_blocks + bi];
-                const uint64_t kb = (uint64_t) pb * args.stride_block
-                                  + (uint64_t) kv_h * args.stride_head;
-                const uint64_t vb = (uint64_t) pb * args.stride_block
-                                  + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head;
-
+            for (int bg = 0; bg < nblk; bg += SB) {
                 threadgroup_barrier(mem_flags::mem_threadgroup);   // prev iter's readers
-                for (uint idx = tid; idx < (uint)(bs*D); idx += ntg) {
-                    const uint t = idx / (uint) D, d2 = idx % (uint) D;
+                for (uint idx = tid; idx < (uint)(KT*D); idx += ntg) {
+                    const uint t_all = idx / (uint) D, d2 = idx % (uint) D;
+                    const int  sub   = (int) (t_all / (uint) bs);
+                    const int  t     = (int) (t_all % (uint) bs);
+                    const int  bi    = bg + sub;
+                    if (bi >= nblk) {
+                        // Past the end of this sequence's blocks. ZERO rather than read
+                        // block_table out of range; those key positions are beyond every
+                        // row's q_pos and the causal mask discards them anyway.
+                        tk[idx] = (half) 0.0f;
+                        tv[idx] = (half) 0.0f;
+                        continue;
+                    }
+                    const int pb = block_table[seq * args.max_blocks + bi];
+                    const uint64_t kb = (uint64_t) pb * args.stride_block
+                                      + (uint64_t) kv_h * args.stride_head;
+                    const uint64_t vb = (uint64_t) pb * args.stride_block
+                                      + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head;
                     tk[idx] = kv_cache[kb + (uint64_t) t * args.stride_token + d2];
                     tv[idx] = kv_cache[vb + (uint64_t) t * args.stride_token + d2];
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 // ---- S = Q @ K^T
-                for (int cc = 0; cc < bs/8; ++cc) {
+                for (int cc = 0; cc < KT/8; ++cc) {
                     simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
                     simdgroup_half8x8  mq, mk;
                     for (int i = 0; i < D/8; ++i) {
@@ -3132,8 +3148,8 @@ kernel void kernel_paged_attn_f32(
 
                     const float m_prev = Mr[jl];
                     float mx = m_prev;
-                    for (uint c = lnm; c < (uint) bs; c += 32) {
-                        const int kpos = bi*bs + (int) c;
+                    for (uint c = lnm; c < (uint) KT; c += 32) {
+                        const int kpos = bg*bs + (int) c;
                         float s = ss[jl*SH + c] * args.scale;
                         const int rd = q_pos - kpos;
                         if (args.rel_extent > 0 && rd >= 0 && rd < args.rel_extent) {
@@ -3147,7 +3163,7 @@ kernel void kernel_paged_attn_f32(
 
                     const float ms = (m_prev == -INFINITY) ? 0.0f : exp(m_prev - mx);
                     float sum = 0.0f;
-                    for (uint c = lnm; c < (uint) bs; c += 32) {
+                    for (uint c = lnm; c < (uint) KT; c += 32) {
                         const float s  = ss[jl*SH + c];
                         const float vs = (s == -INFINITY) ? 0.0f : exp(s - mx);
                         ss[jl*SH + c] = vs;             // scores -> P, in place
@@ -3166,7 +3182,7 @@ kernel void kernel_paged_attn_f32(
                 for (int dd = 0; dd < D/8; ++dd) {
                     simdgroup_float8x8 lo8;
                     simdgroup_load(lo8, so + (8*sgm)*PV + dd*8, PV);
-                    for (int cc = 0; cc < bs/8; ++cc) {
+                    for (int cc = 0; cc < KT/8; ++cc) {
                         simdgroup_float8x8 mp;
                         simdgroup_half8x8  mv;
                         simdgroup_barrier(mem_flags::mem_none);
