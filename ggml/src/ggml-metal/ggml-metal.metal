@@ -3122,11 +3122,16 @@ kernel void kernel_paged_attn_f32(
                 for (int cc = 0; cc < KT/8; ++cc) {
                     simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
                     simdgroup_half8x8  mq, mk;
+                    // The champion wraps every load group in simdgroup_barrier(mem_none).
+                    // That was COPIED, never measured here -- and at D=128 it is two barriers
+                    // per inner iteration, sixteen iterations per score tile. Gated so the
+                    // cost can be swept; args.sg_barriers is threadgroup-uniform so the
+                    // branch is safe.
                     for (int i = 0; i < D/8; ++i) {
-                        simdgroup_barrier(mem_flags::mem_none);
+                        if (args.sg_barriers) { simdgroup_barrier(mem_flags::mem_none); }
                         simdgroup_load(mq, sq + (8*sgm)*D + 8*i, D);
                         simdgroup_load(mk, tk + cc*8*D + 8*i, D, 0, true);   // -> d x kt
-                        simdgroup_barrier(mem_flags::mem_none);
+                        if (args.sg_barriers) { simdgroup_barrier(mem_flags::mem_none); }
                         simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
                     }
                     simdgroup_store(mqk, ss + (8*sgm)*SH + cc*8, SH);
@@ -3196,10 +3201,10 @@ kernel void kernel_paged_attn_f32(
                         const uint64_t vb = (uint64_t) pbv * args.stride_block
                                           + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head
                                           + (uint64_t) off * args.stride_token;
-                        simdgroup_barrier(mem_flags::mem_none);
+                        if (args.sg_barriers) { simdgroup_barrier(mem_flags::mem_none); }
                         simdgroup_load(mp, ss + (8*sgm)*SH + cc*8, SH);
                         simdgroup_load(mv, kv_cache + vb + dd*8, args.stride_token);
-                        simdgroup_barrier(mem_flags::mem_none);
+                        if (args.sg_barriers) { simdgroup_barrier(mem_flags::mem_none); }
                         simdgroup_multiply_accumulate(lo8, mp, mv, lo8);
                     }
                     simdgroup_store(lo8, so + (8*sgm)*PV + dd*8, PV);

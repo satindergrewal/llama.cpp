@@ -4582,6 +4582,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.nsg               =*/ use_mma ? mma_nsg : ((n_tokens > 1) ? 8 : 32),
         /*.use_mma           =*/ use_mma ? 1 : 0,
         /*.stage_blocks      =*/ mma_sb,
+        /*.sg_barriers       =*/ getenv("DS4P_METAL_NO_SGBAR") ? 0 : 1,
         /*.stride_token      =*/ kv_cache->nb[1] / sizeof(ggml_fp16_t),
         /*.stride_head       =*/ kv_cache->nb[2] / sizeof(ggml_fp16_t),
         /*.stride_block      =*/ kv_cache->nb[3] / sizeof(ggml_fp16_t),
