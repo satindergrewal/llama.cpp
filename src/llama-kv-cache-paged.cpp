@@ -970,3 +970,107 @@ void llama_kv_cache_paged_context::set_batch_size(int32_t new_batch_size) {
 void llama_kv_cache_paged_context::set_max_blocks(int32_t new_max_blocks) {
     max_blocks = new_max_blocks;
 }
+
+// ★ SELF-DRIVE -- see the header for why this exists and how narrow it is.
+bool llama_kv_cache_paged::self_drive_enabled() const {
+    static const bool en = [] {
+        const char * e = getenv("DS4P_PAGED_DRIVE");
+        return e && atoi(e) != 0;
+    }();
+    return en;
+}
+
+void llama_kv_cache_paged::self_drive_end() {
+    if (!sd_active) {
+        return;
+    }
+
+    set_paged_batch_info(nullptr);
+
+    delete[] sd_info.write_slots;
+    delete[] sd_info.block_table;
+    delete[] sd_info.context_lens;
+    delete[] sd_info.batch_offsets;
+    delete[] sd_info.batch_lens;
+    delete[] sd_info.prefill_pending;
+    sd_info = {};
+
+    free_blocks(sd_group);
+    sd_group = {};
+    sd_active = false;
+}
+
+bool llama_kv_cache_paged::self_drive_begin(int32_t n_tokens) {
+    // Always release the previous step first: the info is non-owning at the consumer, so a stale
+    // pointer outliving its arrays is exactly the lifetime bug the scheduler's clear_batch ordering
+    // comment warns about.
+    self_drive_end();
+
+    if (n_tokens <= 0) {
+        return false;
+    }
+
+    sd_group = {};
+    sd_group.request_id = 0;
+    sd_group.n_prompt   = (uint32_t) n_tokens;
+    sd_group.n_past     = 0;
+    sd_group.n_decoded  = 0;
+
+    if (!allocate(n_tokens, sd_group)) {
+        LLAMA_LOG_WARN("%s: self-drive could not allocate %d tokens; falling back to static\n",
+                       __func__, n_tokens);
+        sd_group = {};
+        return false;
+    }
+
+    const int32_t n_blocks = (int32_t) sd_group.block_table.size();
+    if (n_blocks <= 0) {
+        free_blocks(sd_group);
+        sd_group = {};
+        return false;
+    }
+
+    sd_info                   = {};
+    sd_info.n_seq             = 1;
+    sd_info.n_tokens          = n_tokens;
+    sd_info.n_blocks_per_seq  = n_blocks;
+    sd_info.write_slots       = new int32_t[n_tokens];
+    sd_info.block_table       = new int32_t[n_blocks];
+    sd_info.context_lens      = new int32_t[1];
+    sd_info.batch_offsets     = new int32_t[1];
+    sd_info.batch_lens        = new int32_t[1];
+    sd_info.prefill_pending   = new int32_t[1];
+
+    for (int32_t b = 0; b < n_blocks; ++b) {
+        sd_info.block_table[b] = (int32_t) sd_group.block_table[b];
+    }
+
+    // Same mapping as llama_paged_scheduler_impl::calculate_global_slot_index: the physical slot
+    // is block_table[pos/bs]*bs + pos%bs. Reproduced rather than shared because that helper is a
+    // private member of the scheduler; if it ever changes, THIS must change with it.
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const int32_t blk = i / (int32_t) block_size;
+        const int32_t off = i % (int32_t) block_size;
+        GGML_ASSERT(blk < n_blocks && "self-drive slot OOB -- allocate() returned too few blocks");
+        sd_info.write_slots[i] = sd_info.block_table[blk] * (int32_t) block_size + off;
+    }
+
+    sd_info.context_lens[0]    = n_tokens;
+    sd_info.batch_offsets[0]   = 0;
+    sd_info.batch_lens[0]      = n_tokens;
+    sd_info.prefill_pending[0] = 0;
+
+    sd_active = true;
+    set_paged_batch_info(&sd_info);
+
+    {
+        static bool said = false;
+        if (!said) { said = true;
+            LLAMA_LOG_INFO("%s: DS4P-PAGED-DRIVE active -- self-driving %d tokens over %d blocks "
+                           "(n_seq=1; multi-seq admission stays with the scheduler)\n",
+                           __func__, n_tokens, n_blocks);
+        }
+    }
+
+    return true;
+}

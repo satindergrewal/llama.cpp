@@ -985,6 +985,26 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+    // ⚠ When EVERY attention layer takes the paged branch, build_attn is never called, so these
+    // static inputs are created by build_inp_mem_hybrid() and then consumed by NO node. The
+    // allocator skips unconsumed tensors, so ->buffer is null and set_input_k_idxs aborts on
+    // GGML_ASSERT(buffer). This is the trap documented at inkling.cpp:308, hit from the STATIC
+    // side: "creating an input no node consumes leaves it unallocated and its set_input crashes
+    // on a null buffer".
+    //
+    // Inkling avoids it by deciding paged-vs-static BEFORE creating inputs. The generic hybrid
+    // input is shared by many architectures, so changing its CREATION is the riskier edit;
+    // skipping the set for a tensor nothing consumed is both correct and narrow -- there is
+    // genuinely nothing to write. Guarded on the allocator's own signal, not on an arch or a flag.
+    if (inp_attn->self_k_idxs == nullptr || inp_attn->self_k_idxs->buffer == nullptr) {
+        static bool said = false;
+        if (!said) { said = true;
+            LLAMA_LOG_INFO("%s: static attn inputs unconsumed (all attention layers took the paged "
+                           "path) -- skipping their set_input\n", __func__);
+        }
+        return;
+    }
+
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
@@ -3861,7 +3881,11 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
     ggml_tensor * kv_cache_l = paged_ctx->get_k(il);   // interleaved K+V heads (src[3] contract)
     GGML_ASSERT(kv_cache_l != nullptr);
 
-    auto * inp_paged = build_attn_inp_kv_paged(paged_ctx);
+    // ONE set of paged inputs per graph, not per layer -- see cached_inp_paged in the header.
+    if (cached_inp_paged == nullptr) {
+        cached_inp_paged = build_attn_inp_kv_paged(paged_ctx);
+    }
+    auto * inp_paged = cached_inp_paged;
 
     ggml_tensor * rel_p = rel ? ggml_cont(ctx0, rel) : nullptr;
 

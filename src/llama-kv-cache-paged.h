@@ -51,6 +51,21 @@ class llama_kv_cache_paged : public llama_memory_i {
     bool swap_in(llama_sequence_group & group);
     bool swap_out(llama_sequence_group & group);
 
+    // ★ SELF-DRIVE (DS4P_PAGED_DRIVE). set_paged_batch_info() is called from exactly ONE place --
+    // llama_paged_scheduler_impl::step() -- and llama-server never calls it, so has_paged_batch_info()
+    // is always false there and no graph can consume the pool. That is the last link in the Ornith
+    // consumer chain (audit findings 5/7).
+    //
+    // The full fix is P2-8 continuous batching. But the BLOCK ALLOCATOR is ours, not the
+    // scheduler's (block_manager below, allocate()/free_blocks()), so a SINGLE sequence can be
+    // driven here directly without that rewrite. This owns the group and the info for one ubatch.
+    //
+    // Scope, deliberately narrow: n_seq == 1, one ubatch at a time. Multi-seq admission, eviction
+    // and preemption stay with the scheduler. Freed and re-allocated on every call.
+    bool self_drive_begin(int32_t n_tokens);
+    void self_drive_end();
+    bool self_drive_enabled() const;
+
     void     set_paged_batch_info(const llama_paged_batch_info * info);
     uint32_t get_num_gpu_blocks() const;
 
@@ -154,6 +169,11 @@ class llama_kv_cache_paged : public llama_memory_i {
     // The ordering in llama_paged_scheduler_impl::clear_batch is load-bearing;
     // do not reorder without updating init_batch's contract.
     const llama_paged_batch_info * last_paged_info = nullptr;
+
+    // self-drive state (see self_drive_begin). Owned here so it outlives the graph build.
+    llama_sequence_group   sd_group;
+    llama_paged_batch_info sd_info;
+    bool                   sd_active = false;
 
     const uint32_t head_dim;
     const uint32_t n_heads_kv;

@@ -130,6 +130,18 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         // context alongside (same ubatches -- the recurrent split constraints win). Dark until
         // the scheduler drives it: has_paged_batch_info() is false without that, so this cannot
         // trip the init ordering assert. Mirrors llama_memory_hybrid_iswa::init_batch.
+        // ★ SELF-DRIVE bridge (DS4P_PAGED_DRIVE). Nothing in llama-server calls the scheduler's
+        // step(), so has_paged_batch_info() is never true there and no graph can consume the pool
+        // -- the last link of the Ornith consumer chain. Drive a single sequence here using the
+        // cache's OWN allocator; the scheduler keeps multi-seq admission/eviction.
+        // Deliberately narrow: exactly one ubatch, n_seq == 1. Anything else falls through
+        // untouched, so the scheduler-driven path and the static default are both unchanged.
+        if (mem_attn_paged && !mem_attn_paged->has_paged_batch_info() &&
+            mem_attn_paged->self_drive_enabled() && ubatches.size() == 1 &&
+            ubatches[0].n_seqs == 1) {
+            mem_attn_paged->self_drive_begin((int32_t) ubatches[0].n_tokens);
+        }
+
         llama_memory_context_ptr paged_ctx;
         if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
             paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches); // copy: hybrid ctx owns the originals

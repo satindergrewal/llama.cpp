@@ -1121,6 +1121,14 @@ struct llm_graph_context {
     //     if (!cur) { cur = build_attn(inp, ...); }
     //
     // Eligibility is paged_layer_supported() -- a capability test on the LAYER, never an arch name.
+    // ⚠ The paged inputs (block table, write slots, context lens, batch offsets, batch lens) are
+    // per-GRAPH, not per-layer. Creating them inside the per-layer helper made Ornith's 16
+    // attention layers request 16x5 = 80 extra graph inputs and abort with
+    // GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS). Inkling never hit it because far fewer
+    // of its layers take the paged branch -- "it works there" was not evidence it scales.
+    // Built once on first use, reused by every layer of this build.
+    mutable llm_graph_input_attn_kv_paged * cached_inp_paged = nullptr;
+
     ggml_tensor * build_attn_paged_or_null(
             const llama_kv_cache_paged_context * paged_ctx,
             ggml_tensor * q,
