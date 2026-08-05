@@ -353,7 +353,19 @@ int main() {
             const int BS = getenv("DS4P_TEST_BS") ? atoi(getenv("DS4P_TEST_BS")) : 16;
             const int NB = getenv("DS4P_TEST_NB") ? atoi(getenv("DS4P_TEST_NB")) : 2;
             const int N  = BS*NB - BS/2;
-            const int n1 = N/2;   // split mid-stream, deliberately NOT on a block boundary
+
+            // ★ TWO SPLITS, AND THE SECOND ONE IS THE POINT.
+            //   N/2 -> second call is a multi-token PREFILL dispatch
+            //   N-1 -> second call is n_tokens == 1, i.e. the DECODE dispatch
+            // Until this arm existed, test-paged-vs-cpu had NEVER ONCE dispatched n_tokens=1. Every
+            // "q8_0 PASS at all six head_dims and both block sizes" this file has ever printed was
+            // true of the PREFILL path alone -- and the decode branch reads the cache directly as
+            // half at six sites with no dequant, so a quantised cache was garbage there and no
+            // amount of widening head_dim or block_size could ever have shown it. The gate covered
+            // one of the kernel's two branches and its verdict named neither.
+            const int splits[] = { N/2, N-1 };
+            for (size_t si = 0; si < sizeof(splits)/sizeof(splits[0]); ++si) {
+            const int n1 = splits[si];
 
             const std::vector<float> whole = run_paged      (backend, D, true, 0, kts[ki]);
             const std::vector<float> split = run_paged_split(backend, D, true, 0, kts[ki], n1);
@@ -366,9 +378,12 @@ int main() {
             // Same arithmetic in the same order -- only the WRITE SCHEDULE differs, so this is an
             // exactness check, not a tolerance. Anything above f32 noise is the incremental path.
             const bool ok = max_abs < 1e-5;
-            printf("incremental %-5s D=%3d split=%d/%d: max_abs=%.3e %s\n",
-                   ggml_type_name(kts[ki]), D, n1, N, max_abs, ok ? "PASS" : "FAIL");
+            printf("incremental %-5s D=%3d split=%2d/%d%s: max_abs=%.3e %s\n",
+                   ggml_type_name(kts[ki]), D, n1, N,
+                   (N - n1) == 1 ? " [DECODE n_tokens=1]" : " [prefill]",
+                   max_abs, ok ? "PASS" : "FAIL");
             n_fail += ok ? 0 : 1;
+            }
         }
     }
 

@@ -4747,6 +4747,26 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // Prefill goes the other way (3885 -> 4855 ms over the same sweep) because it already
     // has n_tokens*n_heads threadgroups and extra slices only widen the combine.
     int nsg = use_mma ? mma_nsg : (n_tokens > 1 ? 8 : 32);
+
+    // ⚠ DECODE nsg MUST BE CAPPED BY THE COMBINE AREA, and it never was. The decode combine is
+    // (2*nsg + nsg*head_dim) floats, so at the hardcoded nsg=32 it costs 33,024 B at head_dim 256
+    // and 65,792 B at 512 -- against a 32,768 B budget. Nothing checked it, so paged DECODE has
+    // been oversubscribing threadgroup memory for every head_dim >= 256 on BOTH cache types.
+    //
+    // ★ THAT IS ORNITH'S OWN GEOMETRY. head_dim 256 has been running its decode 256 bytes over
+    // budget this whole time, silently, on the f16 path that all the parity numbers came from.
+    // It was invisible because nothing asserted and the output stayed plausible -- the same
+    // signature as every other bug in this file today.
+    //
+    // Halve until it fits rather than picking a new constant: the constant is what got us here,
+    // and the budget is the only thing that actually bounds it.
+    if (!use_mma && n_tokens == 1) {
+        while (nsg > 1 && (size_t) (2*nsg + nsg*head_dim) * sizeof(float) > smem_budget) {
+            nsg /= 2;
+        }
+    }
+    args.nsg = nsg;   // ROW STRIDE and dispatch width move together -- see the DS4P_METAL_NSG note
+
     // DS4P_METAL_NSG forces the simd-group count so a sweep runs as PAIRED ARMS IN ONE
     // BINARY rather than one rebuild per point -- the discipline that made the CUDA
     // cp.async A/B trustworthy. Decode is the shape worth sweeping: its grid is only
