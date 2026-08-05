@@ -200,6 +200,15 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
         // ★ SWA PAGED: carry the paged context alongside when the pool is live AND the scheduler
         // has set batch info. Dark otherwise -- has_paged_batch_info() is false without a driver,
         // so this cannot disturb the static ISWA path. Mirrors llama_memory_hybrid_iswa.
+        // Self-drive bridge, same as the hybrid path: nothing in llama-server calls the paged
+        // scheduler's step(), so without this has_paged_batch_info() is never true and no graph
+        // can consume the pool -- the pool would be built, resolved, and never read.
+        if (mem_attn_paged && mem_attn_paged->self_drive_enabled() &&
+            ubatches.size() == 1 && ubatches[0].n_seqs == 1 &&
+            (mem_attn_paged->self_drive_active() || !mem_attn_paged->has_paged_batch_info())) {
+            mem_attn_paged->self_drive_begin((int32_t) ubatches[0].n_tokens);
+        }
+
         llama_memory_context_ptr paged_ctx;
         if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
             paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches);   // copy: ctx owns originals
@@ -247,8 +256,30 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         assert(sinfos_base.size() == sinfos_swa.size());
 
-        return std::make_unique<llama_kv_cache_iswa_context>(
+        // ⚠ SECOND SUCCESS PATH. init_batch has TWO near-identical success returns (the unified
+        // split above, and this one). Patching only the first left gemma-3 -- which takes THIS
+        // one -- with a pool that was built, resolved, and never read, while its output stayed
+        // correct because it silently ran static. Both paths must carry the paged context or the
+        // capability covers half the models and looks like it covers all of them.
+        if (mem_attn_paged && mem_attn_paged->self_drive_enabled() &&
+            ubatches.size() == 1 && ubatches[0].n_seqs == 1 &&
+            (mem_attn_paged->self_drive_active() || !mem_attn_paged->has_paged_batch_info())) {
+            mem_attn_paged->self_drive_begin((int32_t) ubatches[0].n_tokens);
+        }
+
+        llama_memory_context_ptr paged_ctx2;
+        if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
+            paged_ctx2 = mem_attn_paged->init_batch_with_ubatches(ubatches);
+        }
+
+        auto ctx2 = std::make_unique<llama_kv_cache_iswa_context>(
                 this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+
+        if (paged_ctx2) {
+            ctx2->set_attn_paged_ctx(std::move(paged_ctx2));
+        }
+
+        return ctx2;
     } while (false);
 
     // TODO: if we fail again, we should attempt different splitting strategies
