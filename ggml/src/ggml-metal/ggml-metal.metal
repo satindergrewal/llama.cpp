@@ -3473,6 +3473,23 @@ kernel void kernel_paged_attn_f32(
                 for (uint idx = tid; idx < (uint)(bs*D); idx += ntg) {
                     const uint t  = idx / (uint) D;
                     const uint d2 = idx % (uint) D;
+
+                    // ★ DEQUANTISE ON STAGING. The tile is half either way, so the hot loop, the
+                    // LPK two-phase and the padded stride never see the quantised format -- that
+                    // is the whole point of doing it here rather than in the inner loop. Strides
+                    // are in BLOCKS for q8_0, matching ggml_row_size and the write kernel; all
+                    // three must agree about row width or they disagree silently.
+                    if (args.kv_q8) {
+                        device const block_q8_0 * kvq = (device const block_q8_0 *) kv_cache;
+                        const uint64_t kbq = kb + (uint64_t) t * args.stride_token + d2/QK8_0;
+                        const uint64_t vbq = vb + (uint64_t) t * args.stride_token + d2/QK8_0;
+                        tk[t*(uint) TKP + d2] = (half) ((float) kvq[kbq].d * (float) kvq[kbq].qs[d2 % QK8_0]);
+                        if (args.stage_v) {
+                            tv[idx]           = (half) ((float) kvq[vbq].d * (float) kvq[vbq].qs[d2 % QK8_0]);
+                        }
+                        continue;
+                    }
+
                     tk[t*(uint) TKP + d2] = kv_cache[kb + (uint64_t) t * args.stride_token + d2];
                     // ★ STAGING ARM: V read straight from device is the champion shape
                     // (ggml-metal.metal kernel_flash_attn_ext, `device const v_t * pv`). Halves

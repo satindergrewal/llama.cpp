@@ -4678,6 +4678,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.stage_v           =*/ 1,   // set below alongside lpk
         /*.mma_stage_k       =*/ 1,   // set below alongside lpk
         /*.bs_fc             =*/ 1,   // set below alongside lpk
+        /*.kv_q8             =*/ 0,   // set below from the pool tensor's type
         /*.probe             =*/ 0,   // diagnostics only
         /*.stride_token      =*/ kv_cache->nb[1] / sizeof(ggml_fp16_t),
         /*.stride_head       =*/ kv_cache->nb[2] / sizeof(ggml_fp16_t),
@@ -4790,6 +4791,9 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     args.mma_stage_k = mma_stg_k ? 1 : 0;
     const bool bs_fc = !(getenv("DS4P_METAL_NO_BSFC") && atoi(getenv("DS4P_METAL_NO_BSFC")) != 0);
     args.bs_fc       = bs_fc ? 1 : 0;
+    // Derived from the POOL TENSOR, not from a flag: the kernel must agree with what was
+    // actually allocated, and a flag could disagree with it.
+    args.kv_q8       = (kv_cache->type == GGML_TYPE_Q8_0) ? 1 : 0;
 
     // ================= PAGED CHAMPION PATH (DS4P_METAL_CHAMP=1) =================
     // Ported ggml kernel_flash_attn_ext_impl with block-table K/V addressing. Preconditions are
