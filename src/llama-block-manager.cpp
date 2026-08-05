@@ -52,9 +52,21 @@ bool llama_block_manager::has_free_cpu_blocks(uint32_t num_requested_blocks) con
     return num_requested_blocks <= (curr_free_cpus - watermark_cpu_safety_num_blocks);
 }
 
-// ★ LEAK ACCOUNTING. Measured: at a refusal the sequence held 3 blocks, the free list had 1, and
+// ★ BLOCK ACCOUNTING. Measured: at a refusal the sequence held 3 blocks, the free list had 1, and
 // the pool has 8 -- four unaccounted for. checkout and release are the only two doors, so counting
-// both and diffing them names the leak site instead of nominating a suspect.
+// both and diffing them locates the shortfall instead of nominating a suspect.
+//
+// ⚠ CORRECTION TO THE NAME. Commits cfcac58a and 0b7be856 call this a "block LEAK". It is NOT one,
+// and the word is wrong in both messages -- which cannot be rewritten, so the correction lives here
+// where anyone reading the instrumentation will see it. The timestamped ledger shows 8 blocks
+// checked out and 8 released: nothing is permanently lost. What happens is a TRANSIENT OVER-HOLD --
+// blocks taken during warmup and during a superseded generation stay checked out until process
+// teardown, and while they are held the LIVE sequence cannot grow. The pool is not drained; it is
+// occupied by the past.
+//
+// The distinction decides the repair. A leak means "find who forgets to free". An over-hold means
+// "free EARLIER" -- the release already exists, it just fires at teardown rather than at the
+// boundary where the holding became pointless. I would have built the first one.
 static uint64_t ds4p_n_checked_out = 0;
 static uint64_t ds4p_n_released    = 0;
 uint64_t ds4p_blocks_checked_out() { return ds4p_n_checked_out; }
