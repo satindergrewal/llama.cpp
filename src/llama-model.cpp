@@ -2469,13 +2469,60 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             LLAMA_LOG_INFO("%s: DS4P_PAGED_SWA: constructing the paged attention pool "
                                     "for a pure-SWA architecture\n", __func__);
 
-                            const uint32_t pg_head_dim   = hparams.n_embd_head_v();
-                            const uint32_t pg_n_head     = hparams.n_head_kv();
                             const uint32_t pg_n_layers   = hparams.n_layer();
                             const uint32_t pg_block_size = cparams.block_size;
 
+                            // ⚠ THIS WAS `hparams.n_embd_head_v()` AND `hparams.n_head_kv()`, BOTH OF
+                            // WHICH TAKE `uint32_t il = 0` AS A DEFAULT ARGUMENT. They do not return a
+                            // model-wide value -- they return LAYER 0's. On an interleaved-SWA
+                            // architecture that silently sized the whole pool by whatever type the
+                            // first layer happens to be: gemma4's layer 0 is SWA, so the pool came out
+                            // 256 wide while print_info reported n_embd_head_v = 512, and the 8
+                            // global (512-wide) layers could never use it.
+                            //
+                            // ★ REORDER THE LAYERS AND THE BEHAVIOUR FLIPS. Had layer 0 been global the
+                            // pool would be 512, the 40 SWA layers would be the excluded ones instead of
+                            // the 8 global ones, and the waste would go from a sixth of the pool to five
+                            // sixths. Same code, same model, opposite outcome, no warning either way.
+                            // Geometry inherited by position is not a design.
+                            //
+                            // Chosen deliberately now: serve the LARGEST group of layers sharing a
+                            // geometry, and SAY SO. Layers outside it are filtered out rather than
+                            // allocated and never used. Serving both groups needs a second pool -- the
+                            // next step, and a feature rather than a patch over this accident.
+                            uint32_t pg_head_dim = 0, pg_n_head = 0, pg_match_count = 0;
+                            for (uint32_t cand = 0; cand < pg_n_layers; ++cand) {
+                                const uint32_t hd  = hparams.n_embd_head_v(cand);
+                                const uint32_t hkv = hparams.n_head_kv(cand);
+                                uint32_t n = 0;
+                                for (uint32_t il = 0; il < pg_n_layers; ++il) {
+                                    if (hparams.n_embd_head_v(il) == hd && hparams.n_head_kv(il) == hkv) { ++n; }
+                                }
+                                if (n > pg_match_count) { pg_match_count = n; pg_head_dim = hd; pg_n_head = hkv; }
+                            }
+
+                            std::vector<uint8_t> pg_match(pg_n_layers, 0);
+                            for (uint32_t il = 0; il < pg_n_layers; ++il) {
+                                pg_match[il] = (hparams.n_embd_head_v(il) == pg_head_dim &&
+                                                hparams.n_head_kv(il)     == pg_n_head) ? 1 : 0;
+                            }
+
+                            LLAMA_LOG_INFO("%s: paged pool geometry CHOSEN: head_dim=%u n_head_kv=%u "
+                                    "serving %u/%u layers\n", __func__,
+                                    pg_head_dim, pg_n_head, pg_match_count, pg_n_layers);
+                            if (pg_match_count < pg_n_layers) {
+                                // Named, not silent: a layer that quietly never reaches the paged
+                                // consumer is audit finding 5 at layer granularity.
+                                LLAMA_LOG_WARN("%s: %u layer(s) have a DIFFERENT head geometry and take "
+                                        "the static path; excluded from the pool rather than allocated "
+                                        "unused. Paging them needs a second pool.\n",
+                                        __func__, pg_n_layers - pg_match_count);
+                            }
+
                             auto * paged_attn = new llama_kv_cache_paged(pg_head_dim, pg_n_head,
                                     pg_block_size, pg_n_layers, cparams.n_ubatch, cparams.n_seq_max);
+
+                            paged_attn->set_layer_filter(std::move(pg_match));
 
                             // Every layer of a pure-SWA arch holds KV (SWA changes the WINDOW, not
                             // whether the layer has a cache), so no attention-only filter here --
