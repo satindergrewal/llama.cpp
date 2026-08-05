@@ -463,6 +463,17 @@ void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
     LLAMA_LOG_DEBUG("%s: num_blocks_size=%d, new_ids_size=%ld\n", __func__, num_blocks, new_ids.size());
     GGML_ASSERT(num_blocks == new_ids.size() && "src_ids and new_ids do not have the same size.");
 
+    // ★ PRESENCE MARKER at INFO, not DEBUG. A gate that starves GPU blocks to force eviction and
+    // then compares outputs would pass PERFECTLY if no eviction ever happened -- the run would just
+    // be an ordinary run. "Outputs match" is only evidence when the path under test actually
+    // executed, and this is the only place that can say so. The DEBUG line above cannot: it is off
+    // at the verbosity the gates use, which is how a path stays untested while looking covered.
+    {
+        static int n_swaps = 0;
+        LLAMA_LOG_INFO("%s: DS4P-EVICT swap #%d %s: %u blocks\n", __func__,
+                       ++n_swaps, to_gpu ? "CPU->GPU" : "GPU->CPU", num_blocks);
+    }
+
     const auto & src_layers = to_gpu ? kv_cpu_layers : kv_gpu_layers;
     const auto & dst_layers = to_gpu ? kv_gpu_layers : kv_cpu_layers;
 
