@@ -438,6 +438,23 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
         return;
     }
 
+    // ⚠ request_id IS the slot id, and the server REUSES slot ids. A group that finishes AFTER a new
+    // request has already taken the same id must NOT wipe the new request's mapping. The scheduler
+    // guards the identical operation (llama-paged-scheduler-impl.cpp:250, "a new request may already
+    // have reused this id ... erasing its entry orphans the new request"); this path did not.
+    //
+    // That gap is the residual -np>1 corruption: the live request loses its KV mapping mid-flight,
+    // so attention sees almost no keys and the model repeats the last token of its own prompt.
+    // Measured with slot_reuse_probe.sh -- WARM (a request finished on the slot first) 4/6 corrupt,
+    // COLD (no prior request) 0/6, same tool, same binary, one factor.
+    //
+    // ★ Ownership is sampled HERE, before any block is released, and that placement is load-bearing.
+    // It cannot be checked after the release/clear below: by then these blocks are back in the pool
+    // and a new request may hold the very same ids in the very same order, so a post-hoc comparison
+    // can match by coincidence and re-arm the bug it was added to fix.
+    const auto it_own     = sequence_blocks.find(group.request_id);
+    const bool still_ours = (it_own != sequence_blocks.end() && it_own->second == group.block_table);
+
     llama_block_ids blocks_to_free_gpu;
     llama_block_ids blocks_to_free_cpu;
 
@@ -457,9 +474,14 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
     }
 
     group.block_table.clear();
-    seq_rm(group.request_id, llama_pos{}, llama_pos{});
 
-    sequence_blocks.erase(group.request_id);
+    // The blocks above are released UNCONDITIONALLY -- a stale group's blocks must return to the
+    // pool regardless of who owns the id now, or the pool leaks on every reused slot. Only the
+    // MAPPING is conditional: it belongs to whoever holds the id today.
+    if (still_ours) {
+        seq_rm(group.request_id, llama_pos{}, llama_pos{});
+        sequence_blocks.erase(group.request_id);
+    }
 }
 
 void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,

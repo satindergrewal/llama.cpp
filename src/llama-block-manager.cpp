@@ -2,7 +2,10 @@
 
 #include "llama-impl.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <vector>
 
 void llama_block_manager::init(uint32_t n_gpu, uint32_t n_cpu, float watermark) {
     LLAMA_LOG_INFO("%s: Block manager initialized: n_free_gpu_blocks=%d, n_free_cpu_blocks=%d\n", __func__, n_gpu,
@@ -124,11 +127,39 @@ uint32_t llama_block_manager::get_ref_count(uint32_t block) const {
 void llama_block_manager::release_gpu_blocks(const physical_block_ids & freed_blocks_ids) {
     ds4p_n_released += freed_blocks_ids.size();
     LLAMA_LOG_ERROR("DS4P-RELEASE n=%zu\n", freed_blocks_ids.size());
+    // ★ DS4P_BLOCK_AUDIT -- detector for the #1(c) hypothesis: a block released while ALREADY free
+    // is pushed onto free_gpu_ids a SECOND time, so two live sequences can check out the SAME
+    // physical block and overwrite each other's KV. Impossible on a cold server (nothing has ever
+    // been released) and possible the moment a request finishes -- which is exactly the measured
+    // warm/cold split: WARM 7/12 corrupt, COLD 0/12.
+    //
+    // ⚠ DETECTOR, NOT A FIX, and it must be able to print nothing. If a run corrupts and NO line
+    // below fires, the hypothesis is refuted and gets recorded as refuted.
+    const bool audit = getenv("DS4P_BLOCK_AUDIT") != nullptr;
     for (const uint32_t & id : freed_blocks_ids) {
+        if (audit) {
+            if (gpu_registry[id].ref_count <= 0) {
+                LLAMA_LOG_ERROR("DS4P-DOUBLE-FREE block=%u refcount_was=%d\n", id, gpu_registry[id].ref_count);
+            }
+            if (std::find(free_gpu_ids.begin(), free_gpu_ids.end(), id) != free_gpu_ids.end()) {
+                LLAMA_LOG_ERROR("DS4P-DUP-FREELIST block=%u already queued as free\n", id);
+            }
+        }
         gpu_registry[id].ref_count -= 1;
         if (gpu_registry[id].ref_count <= 0) {
             gpu_registry[id].ref_count = 0;
             free_gpu_ids.push_back(id);
+        }
+    }
+    if (audit) {
+        // Whole-list scan. The invariant is that a physical block appears in the free list AT MOST
+        // ONCE; a duplicate means the next two checkouts can be handed the same block.
+        std::vector<uint32_t> sorted(free_gpu_ids.begin(), free_gpu_ids.end());
+        std::sort(sorted.begin(), sorted.end());
+        const auto dup = std::adjacent_find(sorted.begin(), sorted.end());
+        if (dup != sorted.end()) {
+            LLAMA_LOG_ERROR("DS4P-FREELIST-CORRUPT duplicate block=%u free_list_size=%zu\n",
+                            *dup, free_gpu_ids.size());
         }
     }
 }
