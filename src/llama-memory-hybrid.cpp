@@ -238,6 +238,19 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
         mem_attn->state_write(io, seq_id, flags);
     }
     mem_recr->state_write(io, seq_id, flags);
+
+    // ★ DELEGATE TO THE PAGED POOL. Without this the paged KV is NEVER SERIALISED: on the paged
+    // path the static members hold almost nothing (the KV lives in the pool), so a slot save wrote
+    // 716 B of metadata for a 27-token sequence whose real KV is ~1 MiB -- 0.068% -- and reported
+    // SUCCESS with n_saved=27. The serialiser existed and was correct; it simply had NO CALLER.
+    // grep "attn_paged->state_write" across src/ returned zero hits before this line.
+    //
+    // Ordering is load-bearing: paged goes LAST on write and LAST on read, so the two streams stay
+    // in the same order. Mismatch them and the read desynchronises silently -- it will not throw,
+    // it will restore the wrong bytes.
+    if (mem_attn_paged) {
+        mem_attn_paged->state_write(io, seq_id, flags);
+    }
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -245,6 +258,11 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         mem_attn->state_read(io, seq_id, flags);
     }
     mem_recr->state_read(io, seq_id, flags);
+
+    // MUST mirror state_write's order exactly -- see the note there.
+    if (mem_attn_paged) {
+        mem_attn_paged->state_read(io, seq_id, flags);
+    }
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
