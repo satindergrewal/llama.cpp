@@ -294,6 +294,7 @@ void llama_paged_scheduler_impl::swap_out_or_recompute(llama_sequence_group_ptr 
                         (unsigned long long) pool_tokens,
                         kv_cache_manager->get_usable_gpu_blocks(), block_size);
         // finish() asserts the status first, then frees blocks and erases our id mapping.
+        terminated_ids.push_back(rid);   // dedicated channel: ONLY capacity kills
         group_ptr->status = llama_sequence_group_status::FINISHED;
         finish(*group_ptr);
         return;

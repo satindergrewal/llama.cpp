@@ -223,6 +223,20 @@ LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler 
 
 // True when the LAST prepare_batch returned false because the scheduler declared a deadlock,
 // as opposed to simply having nothing to admit. See the note on last_deadlock.
+// Drain the ids the scheduler terminated for CAPACITY (not normal completions). Returns how many
+// were written to `out`, and clears the internal list.
+LLAMA_API int32_t llama_paged_scheduler_take_terminated(struct llama_paged_scheduler * sched,
+                                                       int32_t * out, int32_t max_out) {
+    if (!sched || !out || max_out <= 0) { return 0; }
+    int32_t n = 0;
+    for (int32_t id : sched->impl.terminated_ids) {
+        if (n >= max_out) { break; }
+        out[n++] = id;
+    }
+    sched->impl.terminated_ids.clear();
+    return n;
+}
+
 LLAMA_API bool llama_paged_scheduler_last_was_deadlock(const struct llama_paged_scheduler * sched) {
     return sched != nullptr && sched->last_deadlock;
 }

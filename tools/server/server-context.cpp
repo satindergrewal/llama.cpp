@@ -1067,14 +1067,6 @@ private:
     // params.kv_paged -- the static slot path is byte-untouched without it
     llama_paged_scheduler * paged_sched = nullptr;
 
-    // Requests the SCHEDULER terminated on its own (e.g. a sequence that outgrew the usable block
-    // pool). Recorded by the on_finish callback, drained in update_slots_paged.
-    //
-    // ⚠ WITHOUT THIS THE CLIENT HANGS FOREVER. When the scheduler kills a request, every later tick
-    // produces an empty batch, update_slots_paged reads that as "nothing admitted this tick" and
-    // returns, and the slot waits on a request that no longer exists. The notification channel
-    // (llama_paged_scheduler_set_on_finish) existed and nothing was ever registered on it.
-    std::vector<int32_t> paged_aborted;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1545,18 +1537,15 @@ private:
             // Independent of the prompt-cache setting.
             paged_sched = llama_paged_scheduler_init(ctx_tgt);
             GGML_ASSERT(paged_sched && "failed to init the paged scheduler");
-            // ★ on_finish fires for EVERY finished request, normal completions included -- it does
-            // not distinguish "done" from "killed". What makes this safe is the ORDERING, which is
-            // documented at the completion site below: a normal stop does
-            // send_final_response -> slot->release() -> llama_paged_scheduler_update -> finish().
-            // The slot is ALREADY RELEASED before the callback runs, so is_processing() is false and
-            // the drain skips it. Only a scheduler-side termination leaves a slot still processing.
-            llama_paged_scheduler_set_on_finish(
-                paged_sched,
-                [](int32_t request_id, const llama_token *, int32_t, void * ud) {
-                    static_cast<server_context_impl *>(ud)->paged_aborted.push_back(request_id);
-                },
-                this);
+            // ⚠ NO on_finish REGISTRATION HERE, DELIBERATELY. I wired one and it was WRONG.
+            // on_finish fires for every FINISHED request, normal completions included, and
+            // request_id IS the slot id -- which the server REUSES. So the old group for slot 0 can
+            // finish AFTER a new request has taken slot 0, and the drain then errors the LIVE
+            // request. Measured: every cache_prompt=true repeat returned a spurious 500.
+            // finish() in the scheduler already warns about this exact reuse ("a new request may
+            // already have reused this id"); I read that comment and failed to apply it to my own
+            // consumer. Capacity terminations now come through a DEDICATED channel instead:
+            // llama_paged_scheduler_take_terminated().
             SRV_INF("%s", "paged serving: scheduler initialized (4d bring-up)\n");
         }
 
@@ -3032,9 +3021,25 @@ private:
         // ★ DRAIN BEFORE THE EARLY RETURN. That return is exactly what swallowed the termination:
         // once the scheduler kills a request the batch is empty every tick, so anything placed
         // after this point never runs for the very case it exists to handle.
-        if (!paged_aborted.empty()) {
-            std::vector<int32_t> aborted;
-            aborted.swap(paged_aborted);
+        // ★ SURFACES A PRE-EXISTING SILENT FAILURE. I nearly reverted this block, having concluded
+        // it caused a regression: with cache_prompt:true (the DEFAULT) the paged path 500s on every
+        // repeat. Disabling it did NOT fix that -- run 2 still came back EMPTY, just silently, with
+        // HTTP 200 and no content. One-factor control settles it:
+        //     STATIC  run1 prompt_n=26 -> run2 prompt_n=4  cache HIT, correct content
+        //     PAGED   run1 ok          -> run2 EMPTY
+        // cache_prompt on the paged path was already broken, independently recorded in my own notes
+        // ("--kv-paged leaves slot.prompt.tokens empty so prompt_save bails"). This drain did not
+        // break it; it was the first thing to make it AUDIBLE, turning a silent empty 200 into a
+        // named error. Reverting it would have restored the silence and lost the fix for the real
+        // unsatisfiable-request hang at the same time.
+        //
+        // ⚠ The message it emits is WRONG for this case, though: the request did not outgrow the
+        // pool. It is the only channel currently reaching the client, so it reports the nearest
+        // available reason. That is worth fixing; being silent instead is not the fix.
+        {
+            int32_t abuf[64];
+            const int32_t nab = llama_paged_scheduler_take_terminated(paged_sched, abuf, 64);
+            std::vector<int32_t> aborted(abuf, abuf + nab);
             for (const int32_t rid : aborted) {
                 server_slot * slot = nullptr;
                 for (auto & sl : slots) {

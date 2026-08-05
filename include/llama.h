@@ -1694,6 +1694,12 @@ extern "C" {
     // difference, and treating the two alike makes a self-diagnosed deadlock invisible to the caller.
     LLAMA_API bool llama_paged_scheduler_last_was_deadlock(const struct llama_paged_scheduler * sched);
 
+    // Ids the scheduler TERMINATED for capacity, as distinct from requests that merely finished.
+    // on_finish cannot serve this: it fires on normal completions too, and request ids are reused
+    // by the caller, so acting on it kills live requests.
+    LLAMA_API int32_t llama_paged_scheduler_take_terminated(struct llama_paged_scheduler * sched,
+                                                            int32_t * out, int32_t max_out);
+
     LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
                                                 struct llama_batch *           batch,
                                                 const llama_token *            tokens,
