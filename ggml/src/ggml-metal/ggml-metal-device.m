@@ -1221,8 +1221,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             // scalar Metal paged attention: F32 q/out, F16 cache, head_dim within the
             // threadgroup width we dispatch. Functionality before performance -- before
             // this the op could not run on Metal at all.
+            // q8_0 admitted alongside f16: the write kernel quantises per 32-element block
+            // (kernel_paged_attn_write_q8_0) and the attend path dequantises during staging, so
+            // the quantised format never reaches the hot loop. This is the FOURTH gate the
+            // quantised path had to clear -- pool sizing, write kernel, read dequant, and this
+            // backend support check -- and it is the one that was correctly stopping the other
+            // three from being exercised at all.
             return op->src[0]->type == GGML_TYPE_F32 &&
-                   op->src[3]->type == GGML_TYPE_F16 &&
+                   (op->src[3]->type == GGML_TYPE_F16 || op->src[3]->type == GGML_TYPE_Q8_0) &&
                    op->src[0]->ne[0] <= 1024;
         case GGML_OP_ARGMAX:
             return has_simdgroup_reduction;

@@ -4680,9 +4680,14 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.bs_fc             =*/ 1,   // set below alongside lpk
         /*.kv_q8             =*/ 0,   // set below from the pool tensor's type
         /*.probe             =*/ 0,   // diagnostics only
-        /*.stride_token      =*/ kv_cache->nb[1] / sizeof(ggml_fp16_t),
-        /*.stride_head       =*/ kv_cache->nb[2] / sizeof(ggml_fp16_t),
-        /*.stride_block      =*/ kv_cache->nb[3] / sizeof(ggml_fp16_t),
+        // ⚠ UNIT DEPENDS ON THE CACHE TYPE. f16: strides in HALVES. q8_0: strides in BLOCKS,
+        // because both quantised kernels index block arrays. I wrote "strides are in BLOCKS" in
+        // the q8_0 kernel comment and then left this computing halves -- a comment asserting an
+        // invariant the code did not implement. The write gate caught it: 380 of 384 blocks
+        // mismatched.
+        /*.stride_token      =*/ kv_cache->nb[1] / ggml_type_size(kv_cache->type),
+        /*.stride_head       =*/ kv_cache->nb[2] / ggml_type_size(kv_cache->type),
+        /*.stride_block      =*/ kv_cache->nb[3] / ggml_type_size(kv_cache->type),
     };
 
     // ★ CONSUMER PROBE: DS4P_PAGED_TAINT scales what the write kernel stores into the pool.

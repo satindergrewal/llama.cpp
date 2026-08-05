@@ -276,6 +276,9 @@ target_link_libraries(test-paged-banded PRIVATE ggml)
 
 add_executable(test-paged-vs-cpu test-paged-vs-cpu.cpp)
 target_link_libraries(test-paged-vs-cpu PRIVATE ggml)
+
+add_executable(test-paged-write-q8 test-paged-write-q8.cpp)
+target_link_libraries(test-paged-write-q8 PRIVATE ggml)
 add_test(NAME test-paged-banded COMMAND test-paged-banded)
 
 add_executable(test-flash-attn-generic-hash test-flash-attn-generic-hash.cpp)
