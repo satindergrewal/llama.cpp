@@ -1206,7 +1206,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_write
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_paged_attn_write_f32");
+    // ★ SELECT BY CACHE TYPE. q8_0 needs a different kernel, not a flag: f16 writes one element
+    // per thread while q8_0 has 32 elements sharing one scale, so the two have different THREAD
+    // GEOMETRY. The caller must switch its dispatch width to match -- see ggml-metal-ops.cpp.
+    const ggml_type kvt = op->src[3]->type;   // the paged pool tensor
+
+    if (kvt == GGML_TYPE_Q8_0) {
+        snprintf(base, 256, "kernel_paged_attn_write_q8_0");
+    } else {
+        snprintf(base, 256, "kernel_paged_attn_write_f32");
+    }
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

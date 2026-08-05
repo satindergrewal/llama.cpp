@@ -4703,8 +4703,17 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // grid is not guaranteed, so the write must complete as its own encoded pass.
     {
         auto wpipe = ggml_metal_library_get_pipeline_paged_attn_write(lib, op);
+
+        // ⚠ THREAD WIDTH MUST FOLLOW THE KERNEL. The f16 kernel is one thread per head-dim
+        // ELEMENT; the q8_0 kernel is one thread per 32-element BLOCK. Selecting the kernel by
+        // type but leaving the width at head_dim would launch 32x the threads the q8_0 kernel
+        // expects -- it early-returns on b >= nbk so it would not crash, it would just be
+        // wasteful and would look fine. Kernel and geometry move together or not at all.
+        const bool w_q8 = kv_cache->type == GGML_TYPE_Q8_0;
+        const int  w_units = w_q8 ? (head_dim / 32) : head_dim;
+
         int wnth = 32;
-        while (wnth < head_dim) { wnth *= 2; }
+        while (wnth < w_units) { wnth *= 2; }
         ggml_metal_encoder_set_pipeline(enc, wpipe);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);  // k_new
