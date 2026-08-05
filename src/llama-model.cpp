@@ -2248,6 +2248,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     if (layer_backends[il] != layer_backends[0]) { pg_multi_dev = true; break; }
                                 }
                             }
+                            {
+                                // ★ #2436 attention-only pool: allocate KV tensors ONLY for layers
+                                // that hold KV. A hybrid's recurrent layers hold none -- Ornith-9B
+                                // is 32 layers of which 16 are attention, so half the pool was
+                                // allocated for layers that can never use it. Filtered layers get
+                                // no tensor and get_k() returns nullptr, which paged_layer_supported()
+                                // already treats as not-pageable, so no caller needs to know.
+                                std::vector<uint8_t> pg_has_kv(pg_n_layers, 1);
+                                for (uint32_t il = 0; il < pg_n_layers; ++il) {
+                                    pg_has_kv[il] = hparams.is_recr(il) ? 0 : 1;
+                                }
+                                paged_attn->set_layer_filter(std::move(pg_has_kv));
+                            }
                             if (pg_multi_dev) {
                                 paged_attn->init_multi(layer_backends, backend_cpu, params.type_k,
                                         cparams.n_gpu_blocks, cparams.n_cpu_blocks, cparams.kv_paged_watermark);
@@ -2302,6 +2315,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 for (uint32_t il = 1; il < pg_n_layers; ++il) {
                                     if (layer_backends[il] != layer_backends[0]) { pg_multi_dev = true; break; }
                                 }
+                            }
+                            {
+                                // ★ #2436 attention-only pool: allocate KV tensors ONLY for layers
+                                // that hold KV. A hybrid's recurrent layers hold none -- Ornith-9B
+                                // is 32 layers of which 16 are attention, so half the pool was
+                                // allocated for layers that can never use it. Filtered layers get
+                                // no tensor and get_k() returns nullptr, which paged_layer_supported()
+                                // already treats as not-pageable, so no caller needs to know.
+                                std::vector<uint8_t> pg_has_kv(pg_n_layers, 1);
+                                for (uint32_t il = 0; il < pg_n_layers; ++il) {
+                                    pg_has_kv[il] = hparams.is_recr(il) ? 0 : 1;
+                                }
+                                paged_attn->set_layer_filter(std::move(pg_has_kv));
                             }
                             if (pg_multi_dev) {
                                 paged_attn->init_multi(layer_backends, backend_cpu, params.type_k,

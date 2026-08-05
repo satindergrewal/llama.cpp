@@ -62,6 +62,15 @@ class llama_kv_cache_paged : public llama_memory_i {
     //
     // Scope, deliberately narrow: n_seq == 1, one ubatch at a time. Multi-seq admission, eviction
     // and preemption stay with the scheduler. Freed and re-allocated on every call.
+    // ★ ATTENTION-ONLY POOL (#2436). The pool allocated one KV tensor for EVERY model layer, but a
+    // hybrid's recurrent layers hold no KV at all -- Ornith-9B is 32 layers of which only 16 are
+    // attention, so HALF the pool was allocated for layers that can never use it.
+    //
+    // Set BEFORE init(): layers marked false get no tensor and get_k()/get_v() return nullptr.
+    // That composes with llm_graph_context::paged_layer_supported(), which already treats a null
+    // KV tensor as "not pageable" -- so no caller needs to know about this filter.
+    void set_layer_filter(std::vector<uint8_t> has_kv);
+
     bool self_drive_begin(int32_t n_tokens);
     void self_drive_end();
     bool self_drive_enabled() const;
@@ -174,6 +183,9 @@ class llama_kv_cache_paged : public llama_memory_i {
     llama_sequence_group   sd_group;
     llama_paged_batch_info sd_info;
     bool                   sd_active = false;
+
+    // empty = every layer has KV (default, unchanged behaviour)
+    std::vector<uint8_t> layer_has_kv;
 
     const uint32_t head_dim;
     const uint32_t n_heads_kv;

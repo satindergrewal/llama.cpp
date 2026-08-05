@@ -43,6 +43,31 @@ static uint8_t ds4p_kv_fill(const char * where) {
     return 0xFF;
 }
 
+// true when layer il should own a KV tensor. Empty filter = all layers (unchanged default).
+// Defined HERE, above init(): it was originally placed next to allocate() further down and the
+// build failed with "use of undeclared identifier" at four init sites. Declaration order matters.
+static inline bool ds4p_layer_kv(const std::vector<uint8_t> & f, uint32_t il) {
+    return f.empty() || (il < f.size() && f[il] != 0);
+}
+
+void llama_kv_cache_paged::set_layer_filter(std::vector<uint8_t> has_kv) {
+    // DS4P_NO_LAYER_FILTER=1 restores the old all-layers pool. Two reasons it exists: it makes the
+    // saving a ONE-FACTOR measurement instead of a cross-build comparison, and it is the fallback
+    // if the filter ever misbehaves on an arch I have not tested.
+    if (getenv("DS4P_NO_LAYER_FILTER")) {
+        LLAMA_LOG_INFO("%s: DS4P_NO_LAYER_FILTER -- allocating ALL layers (filter disabled)\n", __func__);
+        layer_has_kv.clear();
+        return;
+    }
+
+    size_t n_kv = 0;
+    for (uint8_t v : has_kv) { n_kv += v ? 1 : 0; }
+    LLAMA_LOG_INFO("%s: attention-only pool: %zu of %zu layers hold KV\n",
+                   __func__, n_kv, has_kv.size());
+
+    layer_has_kv = std::move(has_kv);
+}
+
 llama_kv_cache_paged::llama_kv_cache_paged(uint32_t head_dim,
                                            uint32_t n_heads_kv,
                                            uint32_t block_size,
@@ -99,7 +124,7 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
     for (auto * be : distinct) {
         size_t n_here = 0;
         for (uint32_t il = 0; il < n_layers; ++il) {
-            if (layer_backends[il] == be) n_here++;
+            if (layer_backends[il] == be && ds4p_layer_kv(layer_has_kv, il)) n_here++;
         }
 
         struct ggml_init_params gp;
@@ -112,6 +137,7 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
 
         for (uint32_t il = 0; il < n_layers; ++il) {
             if (layer_backends[il] != be) continue;
+            if (!ds4p_layer_kv(layer_has_kv, il)) continue;   // attention-only pool
             kv_gpu_layers[il] =
                 ggml_new_tensor_4d(ctx, type, head_dim, block_size, 2 * n_heads_kv, n_gpu_blocks);
         }
@@ -129,6 +155,7 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
     }
 
     for (uint32_t il = 0; il < n_layers; ++il) {
+        if (!ds4p_layer_kv(layer_has_kv, il)) { continue; }
         GGML_ASSERT(kv_gpu_layers[il] && "layer tensor not allocated");
         GGML_ASSERT(kv_gpu_layers[il]->buffer && "layer tensor has null buffer");
     }
@@ -148,6 +175,7 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
     GGML_ASSERT(buf_cpu && "Failed to allocate CPU KV cache buffer");
     ggml_backend_buffer_clear(buf_cpu, ds4p_kv_fill("CPU pool (A)"));
     for (uint32_t il = 0; il < n_layers; ++il) {
+        if (!ds4p_layer_kv(layer_has_kv, il)) { continue; }
         GGML_ASSERT(kv_cpu_layers[il]->buffer && "CPU layer tensor has null buffer");
     }
 
@@ -193,6 +221,10 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     struct ggml_context * ctx_gpu = ggml_init(gpu_params);
 
     for (uint32_t il = 0; il < n_layers; ++il) {
+        if (!ds4p_layer_kv(layer_has_kv, il)) {   // attention-only pool: recurrent layers hold no KV
+            kv_gpu_layers.push_back(nullptr);
+            continue;
+        }
         // Since GGML_MAX_DIMS is set to 4, we flatten the layout to be 4D: [num_blocks, 2 * n_heads_kv, block_size, head_dim]
         ggml_tensor * kv_layer_gpu =
             ggml_new_tensor_4d(ctx_gpu, type, head_dim, block_size, 2 * n_heads_kv, n_gpu_blocks);
@@ -208,6 +240,7 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     // does read one, everything turns NaN and the gate fails LOUDLY instead of silently.
     ggml_backend_buffer_clear(buf_gpu, ds4p_kv_fill("single-device GPU pool"));
     for (uint32_t il = 0; il < n_layers; ++il) {
+        if (!ds4p_layer_kv(layer_has_kv, il)) { continue; }
         GGML_ASSERT(kv_gpu_layers[il]->buffer && "GPU layer tensor has null buffer");
     }
 
@@ -220,6 +253,10 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     cpu_params.no_alloc           = true;
     struct ggml_context * ctx_cpu = ggml_init(cpu_params);
     for (uint32_t il = 0; il < n_layers; ++il) {
+        if (!ds4p_layer_kv(layer_has_kv, il)) {
+            kv_cpu_layers.push_back(nullptr);
+            continue;
+        }
         ggml_tensor * kv_layer_cpu =
             ggml_new_tensor_4d(ctx_cpu, type, head_dim, block_size, 2 * n_heads_kv, n_cpu_blocks);
         kv_cpu_layers.push_back(kv_layer_cpu);
@@ -230,12 +267,15 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     GGML_ASSERT(buf_cpu && "Failed to allocate CPU KV cache buffer");
     ggml_backend_buffer_clear(buf_cpu, ds4p_kv_fill("CPU pool (B)"));
     for (uint32_t il = 0; il < n_layers; ++il) {
+        if (!ds4p_layer_kv(layer_has_kv, il)) { continue; }
         GGML_ASSERT(kv_cpu_layers[il]->buffer && "CPU layer tensor has null buffer");
     }
 
     // Setting up our block accountant
     block_manager.init(n_gpu_blocks, n_cpu_blocks, watermark);
 }
+
+
 
 bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & group) {
     uint32_t curr_block_count     = group.block_table.size();
@@ -359,6 +399,11 @@ void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
     std::vector<uint8_t> staging(block_bytes);
 
     for (uint32_t il = 0; il < n_layers; ++il) {
+        // ★ ATTENTION-ONLY POOL: a filtered (recurrent) layer owns no tensor on either side.
+        // Without this guard the swap path dereferences nullptr -- the hazard that made this
+        // change worth doing carefully rather than only touching the allocation loops.
+        if (!ds4p_layer_kv(layer_has_kv, il)) { continue; }
+
         struct ggml_tensor * src_main = src_layers[il];
         struct ggml_tensor * dst_main = dst_layers[il];
 
