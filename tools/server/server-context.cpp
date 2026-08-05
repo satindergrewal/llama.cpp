@@ -1067,6 +1067,15 @@ private:
     // params.kv_paged -- the static slot path is byte-untouched without it
     llama_paged_scheduler * paged_sched = nullptr;
 
+    // Requests the SCHEDULER terminated on its own (e.g. a sequence that outgrew the usable block
+    // pool). Recorded by the on_finish callback, drained in update_slots_paged.
+    //
+    // ⚠ WITHOUT THIS THE CLIENT HANGS FOREVER. When the scheduler kills a request, every later tick
+    // produces an empty batch, update_slots_paged reads that as "nothing admitted this tick" and
+    // returns, and the slot waits on a request that no longer exists. The notification channel
+    // (llama_paged_scheduler_set_on_finish) existed and nothing was ever registered on it.
+    std::vector<int32_t> paged_aborted;
+
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
@@ -1536,6 +1545,18 @@ private:
             // Independent of the prompt-cache setting.
             paged_sched = llama_paged_scheduler_init(ctx_tgt);
             GGML_ASSERT(paged_sched && "failed to init the paged scheduler");
+            // ★ on_finish fires for EVERY finished request, normal completions included -- it does
+            // not distinguish "done" from "killed". What makes this safe is the ORDERING, which is
+            // documented at the completion site below: a normal stop does
+            // send_final_response -> slot->release() -> llama_paged_scheduler_update -> finish().
+            // The slot is ALREADY RELEASED before the callback runs, so is_processing() is false and
+            // the drain skips it. Only a scheduler-side termination leaves a slot still processing.
+            llama_paged_scheduler_set_on_finish(
+                paged_sched,
+                [](int32_t request_id, const llama_token *, int32_t, void * ud) {
+                    static_cast<server_context_impl *>(ud)->paged_aborted.push_back(request_id);
+                },
+                this);
             SRV_INF("%s", "paged serving: scheduler initialized (4d bring-up)\n");
         }
 
@@ -3007,6 +3028,29 @@ private:
         llama_batch pbatch = {};
 
         const bool success = llama_paged_scheduler_prepare_batch(paged_sched, &pbatch);
+
+        // ★ DRAIN BEFORE THE EARLY RETURN. That return is exactly what swallowed the termination:
+        // once the scheduler kills a request the batch is empty every tick, so anything placed
+        // after this point never runs for the very case it exists to handle.
+        if (!paged_aborted.empty()) {
+            std::vector<int32_t> aborted;
+            aborted.swap(paged_aborted);
+            for (const int32_t rid : aborted) {
+                server_slot * slot = nullptr;
+                for (auto & sl : slots) {
+                    if (sl.id == rid && sl.is_processing()) { slot = &sl; break; }
+                }
+                // Not processing = it completed normally and released itself first (see the
+                // ordering note at the scheduler init). Nothing to do, and NOT an error.
+                if (slot == nullptr) { continue; }
+                SRV_ERR("paged: request %d was terminated by the scheduler; failing the slot\n", rid);
+                send_error(*slot, "paged KV: the request outgrew the block pool and was terminated",
+                           ERROR_TYPE_SERVER);
+                slot->release();
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), rid, -1, -1);
+            }
+        }
+
         if (!success || pbatch.n_tokens == 0) {
             return; // nothing admitted/decodable this tick
         }
