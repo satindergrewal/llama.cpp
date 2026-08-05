@@ -195,6 +195,23 @@ int main() {
             printf("q8_0 D=128 case %c: with_rel=%d window=%lld max_abs=%.3e nmse=%.3e %s\n",
                    'A' + cse, with_rel ? 1 : 0, (long long) window, max_abs, nmse, ok ? "PASS" : "FAIL");
             n_fail += ok ? 0 : 1;
+
+            // ★ DIVERGENCE BEFORE EQUALITY. The agreement above is metal-q8 vs cpu-q8; if BOTH
+            // sides silently skipped quantisation it would pass just as cleanly. So require the
+            // q8_0 result to DIFFER from the f16 result by roughly a quantisation step. A gate
+            // that only checks equality cannot tell "both correct" from "both bypassed".
+            const std::vector<float> f16ref = run_paged(backend, 128, with_rel, window, GGML_TYPE_F16);
+            double qdiff = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                const double d = fabs((double) a[i] - f16ref[i]);
+                qdiff = d > qdiff ? d : qdiff;
+            }
+            // Floor: below this the q8 store did nothing. Ceiling: above it the error is not
+            // quantisation noise but a bug wearing its clothes.
+            const bool diverged = qdiff > 1e-5 && qdiff < 5e-2;
+            printf("   [divergence] q8_0 vs f16 max_abs=%.3e %s (quantisation actually applied)\n",
+                   qdiff, diverged ? "PASS" : "FAIL");
+            n_fail += diverged ? 0 : 1;
         }
     }
 

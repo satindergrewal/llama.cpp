@@ -12264,7 +12264,7 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
                 const size_t v_cache_byte_offset =
                     ((size_t) block_id * stride_block + (size_t) (n_heads_kv + h_id) * stride_head +
                      (size_t) token_in_block * stride_token) *
-                    sizeof(ggml_fp16_t);
+                    kv_elt_size;
                 const size_t input_offset = (size_t) token_batch_idx * n_heads_kv * head_dim + (size_t) h_id * head_dim;
 
                 if (kv_is_q8) {
