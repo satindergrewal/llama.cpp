@@ -102,7 +102,13 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
     kv_type        = type;
     cpu_backend    = backend_cpu;
     gpu_backend    = layer_backends[0];  // representative; per-layer truth is in the vector
-    block_bytes    = 2 * block_size * n_heads_kv * head_dim * ggml_type_size(kv_type);
+    // ⚠ WAS head_dim * ggml_type_size(kv_type). ggml_type_size is bytes per BLOCK, not per
+    // element, so for q8_0 (32 elements in a 34-byte block) this multiplied by 34 instead of
+    // dividing by 32 -- roughly 34x oversized, with every stride wrong. Harmless while f16 is the
+    // only admitted type (1 element, 2 bytes, so the two happen to agree), which is exactly why it
+    // survived: the bug is invisible until the feature it breaks is switched on.
+    // ggml_row_size handles both cases.
+    block_bytes    = 2 * block_size * n_heads_kv * ggml_row_size(kv_type, head_dim);
 
     // Group layers by the device that holds them. llama.cpp's --tensor-split splits
     // by LAYER, so layer il's KV must live on dev_layer(il). Every device allocates
@@ -209,7 +215,13 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     kv_type        = type;
     gpu_backend    = backend_gpu;
     cpu_backend    = backend_cpu;
-    block_bytes    = 2 * block_size * n_heads_kv * head_dim * ggml_type_size(kv_type);
+    // ⚠ WAS head_dim * ggml_type_size(kv_type). ggml_type_size is bytes per BLOCK, not per
+    // element, so for q8_0 (32 elements in a 34-byte block) this multiplied by 34 instead of
+    // dividing by 32 -- roughly 34x oversized, with every stride wrong. Harmless while f16 is the
+    // only admitted type (1 element, 2 bytes, so the two happen to agree), which is exactly why it
+    // survived: the bug is invisible until the feature it breaks is switched on.
+    // ggml_row_size handles both cases.
+    block_bytes    = 2 * block_size * n_heads_kv * ggml_row_size(kv_type, head_dim);
 
     // Set up GPU context and tensor
     // Interleaved shape: [num_blocks, 2, n_heads_kv, block_size, head_dim] (5D)
