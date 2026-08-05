@@ -4820,6 +4820,53 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // actually allocated, and a flag could disagree with it.
     args.kv_q8       = (kv_cache->type == GGML_TYPE_Q8_0) ? 1 : 0;
 
+    // ★ DS4P_ARGDUMP=N -- print the first N dispatches' FULL argument set, verbatim.
+    //
+    // Why this exists: the unit harness now covers four write schedules (single-call prefill,
+    // incremental, one decode, K decodes) at every head_dim and both cache types, and reproduces
+    // NONE of the server's quantised-KV failure. Four hypotheses were spent guessing which server
+    // property mattered. Guessing ends here: dump exactly what the server hands the op, then replay
+    // those values in the harness. If the replay fails the bug is somewhere instrumentable; if it
+    // passes with the server's own arguments then the arguments are fine and the fault is in the
+    // memory they point at -- a different search, but a KNOWN one.
+    //
+    // Dumps the small int32 inputs by VALUE, not just their shapes: a block table is a mapping, and
+    // a mapping's shape tells you nothing about where it points.
+    if (const char * e = getenv("DS4P_ARGDUMP")) {
+        static int dumps_left = -1;
+        if (dumps_left < 0) { dumps_left = atoi(e); }
+        if (dumps_left > 0) {
+            dumps_left--;
+            GGML_LOG_INFO("%s: ARGDUMP n_tokens=%d head_dim=%d n_heads=%d n_heads_kv=%d "
+                          "block_size=%d n_blocks=%d kv_type=%s kv_q8=%d\n",
+                          __func__, n_tokens, head_dim, (int) q->ne[1], n_heads_kv,
+                          bs_pa_lpk, (int) btab->ne[0], ggml_type_name(kv_cache->type), args.kv_q8);
+            GGML_LOG_INFO("%s: ARGDUMP strides token=%llu head=%llu block=%llu | cache ne=[%lld %lld %lld %lld] "
+                          "nb=[%zu %zu %zu %zu]\n", __func__,
+                          (unsigned long long) args.stride_token, (unsigned long long) args.stride_head,
+                          (unsigned long long) args.stride_block,
+                          (long long) kv_cache->ne[0], (long long) kv_cache->ne[1],
+                          (long long) kv_cache->ne[2], (long long) kv_cache->ne[3],
+                          kv_cache->nb[0], kv_cache->nb[1], kv_cache->nb[2], kv_cache->nb[3]);
+            const auto dump_i32 = [&](const char * name, const ggml_tensor * t, int cap) {
+                if (!t) { GGML_LOG_INFO("%s: ARGDUMP %s = (null)\n", __func__, name); return; }
+                const int n = (int) ggml_nelements(t) < cap ? (int) ggml_nelements(t) : cap;
+                std::vector<int32_t> v(n);
+                ggml_backend_tensor_get((ggml_tensor *) t, v.data(), 0, (size_t) n*sizeof(int32_t));
+                std::string s;
+                for (int i = 0; i < n; ++i) { s += " " + std::to_string(v[i]); }
+                GGML_LOG_INFO("%s: ARGDUMP %s[%lld] =%s%s\n", __func__, name,
+                              (long long) ggml_nelements(t), s.c_str(),
+                              n < (int) ggml_nelements(t) ? " ..." : "");
+            };
+            dump_i32("block_table",  btab,        32);
+            dump_i32("write_slots",  op->src[6],  32);
+            dump_i32("context_lens", clens,        8);
+            dump_i32("batch_offs",   boffs,        8);
+            dump_i32("batch_lens",   blens,        8);
+        }
+    }
+
     // ================= PAGED CHAMPION PATH (DS4P_METAL_CHAMP=1) =================
     // Ported ggml kernel_flash_attn_ext_impl with block-table K/V addressing. Preconditions are
     // HARD and each is stated in the marker when it refuses -- a silent fallback here would look

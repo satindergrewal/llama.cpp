@@ -34,8 +34,13 @@ static float val_r(int e, int h, int tok)  { return 0.50f * cosf(0.8f*e + 0.6f*h
 // thing twice and diff it.
 static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel, int64_t window,
                                     ggml_type kv_type = GGML_TYPE_F16) {
-    const int H   = 4;    // query heads
-    const int HKV = 2;    // kv heads (GQA 2:1)
+    // ⚠ H/HKV ARE ENV-OVERRIDABLE so the harness can be REPLAYED at the server's real geometry.
+    // The ARGDUMP showed the server running head_dim=256, n_heads=16, n_heads_kv=4 (GQA 4:1) with
+    // n_blocks=1 -- while this file had GQA 2:1 hardcoded. Every "PASS" it has printed was at a GQA
+    // ratio the failing configuration does not use, which is one more instance of the coverage
+    // being narrower than the claim it licensed.
+    const int H   = getenv("DS4P_TEST_H")   ? atoi(getenv("DS4P_TEST_H"))   : 4;    // query heads
+    const int HKV = getenv("DS4P_TEST_HKV") ? atoi(getenv("DS4P_TEST_HKV")) : 2;    // kv heads
     const int E   = 8;    // rel_extent
     // block_size / block count are env-overridable so a gate can exercise a path that has a
     // block-size PRECONDITION (the lane-per-key loop needs bs >= 32). Hard-coded at BS=16,
@@ -45,7 +50,11 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
     const int NB  = getenv("DS4P_TEST_NB") ? atoi(getenv("DS4P_TEST_NB")) : 2;    // blocks
     // Ends MID-block on purpose: a token count that lands exactly on a block boundary never
     // tests the partial-tile tail, where the lane-per-key masking lives.
-    const int N   = BS*NB - BS/2;   // tokens, spans every block
+    // ⚠ N IS OVERRIDABLE so block COUNT can be varied independently of token COUNT. Sweeping NB
+    // alone changes both (N = BS*NB - BS/2), so "NB=1 fails, NB=2 passes" is two factors moving
+    // together and cannot name a cause -- exactly the arms-differ-in-one-thing rule this lane has
+    // already paid for once.
+    const int N   = getenv("DS4P_TEST_N") ? atoi(getenv("DS4P_TEST_N")) : BS*NB - BS/2;
     const float scale = 1.0f / sqrtf((float) D);
 
     ggml_init_params ip = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), nullptr, /*no_alloc*/ true };
@@ -91,7 +100,12 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
     std::vector<int32_t> i32(N);
     for (int t = 0; t < N; ++t) i32[t] = t;               // identity write slots
     ggml_backend_tensor_set(slots, i32.data(), 0, N*sizeof(int32_t));
-    i32 = {0, 1};  ggml_backend_tensor_set(btab,  i32.data(), 0, 2*sizeof(int32_t));
+    // ⚠ WAS `i32 = {0, 1}` with a hardcoded 2-entry write -- at DS4P_TEST_NB=1 that wrote past the
+    // end of btab and aborted in ggml_backend_tensor_set. Identity table sized from NB, like the
+    // slots above; the block count is a knob, so nothing may assume its value.
+    i32.assign(NB, 0);
+    for (int b = 0; b < NB; ++b) { i32[b] = b; }
+    ggml_backend_tensor_set(btab,  i32.data(), 0, (size_t) NB*sizeof(int32_t));
     i32 = {N};     ggml_backend_tensor_set(clens, i32.data(), 0, sizeof(int32_t));
     i32 = {0};     ggml_backend_tensor_set(boffs, i32.data(), 0, sizeof(int32_t));
     i32 = {N};     ggml_backend_tensor_set(blens, i32.data(), 0, sizeof(int32_t));
@@ -125,12 +139,12 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
 // arithmetic, same order, only the write schedule differs. Any divergence is the incremental path.
 static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool with_rel, int64_t window,
                                           ggml_type kv_type, int n1, int n_dec = 1) {
-    const int H   = 4;
-    const int HKV = 2;
+    const int H   = getenv("DS4P_TEST_H")   ? atoi(getenv("DS4P_TEST_H"))   : 4;
+    const int HKV = getenv("DS4P_TEST_HKV") ? atoi(getenv("DS4P_TEST_HKV")) : 2;
     const int E   = 8;
     const int BS  = getenv("DS4P_TEST_BS") ? atoi(getenv("DS4P_TEST_BS")) : 16;
     const int NB  = getenv("DS4P_TEST_NB") ? atoi(getenv("DS4P_TEST_NB")) : 2;
-    const int N   = BS*NB - BS/2;
+    const int N   = getenv("DS4P_TEST_N") ? atoi(getenv("DS4P_TEST_N")) : BS*NB - BS/2;
     const float scale = 1.0f / sqrtf((float) D);
     // n_dec sequential single-token DECODE calls after the prefill. n_dec >= 2 is the shape the
     // server fails on and this harness could not previously express: a token written by one decode
@@ -175,8 +189,9 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
 
     std::vector<uint8_t> zeros(ggml_nbytes(cache), 0);
     ggml_backend_tensor_set(cache, zeros.data(), 0, zeros.size());
-    std::vector<int32_t> bt = {0, 1};
-    ggml_backend_tensor_set(btab, bt.data(), 0, 2*sizeof(int32_t));
+    std::vector<int32_t> bt(NB);
+    for (int b = 0; b < NB; ++b) { bt[b] = b; }
+    ggml_backend_tensor_set(btab, bt.data(), 0, (size_t) NB*sizeof(int32_t));
 
     std::vector<float> out((size_t) N*H*D);
 
