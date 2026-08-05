@@ -12153,9 +12153,14 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     GGML_ASSERT(n_heads_kv != 0 && "n_head_kv cannot be 0.");
     GGML_ASSERT(n_heads % n_heads_kv == 0 && "n_heads must be divisible by n_head_kv.");
 
-    const size_t stride_token = kv_cache->nb[1] / sizeof(ggml_fp16_t);
-    const size_t stride_head  = kv_cache->nb[2] / sizeof(ggml_fp16_t);
-    const size_t stride_block = kv_cache->nb[3] / sizeof(ggml_fp16_t);
+    // ⚠ UNIT FOLLOWS THE CACHE TYPE. This was nb[i] / sizeof(ggml_fp16_t) -- the IDENTICAL defect
+    // fixed on the Metal host in 15eb349f, in a different backend, with nothing forcing the two to
+    // be edited together. For f16 the forms agree (type size 2), so it is silent until a quantised
+    // cache appears; the Metal side's write gate went 380/384 wrong on exactly this.
+    const size_t kv_elt_size  = ggml_type_size(kv_cache->type);
+    const size_t stride_token = kv_cache->nb[1] / kv_elt_size;
+    const size_t stride_head  = kv_cache->nb[2] / kv_elt_size;
+    const size_t stride_block = kv_cache->nb[3] / kv_elt_size;
 
     // Accessing tensors via backend API to make the CPU reference implementation backend agnostic
     std::vector<float>   q_host(ggml_nelements(q));
@@ -12197,11 +12202,49 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
 
     // We use staging buffers for KV cache access to make it agnostic to where
     // the KV cache is allocated.
-    const size_t             head_bytes = (size_t) head_dim * sizeof(ggml_fp16_t);
+    // ★ q8_0 SUPPORT, deliberately the same trick that worked on Metal: dequantise INTO THE
+    // STAGING BUFFER, so the attention arithmetic below never learns the cache was quantised --
+    // no change to the softmax, the banded window or the rel-bias path. This is a CORRECTNESS
+    // REFERENCE, not a fast path; it is intentionally unoptimised, because its only job is to be
+    // the thing a backend is checked against.
+    const bool   kv_is_q8   = kv_cache->type == GGML_TYPE_Q8_0;
+    const size_t head_bytes = ggml_row_size(kv_cache->type, head_dim);
+
     std::vector<ggml_fp16_t> staging_k(head_dim);
     std::vector<ggml_fp16_t> staging_v(head_dim);
     std::vector<ggml_fp16_t> staging_write_k(head_dim);
     std::vector<ggml_fp16_t> staging_write_v(head_dim);
+
+    // raw block staging, used only when the cache is quantised
+    std::vector<uint8_t> qbuf_k(head_bytes), qbuf_v(head_bytes), qbuf_w(head_bytes);
+
+    const auto deq_row = [&](const uint8_t * src, ggml_fp16_t * dst_f16) {
+        const int nbk = head_dim / (int) ggml_blck_size(GGML_TYPE_Q8_0);
+        for (int b = 0; b < nbk; ++b) {
+            const uint8_t * blk = src + (size_t) b * ggml_type_size(GGML_TYPE_Q8_0);
+            const float     d   = GGML_FP16_TO_FP32(*(const ggml_fp16_t *) blk);
+            const int8_t *  qs  = (const int8_t *) (blk + sizeof(ggml_fp16_t));
+            for (int j = 0; j < (int) ggml_blck_size(GGML_TYPE_Q8_0); ++j) {
+                dst_f16[b*(int) ggml_blck_size(GGML_TYPE_Q8_0) + j] = GGML_FP32_TO_FP16(d * (float) qs[j]);
+            }
+        }
+    };
+
+    // Same arithmetic as kernel_paged_attn_write_q8_0, so the two agree exactly rather than
+    // approximately -- that is what lets the full-path gate keep the 2e-3 bar.
+    const auto quant_row = [&](const float * src, uint8_t * dst_q) {
+        const int nbk = head_dim / (int) ggml_blck_size(GGML_TYPE_Q8_0);
+        for (int b = 0; b < nbk; ++b) {
+            float amax = 0.0f;
+            for (int j = 0; j < (int) ggml_blck_size(GGML_TYPE_Q8_0); ++j) { amax = std::max(amax, std::fabs(src[b*(int) ggml_blck_size(GGML_TYPE_Q8_0) + j])); }
+            const float dq = amax / 127.0f;
+            const float id = dq ? 1.0f/dq : 0.0f;
+            uint8_t * blk = dst_q + (size_t) b * ggml_type_size(GGML_TYPE_Q8_0);
+            *(ggml_fp16_t *) blk = GGML_FP32_TO_FP16(dq);
+            int8_t * qs = (int8_t *) (blk + sizeof(ggml_fp16_t));
+            for (int j = 0; j < (int) ggml_blck_size(GGML_TYPE_Q8_0); ++j) { qs[j] = (int8_t) std::lround(src[b*(int) ggml_blck_size(GGML_TYPE_Q8_0) + j] * id); }
+        }
+    };
 
     // Write to KV cache
     for (int seq = 0; seq < n_seq; ++seq) {
