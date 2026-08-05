@@ -4812,9 +4812,21 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     if (ggml_metal_paged_champ_enabled()) {
         const int n_seq_c = (int) blens->ne[0];
         const bool hd_ok  = (head_dim == 64 || head_dim == 96 || head_dim == 128 || head_dim == 192);
+        // ⚠ A QUANTISED CACHE MUST REFUSE HERE, and the reason is not "unimplemented" -- it is that
+        // the three stride lines further down divide nb[] by sizeof(ggml_fp16_t). Found by the
+        // repo-wide sweep run after the fitter turned out to be the FIFTH site of the same f16
+        // assumption; these are the sixth and seventh. On a q8_0 pool that divides a 272-byte row
+        // by 2 and yields strides 17x too large, silently, on a path that is otherwise correct.
+        //
+        // Type-aware strides would NOT be the fix. The champion kernel reads K/V as half with no
+        // dequant staging at all -- that lives only in the scalar/LPK path -- so correct strides
+        // would merely deliver correctly-addressed q8_0 bytes to code that reads them as f16.
+        // Refusing hands the work to the scalar path, which genuinely handles q8_0.
         const char * why  = bs_pa_lpk != 64 ? "bs!=64"
                           : n_seq_c   != 1  ? "n_seq!=1"
-                          : !hd_ok          ? "head_dim" : nullptr;
+                          : !hd_ok          ? "head_dim"
+                          : args.kv_q8      ? "quantised KV (champion has no dequant staging)"
+                                            : nullptr;
         if (why) {
             static const char * last_why = nullptr;
             if (why != last_why) { last_why = why;
@@ -5051,6 +5063,15 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         const size_t pad = (size_t) atol(e);
         if (smem_use + pad <= smem_budget) { smem_use += pad; }
     }
+    // ⚠ THE SCALAR PATH HAD NO BUDGET CHECK AT ALL. The LPK arm gates on smem_lpk <= smem_budget
+    // and the MMA arm on mma_smem() <= smem_budget; the plain staged path gated on NOTHING, so
+    // bs=64 with head_dim=512 requested 131,072 B of threadgroup memory and produced silently
+    // WRONG numbers (max_abs 2.34e-02, f16 and q8_0 alike) instead of failing. The champion path
+    // one screen up already asserts its own smem; this is the same assert the scalar path was
+    // missing. paged_layer_supported() now refuses the combination, so this should be unreachable
+    // -- which is exactly what makes it worth asserting rather than hoping.
+    GGML_ASSERT(smem_use <= (size_t) ggml_metal_device_get_props(ctx->dev)->max_theadgroup_memory_size &&
+                "paged scalar tile exceeds threadgroup memory -- would corrupt silently");
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_use, 0);
 
     // PRESENCE MARKER. A float arm once reported "ALL PASSED" while the fallback silently

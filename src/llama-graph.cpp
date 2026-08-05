@@ -3875,6 +3875,32 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
         return reject("head_dim outside the kernel contract (need >0, <=512, multiple of 32)");
     }
 
+    // ★ JOINT CONTRACT ON (block_size, head_dim) -- head_dim ALONE was never the real limit.
+    //
+    // The scalar path stages K and V tiles in threadgroup memory: 2 * block_size * head_dim
+    // halves. head_dim <= 512 is satisfiable at block_size 16 and unsatisfiable at 64, so a
+    // predicate that checks only head_dim admits configurations the kernel cannot execute.
+    // bs=64/D=512 FAILED deterministically at max_abs 2.34e-02 for f16 AND q8_0 -- identical on
+    // both, so a capacity limit, not a quantisation bug.
+    //
+    // ⚠ I INTRODUCED THIS when I raised the head_dim ceiling 256 -> 512. I verified 512 at the
+    // default block size only, then widened a predicate that is consulted at EVERY block size.
+    // The coverage was one point; the claim was the whole axis.
+    //
+    // ⚠⚠ AND MY FIRST BOUND HERE WAS 16384, DERIVED FROM RUNS THAT WERE THEMSELVES OVERSUBSCRIBED.
+    // bs=32/D=512 (65,536 B) "PASSED" before the dispatch assert existed, so I read it as proof the
+    // budget was 64 KiB. Once the assert went in it fired at 49,152 B while 32,768 B ran clean --
+    // the device limit is 32,768 and that earlier PASS was an out-of-budget dispatch returning
+    // plausible numbers. A passing run is not evidence a configuration is LEGAL; it is only
+    // evidence it did not visibly break that time. Calibrating a limit against unchecked runs
+    // reproduces exactly the silence the limit exists to end.
+    //
+    // The staged tile must fit: 2 * bs * head_dim * sizeof(half) <= 32768.
+    if ((int64_t) cparams.block_size * head_dim > 8192) {
+        return reject("block_size x head_dim exceeds the staged-tile budget "
+                      "(need block_size*head_dim <= 8192; e.g. head_dim 512 needs block_size <= 16)");
+    }
+
     if (hparams.n_head_kv(il) == 0 || hparams.n_head(il) % hparams.n_head_kv(il) != 0) {
         return reject("GQA ratio not an integer (n_head % n_head_kv != 0)");
     }

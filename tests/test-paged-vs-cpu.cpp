@@ -228,11 +228,27 @@ int main() {
     const int dims[] = { 64, 96, 128, 192, 256, 512 };   // 512: gemma4 n_embd_head
     int n_fail = 0;
 
+    // ★ MIRRORS paged_layer_supported()'s JOINT (block_size, head_dim) CONTRACT. The scalar path
+    // stages 2 * block_size * head_dim halves, so head_dim alone never bounded it: bs=64/D=512
+    // wants 131,072 B of threadgroup memory and used to return silently wrong numbers (2.34e-02,
+    // f16 and q8_0 alike). The dispatch now asserts, so without this skip the whole run aborts at
+    // BS=64 and the OTHER dims never get tested -- a harness that dies on a case the real path
+    // refuses is measuring nothing. ⚠ SKIPS ARE PRINTED: a silently-shrunk sweep reads as
+    // "everything passed", which is the exact failure this file already has scars from.
+    const int tst_bs = getenv("DS4P_TEST_BS") ? atoi(getenv("DS4P_TEST_BS")) : 16;
+    const auto tile_fits = [&](int D) {
+        if ((int64_t) tst_bs * D <= 8192) { return true; }
+        printf("SKIP D=%3d at block_size=%d: block_size*head_dim=%d > 8192, the paged predicate "
+               "refuses this combination (staged tile would not fit)\n", D, tst_bs, tst_bs*D);
+        return false;
+    };
+
     // ⚠ WAS `di < 4` -- a HARDCODED bound beside a sized array. Adding 256 to dims[] silently did
     // nothing and the run still printed ALL PASSED, i.e. a green verdict for a case never executed.
     // Same gate-plumbing-lie class this lane keeps paying for. Derive the bound from the array.
     for (size_t di = 0; di < sizeof(dims)/sizeof(dims[0]); ++di) {
         const int D = dims[di];
+        if (!tile_fits(D)) { continue; }
         for (int cse = 0; cse < 3; ++cse) {
             const bool    with_rel = cse != 2;
             const int64_t window   = (cse == 0) ? 0 : 8;
@@ -271,6 +287,7 @@ int main() {
         for (size_t di = 0; di < sizeof(dims)/sizeof(dims[0]); ++di)
         for (int cse = 0; cse < 3; ++cse) {
             const int     D        = dims[di];
+            if (!tile_fits(D)) { continue; }
             const bool    with_rel = cse != 2;
             const int64_t window   = (cse == 0) ? 0 : 8;
 
@@ -332,6 +349,7 @@ int main() {
         for (size_t ki = 0; ki < sizeof(kts)/sizeof(kts[0]); ++ki)
         for (size_t di = 0; di < sizeof(dims)/sizeof(dims[0]); ++di) {
             const int D  = dims[di];
+            if (!tile_fits(D)) { continue; }
             const int BS = getenv("DS4P_TEST_BS") ? atoi(getenv("DS4P_TEST_BS")) : 16;
             const int NB = getenv("DS4P_TEST_NB") ? atoi(getenv("DS4P_TEST_NB")) : 2;
             const int N  = BS*NB - BS/2;
