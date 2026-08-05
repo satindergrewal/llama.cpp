@@ -210,8 +210,8 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
                        ggml_backend_name(be), n_here,
                        ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
 
-        gpu_ctxs.push_back(ctx);
-        gpu_bufs.push_back(buf);
+        gpu_ctxs.emplace_back(ctx);
+        gpu_bufs.emplace_back(buf);
     }
 
     for (uint32_t il = 0; il < n_layers; ++il) {
@@ -233,6 +233,8 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
     }
     ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
     GGML_ASSERT(buf_cpu && "Failed to allocate CPU KV cache buffer");
+    owned_ctxs.emplace_back(ctx_cpu);
+    owned_bufs.emplace_back(buf_cpu);
     ggml_backend_buffer_clear(buf_cpu, ds4p_kv_fill("CPU pool (A)"));
     for (uint32_t il = 0; il < n_layers; ++il) {
         if (!ds4p_layer_kv(layer_has_kv, il)) { continue; }
@@ -310,6 +312,8 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     // Allocate on GPU backend
     ggml_backend_buffer_t buf_gpu = ggml_backend_alloc_ctx_tensors(ctx_gpu, backend_gpu);
     GGML_ASSERT(buf_gpu && "Failed to allocate GPU KV cache buffer");
+    owned_ctxs.emplace_back(ctx_gpu);
+    owned_bufs.emplace_back(buf_gpu);
     // POISON PROBE (DS4P_KV_POISON): fill with 0xFF so every fp16 is NaN. If nothing ever
     // reads an unwritten block, results are unchanged and the gates still pass -- which is
     // the premise that makes deferring this clear (and thus lazy commit) safe. If something
@@ -341,6 +345,8 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     // Allocate on the CPU backend (using pinned memory for faster PCIe transfer)
     ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
     GGML_ASSERT(buf_cpu && "Failed to allocate CPU KV cache buffer");
+    owned_ctxs.emplace_back(ctx_cpu);
+    owned_bufs.emplace_back(buf_cpu);
     ggml_backend_buffer_clear(buf_cpu, ds4p_kv_fill("CPU pool (B)"));
     for (uint32_t il = 0; il < n_layers; ++il) {
         if (!ds4p_layer_kv(layer_has_kv, il)) { continue; }

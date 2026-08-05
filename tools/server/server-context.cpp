@@ -2797,6 +2797,25 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    // ⚠ THE PAGED PATH CANNOT SATISFY THIS REQUEST, BY DESIGN. finish() ->
+                    // free_blocks() returns a sequence's blocks to the pool the moment it
+                    // completes (see the note at the P1-5 capture site) -- "holding a finished
+                    // sequence's blocks would fight the entire point of paging". This endpoint
+                    // runs AFTER the completion returns, so the pool no longer holds the KV:
+                    // llama_state_seq_save_file writes only metadata and reports success.
+                    // Measured: n_saved=27, n_written=716 against an expected ~864 KB, HTTP 200.
+                    // An endpoint that cannot do the job must REFUSE, not answer 200 with a
+                    // plausible byte count. Do NOT "fix" this by making state_write retain
+                    // blocks -- that fights the design; route through the finish-window capture
+                    // instead if slot-save is wanted on this path.
+                    if (paged_sched) {
+                        send_error(task, "slot save is not supported on the paged KV path: blocks are "
+                                         "returned to the pool when a request finishes, so there is no "
+                                         "KV left to serialise by the time this endpoint runs",
+                                   ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
                     const llama_tokens tokens = slot->prompt.tokens.get_text_tokens();
                     const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
@@ -2833,6 +2852,20 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
+
+                    // ⚠ SYMMETRIC WITH SLOT SAVE, AND FOR THE SAME REASON. The paged path frees
+                    // a sequence's blocks at finish, so nothing on this path ever produced a real
+                    // slot-save file to restore FROM. Refusing the save while still accepting the
+                    // restore would leave the second half of a broken pair pretending to work:
+                    // llama_state_seq_load_file would read a metadata-only stub, report a byte
+                    // count, and hand back a slot with no KV behind it.
+                    if (paged_sched) {
+                        send_error(task, "slot restore is not supported on the paged KV path: blocks are "
+                                         "returned to the pool when a request finishes, so no slot-save "
+                                         "file on this path carries usable KV",
+                                   ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
 
                     llama_tokens tokens;
                     tokens.resize(slot->n_ctx);

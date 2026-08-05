@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ggml-cpp.h"
 #include "llama-batch.h"
 #include "llama-block-manager.h"
 #include "llama-graph.h"
@@ -231,8 +232,18 @@ class llama_kv_cache_paged : public llama_memory_i {
     uint32_t       block_bytes;
 
     // one context+buffer per distinct device holding layers (multi-device path)
-    std::vector<struct ggml_context *>     gpu_ctxs;
-    std::vector<ggml_backend_buffer_t>     gpu_bufs;
+    // OWNING: these were raw pointers with no destructor on this class, so every context and
+    // buffer init() allocated was leaked. ggml_context_ptr / ggml_backend_buffer_ptr are the
+    // in-tree RAII types (ggml-cpp.h), already used by llama-kv-cache.h and llama-adapter.h.
+    std::vector<ggml_context_ptr>          gpu_ctxs;
+    std::vector<ggml_backend_buffer_ptr>   gpu_bufs;
+
+    // The single-device GPU pool and the two CPU pools allocated a context + buffer each and
+    // stored NEITHER -- six handles unreachable the moment init() returned. Own them here.
+    // Declared AFTER kv_gpu_layers/kv_cpu_layers on purpose: members destruct in reverse
+    // declaration order, so these are released BEFORE the raw ggml_tensor* views into them.
+    std::vector<ggml_context_ptr>          owned_ctxs;
+    std::vector<ggml_backend_buffer_ptr>   owned_bufs;
 
     ggml_backend_t gpu_backend;
     ggml_backend_t cpu_backend;
