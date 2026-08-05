@@ -1221,6 +1221,14 @@ bool llama_kv_cache_paged::self_drive_begin(int32_t n_tokens) {
         // Same line, safe in one context and silently destructive in the other, previously logged
         // at WARN with the words "static path" -- which reads as a routing decision rather than
         // data loss. The producer was correct the whole time and nothing consumed it.
+        // ⚠ MEASURE THE PREMISE, DO NOT DESIGN AROUND IT. "the pool is too small" is an assumption:
+        // at -ngpub 8 there are 7 usable blocks and this sequence needs 4, yet allocation failed at
+        // 3. Print what the allocator actually HAS at the moment it refuses, so the fix addresses
+        // the real shortage rather than the one I guessed.
+        LLAMA_LOG_ERROR("%s: DS4P-ALLOCFAIL n_past=%d table_blocks=%zu free_gpu=%u total_gpu=%u "
+                        "usable_gpu=%u block_size=%u\n", __func__, n_past,
+                        sd_group.block_table.size(), block_manager.num_free_gpu_blocks(),
+                        num_gpu_blocks, block_manager.get_usable_gpu_blocks(), block_size);
         if (n_past > 0) {
             LLAMA_LOG_ERROR("%s: PAGED KV LOST. self-drive could not grow the block table for %d "
                             "token(s) at n_past=%d (table holds %zu blocks x %u = %u tokens). The "

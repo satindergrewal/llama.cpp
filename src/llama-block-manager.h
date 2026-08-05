@@ -49,6 +49,10 @@ class llama_block_manager {
     // ceil(8*0.05) = 1 block is permanently reserved, so usable capacity is 7 blocks -- and a
     // sequence that reaches exactly 7 blocks of context can never obtain an 8th, forever. A guard
     // written against the TOTAL pool does not fire, because the sequence never exceeds the total.
+    // How many GPU blocks are actually on the free list right now. Diagnostic: "the pool is too
+    // small" and "the pool will not hand out what it has" look identical from the caller.
+    uint32_t num_free_gpu_blocks() const { return (uint32_t) free_gpu_ids.size(); }
+
     uint32_t get_usable_gpu_blocks() const {
         return total_num_gpu_blocks > watermark_gpu_safety_num_blocks
              ? total_num_gpu_blocks - watermark_gpu_safety_num_blocks : 0;
