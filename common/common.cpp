@@ -1550,6 +1550,32 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    // ★ CHECKED FIRST, BEFORE THE MODEL AND CONTEXT ARE BUILT. It was originally placed next to
+    // the paged fitter, which runs AFTER context creation -- so the kv_paged n_ubatch assert fired
+    // first and this was never reached. A guard downstream of the thing it guards is not a guard.
+    // ★ REFUSE QUANTISED KV ON THE PAGED PATH -- measured, not assumed.
+    //   --kv-paged -ctk f16  : "Paris. The capital of Germany is Berlin"   (correct)
+    //   --kv-paged -ctk q8_0 : " thesssssss"                               (GARBAGE)
+    //   static     -ctk q8_0 : "Paris. The capital of Germany is Berlin"   (correct -- so the
+    //                          corruption is PAGED-SPECIFIC, not a quantised-KV problem)
+    // The paged op never dispatched under q8_0 (no presence marker) and nothing warned; the server
+    // came up healthy and answered with garbage. No dev flag was needed -- plain `--kv-paged
+    // -ctk q8_0` is enough. Silent wrong answers are the worst failure available, so this refuses
+    // at startup with the reason and the fix instead of letting it run.
+    if (params.kv_paged) {
+        const auto kv_type_ok = [](ggml_type t) {
+            return t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_F32;
+        };
+        if (!kv_type_ok(params.cache_type_k) || !kv_type_ok(params.cache_type_v)) {
+            LOG_ERR("%s: --kv-paged does not support a quantised KV cache "
+                    "(got type_k=%s, type_v=%s). The paged attention kernels are f16/bf16/f32 "
+                    "only; running anyway produces CORRUPT OUTPUT rather than an error.\n"
+                    "        Fix: drop -ctk/-ctv (or set them to f16), or drop --kv-paged.\n",
+                    __func__, ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v));
+            throw std::runtime_error("--kv-paged with a quantised KV cache produces corrupt output");
+        }
+    }
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();
