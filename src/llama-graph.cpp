@@ -3814,6 +3814,24 @@ bool llm_graph_context::paged_cache_type_supported(ggml_type type, bool allow_qu
            (allow_quant && type == GGML_TYPE_Q8_0);
 }
 
+// ★ THE SINGLE SOURCE OF TRUTH for "can the paged path hold this KV type", and the only place the
+// dev-flag env is read.
+//
+// ⚠ WHY THIS IS EXPORTED. common.cpp's startup refusal carried its OWN hardcoded {f16,bf16,f32}
+// list -- a SECOND enumeration of exactly this predicate, in a different file, with no link to it.
+// Two lists of the same fact drift the instant one moves: the day q8_0 becomes supported here, the
+// refusal there would still reject it, and the failure would look like "the fix did not work"
+// rather than "the guard is stale". That is the arch-allow-list defect wearing a guard's costume,
+// and this lane has already deleted three allow-lists for the same reason. One list, one reader.
+bool llama_kv_paged_supports_cache_type(enum ggml_type type) {
+    // Dev escape hatch: the q8_0 paged path is proven at the OP level (test-paged-vs-cpu, both
+    // backends, plus a divergence check) but not yet end-to-end, so it stays off by default.
+    // The flag widens what is REACHABLE; it never disables a check that would have run.
+    const bool allow_quant = getenv("LLAMA_BANDED_QUANT_KV") != nullptr;
+
+    return llm_graph_context::paged_cache_type_supported(type, allow_quant);
+}
+
 bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context * pctx, int il) const {
     // ⚠ Each rejection names its REASON. The first version returned a bare false and the caller
     // logged "layer N fails the paged capability contract" -- which told me 90 layers were refused
@@ -3861,9 +3879,9 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
         return reject("GQA ratio not an integer (n_head % n_head_kv != 0)");
     }
 
-    const bool allow_quant = getenv("LLAMA_BANDED_QUANT_KV") != nullptr;
-
-    if (!paged_cache_type_supported(kv->type, allow_quant)) {
+    // Goes through the exported wrapper so the graph predicate and the startup refusal cannot
+    // disagree about what is supported -- one list, one env read.
+    if (!llama_kv_paged_supports_cache_type(kv->type)) {
         return reject("paged KV cache type not supported by the kernel (f16/bf16/f32, or q8_0 with LLAMA_BANDED_QUANT_KV)");
     }
 

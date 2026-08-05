@@ -163,13 +163,20 @@ int main() {
     // quant_row mirrors kernel_paged_attn_write_q8_0), so this keeps the SAME 2e-3 bar as every
     // f16 case. No loosened tolerance -- a gate widened to swallow ~8e-3 of quantisation error
     // would also pass a genuinely broken kernel.
+    // ⚠ SWEEPS THE SAME DIMS AS THE f16 ARM. This was D=128 ONLY, and on that single dimension I
+    // called the q8_0 read path "proven on both backends" -- while the model the end-to-end gate
+    // actually runs (Ornith-9B) has head_dim 256, which the arm never touched. Same shape as the
+    // `di < 4` loop bound that printed ALL PASSED for a case that never ran: the claim was wider
+    // than the coverage. dims[] is shared with the f16 arm so the two cannot drift apart.
     if (!same) {
+        for (size_t di = 0; di < sizeof(dims)/sizeof(dims[0]); ++di)
         for (int cse = 0; cse < 3; ++cse) {
+            const int     D        = dims[di];
             const bool    with_rel = cse != 2;
             const int64_t window   = (cse == 0) ? 0 : 8;
 
-            const std::vector<float> a = run_paged(backend, 128, with_rel, window, GGML_TYPE_Q8_0);
-            const std::vector<float> b = run_paged(cpu,     128, with_rel, window, GGML_TYPE_Q8_0);
+            const std::vector<float> a = run_paged(backend, D, with_rel, window, GGML_TYPE_Q8_0);
+            const std::vector<float> b = run_paged(cpu,     D, with_rel, window, GGML_TYPE_Q8_0);
             GGML_ASSERT(a.size() == b.size());
 
             double max_abs = 0.0, sum_sq = 0.0, ref_sq = 0.0;
@@ -192,15 +199,15 @@ int main() {
             printf("   [diag] metal: nan=%d nonzero=%d | cpu: nan=%d nonzero=%d | n=%zu\n",
                    nan_a, nz_a, nan_b, nz_b, a.size());
 
-            printf("q8_0 D=128 case %c: with_rel=%d window=%lld max_abs=%.3e nmse=%.3e %s\n",
-                   'A' + cse, with_rel ? 1 : 0, (long long) window, max_abs, nmse, ok ? "PASS" : "FAIL");
+            printf("q8_0 D=%3d case %c: with_rel=%d window=%lld max_abs=%.3e nmse=%.3e %s\n",
+                   D, 'A' + cse, with_rel ? 1 : 0, (long long) window, max_abs, nmse, ok ? "PASS" : "FAIL");
             n_fail += ok ? 0 : 1;
 
             // ★ DIVERGENCE BEFORE EQUALITY. The agreement above is metal-q8 vs cpu-q8; if BOTH
             // sides silently skipped quantisation it would pass just as cleanly. So require the
             // q8_0 result to DIFFER from the f16 result by roughly a quantisation step. A gate
             // that only checks equality cannot tell "both correct" from "both bypassed".
-            const std::vector<float> f16ref = run_paged(backend, 128, with_rel, window, GGML_TYPE_F16);
+            const std::vector<float> f16ref = run_paged(backend, D, with_rel, window, GGML_TYPE_F16);
             double qdiff = 0.0;
             for (size_t i = 0; i < a.size(); ++i) {
                 const double d = fabs((double) a[i] - f16ref[i]);

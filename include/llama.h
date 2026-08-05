@@ -1661,6 +1661,10 @@ extern "C" {
     LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama_context * ctx);
     LLAMA_API void llama_paged_scheduler_free(struct llama_paged_scheduler * sched);
 
+    // Can the paged KV path hold a cache of this type? Exported so the CLI/server startup check
+    // and the graph-build capability test share ONE list instead of keeping two that drift.
+    LLAMA_API bool llama_kv_paged_supports_cache_type(enum ggml_type type);
+
     // Queueing and stepping.
     // P1-6: queue a request as a copy-on-write FORK of a live one -- the shared prefix is
     // inherited by block reference (no re-prefill, 1x prefix memory for N agents). Falls

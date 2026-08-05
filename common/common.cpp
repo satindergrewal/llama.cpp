@@ -1562,17 +1562,21 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     // came up healthy and answered with garbage. No dev flag was needed -- plain `--kv-paged
     // -ctk q8_0` is enough. Silent wrong answers are the worst failure available, so this refuses
     // at startup with the reason and the fix instead of letting it run.
+    // ⚠ ASKS THE LIBRARY, does not keep its own list. This block used to carry a local
+    // {f16,bf16,f32} lambda -- a second copy of llama-graph's capability predicate, in another
+    // file, with nothing tying them together. The moment the kernel gained q8_0 support, the graph
+    // predicate would have admitted it while this stale copy still refused, and the symptom would
+    // read as "the q8_0 work did not land" rather than "the guard is out of date". Same defect as
+    // the three allow-lists this lane already deleted, just wearing a guard's costume.
     if (params.kv_paged) {
-        const auto kv_type_ok = [](ggml_type t) {
-            return t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_F32;
-        };
-        if (!kv_type_ok(params.cache_type_k) || !kv_type_ok(params.cache_type_v)) {
-            LOG_ERR("%s: --kv-paged does not support a quantised KV cache "
-                    "(got type_k=%s, type_v=%s). The paged attention kernels are f16/bf16/f32 "
-                    "only; running anyway produces CORRUPT OUTPUT rather than an error.\n"
+        if (!llama_kv_paged_supports_cache_type(params.cache_type_k) ||
+            !llama_kv_paged_supports_cache_type(params.cache_type_v)) {
+            LOG_ERR("%s: --kv-paged does not support this KV cache type "
+                    "(got type_k=%s, type_v=%s). Running anyway produces CORRUPT OUTPUT rather "
+                    "than an error.\n"
                     "        Fix: drop -ctk/-ctv (or set them to f16), or drop --kv-paged.\n",
                     __func__, ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v));
-            throw std::runtime_error("--kv-paged with a quantised KV cache produces corrupt output");
+            throw std::runtime_error("--kv-paged with an unsupported KV cache type produces corrupt output");
         }
     }
 
