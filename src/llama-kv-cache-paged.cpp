@@ -1225,10 +1225,16 @@ bool llama_kv_cache_paged::self_drive_begin(int32_t n_tokens) {
         // at -ngpub 8 there are 7 usable blocks and this sequence needs 4, yet allocation failed at
         // 3. Print what the allocator actually HAS at the moment it refuses, so the fix addresses
         // the real shortage rather than the one I guessed.
+        extern uint64_t ds4p_blocks_checked_out();
+        extern uint64_t ds4p_blocks_released();
         LLAMA_LOG_ERROR("%s: DS4P-ALLOCFAIL n_past=%d table_blocks=%zu free_gpu=%u total_gpu=%u "
-                        "usable_gpu=%u block_size=%u\n", __func__, n_past,
+                        "usable_gpu=%u block_size=%u | checked_out=%llu released=%llu OUTSTANDING=%lld\n",
+                        __func__, n_past,
                         sd_group.block_table.size(), block_manager.num_free_gpu_blocks(),
-                        num_gpu_blocks, block_manager.get_usable_gpu_blocks(), block_size);
+                        num_gpu_blocks, block_manager.get_usable_gpu_blocks(), block_size,
+                        (unsigned long long) ds4p_blocks_checked_out(),
+                        (unsigned long long) ds4p_blocks_released(),
+                        (long long) (ds4p_blocks_checked_out() - ds4p_blocks_released()));
         if (n_past > 0) {
             LLAMA_LOG_ERROR("%s: PAGED KV LOST. self-drive could not grow the block table for %d "
                             "token(s) at n_past=%d (table holds %zu blocks x %u = %u tokens). The "

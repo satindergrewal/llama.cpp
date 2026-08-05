@@ -52,7 +52,16 @@ bool llama_block_manager::has_free_cpu_blocks(uint32_t num_requested_blocks) con
     return num_requested_blocks <= (curr_free_cpus - watermark_cpu_safety_num_blocks);
 }
 
+// ★ LEAK ACCOUNTING. Measured: at a refusal the sequence held 3 blocks, the free list had 1, and
+// the pool has 8 -- four unaccounted for. checkout and release are the only two doors, so counting
+// both and diffing them names the leak site instead of nominating a suspect.
+static uint64_t ds4p_n_checked_out = 0;
+static uint64_t ds4p_n_released    = 0;
+uint64_t ds4p_blocks_checked_out() { return ds4p_n_checked_out; }
+uint64_t ds4p_blocks_released()    { return ds4p_n_released;    }
+
 llama_block_manager::physical_block_ids llama_block_manager::checkout_gpu_blocks(uint32_t num_blocks) {
+    ds4p_n_checked_out += num_blocks;
     physical_block_ids new_ids = {};
     if (num_blocks > free_gpu_ids.size()) {
         return new_ids;
@@ -100,6 +109,7 @@ uint32_t llama_block_manager::get_ref_count(uint32_t block) const {
 }
 
 void llama_block_manager::release_gpu_blocks(const physical_block_ids & freed_blocks_ids) {
+    ds4p_n_released += freed_blocks_ids.size();
     for (const uint32_t & id : freed_blocks_ids) {
         gpu_registry[id].ref_count -= 1;
         if (gpu_registry[id].ref_count <= 0) {
