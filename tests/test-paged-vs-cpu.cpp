@@ -111,6 +111,105 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
     return out;
 }
 
+// ★ INCREMENTAL WRITES -- the largest difference between this harness and a real server, and the
+// one the poison probe pointed at.
+//
+// run_paged() above writes all N tokens in ONE op call. A server writes the prompt, then ONE token
+// per decode step, into a cache the previous step already partly filled. Measured on Ornith-9B:
+// paged f16 is bit-identical with the pool poisoned, paged q8_0 is NOT -- so on the quantised path
+// something reads a region the write never covered, and an unwritten q8_0 block dequantises to a
+// clean 0.0 rather than to NaN, which is why f16 never showed it.
+//
+// This runs the SAME work as two sequential graphs over one cache: tokens [0,N1) then [N1,N).
+// Attention is causal, so the concatenation MUST equal the single-call result exactly -- same
+// arithmetic, same order, only the write schedule differs. Any divergence is the incremental path.
+static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool with_rel, int64_t window,
+                                          ggml_type kv_type, int n1) {
+    const int H   = 4;
+    const int HKV = 2;
+    const int E   = 8;
+    const int BS  = getenv("DS4P_TEST_BS") ? atoi(getenv("DS4P_TEST_BS")) : 16;
+    const int NB  = getenv("DS4P_TEST_NB") ? atoi(getenv("DS4P_TEST_NB")) : 2;
+    const int N   = BS*NB - BS/2;
+    const float scale = 1.0f / sqrtf((float) D);
+    const int   n2    = N - n1;
+
+    ggml_init_params ip = { ggml_tensor_overhead()*96 + ggml_graph_overhead()*2, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+
+    ggml_tensor * cache = ggml_new_tensor_4d(ctx, kv_type, D, BS, 2*HKV, NB);
+    ggml_tensor * btab  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, NB, 1);
+
+    struct part {
+        int n, off;
+        ggml_tensor *q, *k, *v, *slots, *clens, *boffs, *blens, *rel, *out;
+    } P[2] = { { n1, 0, }, { n2, n1, } };
+
+    for (int s = 0; s < 2; ++s) {
+        part & p = P[s];
+        p.q     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H,   p.n);
+        p.k     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, HKV, p.n);
+        p.v     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, HKV, p.n);
+        p.slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, p.n);
+        p.clens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        p.boffs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        p.blens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        p.rel   = with_rel ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, H, p.n) : nullptr;
+        p.out   = ggml_paged_attn_banded(ctx, p.q, p.k, p.v, cache, cache,
+                      btab, p.slots, p.clens, p.boffs, p.blens, p.rel,
+                      scale, BS, NB, with_rel ? E : 1, window);
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    std::vector<uint8_t> zeros(ggml_nbytes(cache), 0);
+    ggml_backend_tensor_set(cache, zeros.data(), 0, zeros.size());
+    std::vector<int32_t> bt = {0, 1};
+    ggml_backend_tensor_set(btab, bt.data(), 0, 2*sizeof(int32_t));
+
+    std::vector<float> out((size_t) N*H*D);
+
+    for (int s = 0; s < 2; ++s) {
+        part & p = P[s];
+        std::vector<float> tq((size_t) p.n*H*D), tk((size_t) p.n*HKV*D), tv((size_t) p.n*HKV*D);
+        for (int t = 0; t < p.n; ++t) {
+            const int gt = p.off + t;   // GLOBAL token index: the values must not depend on the split
+            for (int h = 0; h < H;   ++h) for (int d = 0; d < D; ++d) tq[(size_t) t*H*D   + h*D + d] = val_q(gt, h, d);
+            for (int h = 0; h < HKV; ++h) for (int d = 0; d < D; ++d) tk[(size_t) t*HKV*D + h*D + d] = val_k(gt, h, d);
+            for (int h = 0; h < HKV; ++h) for (int d = 0; d < D; ++d) tv[(size_t) t*HKV*D + h*D + d] = val_v(gt, h, d);
+        }
+        ggml_backend_tensor_set(p.q, tq.data(), 0, tq.size()*sizeof(float));
+        ggml_backend_tensor_set(p.k, tk.data(), 0, tk.size()*sizeof(float));
+        ggml_backend_tensor_set(p.v, tv.data(), 0, tv.size()*sizeof(float));
+
+        if (with_rel) {
+            std::vector<float> r((size_t) E*H*p.n, 0.0f);
+            for (int t = 0; t < p.n; ++t) for (int h = 0; h < H; ++h) for (int e = 0; e < E; ++e)
+                r[(size_t) t*H*E + h*E + e] = val_r(e, h, p.off + t);
+            ggml_backend_tensor_set(p.rel, r.data(), 0, r.size()*sizeof(float));
+        }
+
+        std::vector<int32_t> sl(p.n);
+        for (int t = 0; t < p.n; ++t) sl[t] = p.off + t;      // identity slots, same as run_paged
+        ggml_backend_tensor_set(p.slots, sl.data(), 0, p.n*sizeof(int32_t));
+        int32_t v_clen = p.off + p.n;   // cumulative context AFTER this write
+        int32_t v_zero = 0, v_len = p.n;
+        ggml_backend_tensor_set(p.clens, &v_clen, 0, sizeof(int32_t));
+        ggml_backend_tensor_set(p.boffs, &v_zero, 0, sizeof(int32_t));
+        ggml_backend_tensor_set(p.blens, &v_len,  0, sizeof(int32_t));
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, p.out);
+        ggml_backend_graph_compute(backend, gf);
+
+        ggml_backend_tensor_get(p.out, out.data() + (size_t) p.off*H*D, 0, ggml_nbytes(p.out));
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return out;
+}
+
 int main() {
     ggml_backend_t backend = ggml_backend_init_best();
     GGML_ASSERT(backend);
@@ -222,6 +321,38 @@ int main() {
         }
     }
 
+
+    // ★ INCREMENTAL-WRITE ARM. Chases the e2e failure the single-call arms cannot see: paged q8_0
+    // produces garbage in a real server while passing every op-level case here. f16 runs the SAME
+    // split as a control -- if f16 also diverges the fault is the split harness, not quantisation.
+    // ⚠ Placed BEFORE ggml_backend_free. An earlier arm went in after it and died on
+    // GGML_ASSERT(device); test arms live on the same side of the lifecycle boundary as the backend.
+    {
+        const ggml_type kts[] = { GGML_TYPE_F16, GGML_TYPE_Q8_0 };
+        for (size_t ki = 0; ki < sizeof(kts)/sizeof(kts[0]); ++ki)
+        for (size_t di = 0; di < sizeof(dims)/sizeof(dims[0]); ++di) {
+            const int D  = dims[di];
+            const int BS = getenv("DS4P_TEST_BS") ? atoi(getenv("DS4P_TEST_BS")) : 16;
+            const int NB = getenv("DS4P_TEST_NB") ? atoi(getenv("DS4P_TEST_NB")) : 2;
+            const int N  = BS*NB - BS/2;
+            const int n1 = N/2;   // split mid-stream, deliberately NOT on a block boundary
+
+            const std::vector<float> whole = run_paged      (backend, D, true, 0, kts[ki]);
+            const std::vector<float> split = run_paged_split(backend, D, true, 0, kts[ki], n1);
+
+            double max_abs = 0.0;
+            for (size_t i = 0; i < whole.size() && i < split.size(); ++i) {
+                const double d = fabs((double) whole[i] - split[i]);
+                max_abs = d > max_abs ? d : max_abs;
+            }
+            // Same arithmetic in the same order -- only the WRITE SCHEDULE differs, so this is an
+            // exactness check, not a tolerance. Anything above f32 noise is the incremental path.
+            const bool ok = max_abs < 1e-5;
+            printf("incremental %-5s D=%3d split=%d/%d: max_abs=%.3e %s\n",
+                   ggml_type_name(kts[ki]), D, n1, N, max_abs, ok ? "PASS" : "FAIL");
+            n_fail += ok ? 0 : 1;
+        }
+    }
 
     ggml_backend_free(cpu);
     ggml_backend_free(backend);

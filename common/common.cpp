@@ -1261,7 +1261,15 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     const uint32_t head_dim   = llama_model_n_embd_head_v(model);
     const uint32_t block_size = params.block_size;
 
-    const size_t bytes_per_block = (size_t)2 * head_dim * n_heads_kv * block_size * n_layers * ggml_type_size(GGML_TYPE_F16);
+    // ⚠ WAS `head_dim * ggml_type_size(GGML_TYPE_F16)` -- the f16 assumption hardcoded a FIFTH
+    // time, after llama_kv_cache_paged::init (x2), the CPU op's strides, and its V write offset.
+    // The pool this fitter sizes is built from params.cache_type_k, so with -ctk q8_0 the fitter
+    // budgeted 512 B/row against an actual 272 B/row and sized the pool 1.88x too large. It errs
+    // toward MORE memory, so nothing breaks -- it just silently spends the context budget that
+    // quantising the KV cache was meant to buy back, which is the entire point of the feature.
+    // ggml_row_size is exact for f16 and correct for quantised types.
+    const size_t bytes_per_block = (size_t)2 * n_heads_kv * block_size * n_layers *
+                                   ggml_row_size(params.cache_type_k, head_dim);
 
     // ---- RESERVE POLICY -------------------------------------------------------------------
     // The old reserve was a flat 5% of total. That is wrong at both ends of the range: on a
