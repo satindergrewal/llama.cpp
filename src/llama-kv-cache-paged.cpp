@@ -1025,6 +1025,19 @@ bool llama_kv_cache_paged::self_drive_enabled() const {
     return en;
 }
 
+// Release ONLY the batch info. The group's blocks must survive a decode step.
+void llama_kv_cache_paged::self_drive_release_info() {
+    set_paged_batch_info(nullptr);
+
+    delete[] sd_info.write_slots;
+    delete[] sd_info.block_table;
+    delete[] sd_info.context_lens;
+    delete[] sd_info.batch_offsets;
+    delete[] sd_info.batch_lens;
+    delete[] sd_info.prefill_pending;
+    sd_info = {};
+}
+
 void llama_kv_cache_paged::self_drive_end() {
     if (!sd_active) {
         return;
@@ -1046,61 +1059,89 @@ void llama_kv_cache_paged::self_drive_end() {
 }
 
 bool llama_kv_cache_paged::self_drive_begin(int32_t n_tokens) {
-    // Always release the previous step first: the info is non-owning at the consumer, so a stale
-    // pointer outliving its arrays is exactly the lifetime bug the scheduler's clear_batch ordering
-    // comment warns about.
-    self_drive_end();
-
     if (n_tokens <= 0) {
         return false;
     }
 
-    sd_group = {};
-    sd_group.request_id = 0;
-    sd_group.n_prompt   = (uint32_t) n_tokens;
-    sd_group.n_past     = 0;
-    sd_group.n_decoded  = 0;
+    // ★ PERSISTENT SEQUENCE GROUP. The first version rebuilt the group from scratch on every call
+    // with n_past = 0, so each decode step saw only its own token and generation degenerated
+    // (`one, two, three.` then drivel) -- caught by the hybrid decode gate, which is why that gate
+    // exists.
+    //
+    // n_tokens > 1  => a new prompt: release the old sequence and start fresh.
+    // n_tokens == 1 => a decode step: KEEP the group, grow it, and write at the next position.
+    // ⚠ A genuine ONE-token prompt is indistinguishable from a decode step here. Acceptable for a
+    // dev-gated single-sequence bridge; a real scheduler carries the request identity instead.
+    const bool have_live  = sd_active && !sd_group.block_table.empty();
+    const bool is_prefill = (n_tokens > 1) || !have_live;
 
-    if (!allocate(n_tokens, sd_group)) {
-        LLAMA_LOG_WARN("%s: self-drive could not allocate %d tokens; falling back to static\n",
-                       __func__, n_tokens);
+    // Release only the INFO between steps; the group's blocks must survive a decode step or the
+    // prefix is lost. self_drive_end() frees blocks too, so it is only correct at a real boundary.
+    self_drive_release_info();
+
+    if (is_prefill) {
+        if (have_live) {
+            free_blocks(sd_group);
+        }
         sd_group = {};
+        sd_group.request_id = 0;
+        sd_group.n_prompt   = (uint32_t) n_tokens;
+        sd_group.n_decoded  = 0;
+    }
+
+    // Position this batch's first token: everything already written for this sequence.
+    const int32_t n_past = is_prefill ? 0 : (int32_t) (sd_group.n_prompt + sd_group.n_decoded);
+
+    if (!is_prefill) {
+        sd_group.n_decoded += (uint32_t) n_tokens;
+    }
+
+    // allocate() tops the block table up to cover n_prompt + n_decoded (+ the extra it is asked
+    // for). Counts are already final here, so ask for 0 and let it size from the group.
+    if (!allocate(0, sd_group)) {
+        LLAMA_LOG_WARN("%s: self-drive could not allocate for %d tokens at n_past=%d; static path\n",
+                       __func__, n_tokens, n_past);
+        free_blocks(sd_group);
+        sd_group  = {};
+        sd_active = false;
         return false;
     }
 
     const int32_t n_blocks = (int32_t) sd_group.block_table.size();
     if (n_blocks <= 0) {
         free_blocks(sd_group);
-        sd_group = {};
+        sd_group  = {};
+        sd_active = false;
         return false;
     }
 
-    sd_info                   = {};
-    sd_info.n_seq             = 1;
-    sd_info.n_tokens          = n_tokens;
-    sd_info.n_blocks_per_seq  = n_blocks;
-    sd_info.write_slots       = new int32_t[n_tokens];
-    sd_info.block_table       = new int32_t[n_blocks];
-    sd_info.context_lens      = new int32_t[1];
-    sd_info.batch_offsets     = new int32_t[1];
-    sd_info.batch_lens        = new int32_t[1];
-    sd_info.prefill_pending   = new int32_t[1];
+    sd_info                  = {};
+    sd_info.n_seq            = 1;
+    sd_info.n_tokens         = n_tokens;
+    sd_info.n_blocks_per_seq = n_blocks;
+    sd_info.write_slots      = new int32_t[n_tokens];
+    sd_info.block_table      = new int32_t[n_blocks];
+    sd_info.context_lens     = new int32_t[1];
+    sd_info.batch_offsets    = new int32_t[1];
+    sd_info.batch_lens       = new int32_t[1];
+    sd_info.prefill_pending  = new int32_t[1];
 
     for (int32_t b = 0; b < n_blocks; ++b) {
         sd_info.block_table[b] = (int32_t) sd_group.block_table[b];
     }
 
-    // Same mapping as llama_paged_scheduler_impl::calculate_global_slot_index: the physical slot
-    // is block_table[pos/bs]*bs + pos%bs. Reproduced rather than shared because that helper is a
-    // private member of the scheduler; if it ever changes, THIS must change with it.
+    // Same mapping as llama_paged_scheduler_impl::calculate_global_slot_index, at ABSOLUTE
+    // positions -- this is what carries the prefix across decode steps.
     for (int32_t i = 0; i < n_tokens; ++i) {
-        const int32_t blk = i / (int32_t) block_size;
-        const int32_t off = i % (int32_t) block_size;
-        GGML_ASSERT(blk < n_blocks && "self-drive slot OOB -- allocate() returned too few blocks");
+        const int32_t pos = n_past + i;
+        const int32_t blk = pos / (int32_t) block_size;
+        const int32_t off = pos % (int32_t) block_size;
+        GGML_ASSERT(blk < n_blocks && "self-drive slot OOB -- block table too short for n_past");
         sd_info.write_slots[i] = sd_info.block_table[blk] * (int32_t) block_size + off;
     }
 
-    sd_info.context_lens[0]    = n_tokens;
+    // The kernel walks blocks up to context_lens, so this must be the FULL context, not the batch.
+    sd_info.context_lens[0]    = n_past + n_tokens;
     sd_info.batch_offsets[0]   = 0;
     sd_info.batch_lens[0]      = n_tokens;
     sd_info.prefill_pending[0] = 0;
@@ -1109,15 +1150,12 @@ bool llama_kv_cache_paged::self_drive_begin(int32_t n_tokens) {
     set_paged_batch_info(&sd_info);
 
     {
-        // Log the FIRST FEW calls with their token counts, not just one line. A once-per-process
-        // marker cannot answer "does this re-fire per decode step?", which is exactly the mechanism
-        // question the decode gate raised -- and a marker that cannot distinguish the cases it is
-        // being read for is the same defect class as counting log lines to count layers.
         static int n_calls = 0;
         ++n_calls;
-        if (n_calls <= 6) {
-            LLAMA_LOG_INFO("%s: DS4P-PAGED-DRIVE call #%d -- %d tokens over %d blocks\n",
-                           __func__, n_calls, n_tokens, n_blocks);
+        if (n_calls <= 8) {
+            LLAMA_LOG_INFO("%s: DS4P-PAGED-DRIVE call #%d -- %s %d tok at n_past=%d, ctx=%d, %d blocks\n",
+                           __func__, n_calls, is_prefill ? "PREFILL" : "decode",
+                           n_tokens, n_past, sd_info.context_lens[0], n_blocks);
         }
     }
 

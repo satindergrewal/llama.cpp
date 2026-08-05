@@ -73,6 +73,7 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     bool self_drive_begin(int32_t n_tokens);
     void self_drive_end();
+    void self_drive_release_info();
     bool self_drive_enabled() const;
     // true while WE own the current batch info (as opposed to a real scheduler)
     bool self_drive_active() const { return sd_active; }
