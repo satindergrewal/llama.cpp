@@ -3900,6 +3900,25 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
     ggml_tensor * kv_cache_l = paged_ctx->get_k(il);   // interleaved K+V heads (src[3] contract)
     GGML_ASSERT(kv_cache_l != nullptr);
 
+    // ★ SHAPE CONTRACT, checked against the ACTUAL TENSORS rather than hparams.
+    //
+    // Gemma4 has TWO head dims -- n_embd_head_k = 512 for global layers, n_embd_head_k_swa = 256
+    // for SWA layers -- while the paged pool is allocated once at hparams.n_embd_head_v() = 512.
+    // On an SWA layer the pool's per-head stride (512) then disagrees with what the kernel reads
+    // (256), and the model emitted "<unused25><unused25>..." instead of "Paris.". The op ran 180
+    // times and every capability check passed: nothing was refused, the output was simply wrong.
+    //
+    // hparams could not catch this -- it is exactly what disagreed. So compare the tensors: q's
+    // head extent against the pool's. Arch-agnostic, and it degrades to the static path (correct
+    // output) instead of corrupting, which is the only acceptable behaviour for a mismatch.
+    if (kv_cache_l->ne[0] != q->ne[0]) {
+        LLAMA_LOG_WARN("%s: layer %d head_dim %lld does not match the paged pool's %lld "
+                       "(architecture uses more than one head size -- a single pool cannot serve "
+                       "it); this layer takes the static path\n",
+                       __func__, il, (long long) q->ne[0], (long long) kv_cache_l->ne[0]);
+        return nullptr;
+    }
+
     // ONE set of paged inputs per graph, not per layer -- see cached_inp_paged in the header.
     if (cached_inp_paged == nullptr) {
         cached_inp_paged = build_attn_inp_kv_paged(paged_ctx);
