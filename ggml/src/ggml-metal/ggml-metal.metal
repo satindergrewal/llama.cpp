@@ -2958,6 +2958,34 @@ kernel void kernel_solve_tri_f32(
 //
 // Preconditions the capability contract already guarantees: head_dim % 32 == 0. The constraint
 // added for the kernel's D ceiling turns out to be exactly the one quantisation needs.
+// ★ TYPE-AWARE SINGLE-ELEMENT CACHE READ.
+//
+// The paged strides are expressed in the CACHE TYPE's units -- halves for f16, 34-byte BLOCKS for
+// q8_0 -- so a base offset built from stride_block/stride_head/stride_token is a BLOCK index under
+// q8_0. The decode path then did `kv_cache[k_off + d]`, adding an ELEMENT offset to that base and
+// reading it as half: correct for f16, meaningless for q8_0.
+//
+// It survived because the PREFILL staging loop dequantises properly, so prefill was right and only
+// decode was wrong -- and because the unit suite had never dispatched a decode whose context fit in
+// a single block. The result looked exactly like "reads unwritten memory", which is what the cache
+// content check finally disproved: every row the read can address was verified correct in the cache
+// (0 bad of 64, worst 1.083e-03 = the q8 quantisation bound) while the output was still garbage.
+static inline float ds4p_kv_elem(device const half * kv, bool q8, uint64_t base, int d) {
+    if (q8) {
+        device const block_q8_0 * b = (device const block_q8_0 *) kv;
+        const uint64_t bi = base + (uint64_t) (d >> 5);      // QK8_0 == 32
+        // ⚠ ROUNDS THROUGH half ON PURPOSE. The prefill staging tile is half, so it dequantises as
+        // (half)(d * qs); returning full float here would make decode NUMERICALLY DIFFERENT from
+        // prefill by exactly one half-rounding (~1.5e-05 measured) -- both correct, neither equal.
+        // The incremental arm's bar is EXACTNESS, because only the write schedule is supposed to
+        // differ between the two, so the right move is to match the reference path rather than
+        // widen the bar to swallow the gap. A tolerance loosened to fit a known discrepancy also
+        // admits the unknown ones.
+        return (float) (half) ((float) b[bi].d * (float) b[bi].qs[d & 31]);
+    }
+    return (float) kv[base + (uint64_t) d];
+}
+
 kernel void kernel_paged_attn_write_q8_0(
         constant ggml_metal_kargs_paged_attn & args,
         device const float        * k_new       [[buffer(1)]],
@@ -3556,7 +3584,7 @@ kernel void kernel_paged_attn_f32(
                                 const uint64_t vo = vb + (uint64_t)(tb+k) * args.stride_token;
                                 for (int i = 0; i < NPT; ++i) {
                                     const int d2 = (int) lane + i*32;
-                                    if (d2 < D) { accv[i] += pk * (float) kv_cache[vo + d2]; }
+                                    if (d2 < D) { accv[i] += pk * ds4p_kv_elem(kv_cache, args.kv_q8 != 0, vo, d2); }
                                 }
                             }
                         }
@@ -3588,7 +3616,7 @@ kernel void kernel_paged_attn_f32(
                         const uint64_t vo = vb + (uint64_t) t * args.stride_token;
                         for (int i = 0; i < NPT; ++i) {
                             const int d2 = (int) lane + i*32;
-                            if (d2 < D) { accv[i] = accv[i] * resc + pv * (float) kv_cache[vo + d2]; }
+                            if (d2 < D) { accv[i] = accv[i] * resc + pv * ds4p_kv_elem(kv_cache, args.kv_q8 != 0, vo, d2); }
                         }
                     }
                     m_i = m_new;
@@ -3610,7 +3638,7 @@ kernel void kernel_paged_attn_f32(
                 float part = 0.0f;
                 for (int i = 0; i < NPT; ++i) {
                     const int d2 = (int) lane + i*32;
-                    if (d2 < D) { part += qv[i] * (float) kv_cache[k_off + d2]; }
+                    if (d2 < D) { part += qv[i] * ds4p_kv_elem(kv_cache, args.kv_q8 != 0, k_off, d2); }
                 }
                 float sc = simd_sum(part) * args.scale;
                 const int rd = q_pos - tok;
@@ -3624,7 +3652,7 @@ kernel void kernel_paged_attn_f32(
                 const uint64_t v_off = b + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head;
                 for (int i = 0; i < NPT; ++i) {
                     const int d2 = (int) lane + i*32;
-                    if (d2 < D) { accv[i] = accv[i] * resc + pv * (float) kv_cache[v_off + d2]; }
+                    if (d2 < D) { accv[i] = accv[i] * resc + pv * ds4p_kv_elem(kv_cache, args.kv_q8 != 0, v_off, d2); }
                 }
                 m_i = m_new;
             }
@@ -3663,7 +3691,7 @@ kernel void kernel_paged_attn_f32(
         float part = 0.0f;
         for (int i = 0; i < NPT; ++i) {
             const int d = (int) lane + i*32;
-            if (d < D) { part += qv[i] * (float) kv_cache[k_off + d]; }
+            if (d < D) { part += qv[i] * ds4p_kv_elem(kv_cache, args.kv_q8 != 0, k_off, d); }
         }
         float sc = simd_sum(part) * args.scale;
 
@@ -3679,7 +3707,7 @@ kernel void kernel_paged_attn_f32(
         const uint64_t v_off = b + (uint64_t) (args.n_heads_kv + kv_h) * args.stride_head;
         for (int i = 0; i < NPT; ++i) {
             const int d = (int) lane + i*32;
-            if (d < D) { accv[i] = accv[i] * resc + pv * (float) kv_cache[v_off + d]; }
+            if (d < D) { accv[i] = accv[i] * resc + pv * ds4p_kv_elem(kv_cache, args.kv_q8 != 0, v_off, d); }
         }
         m_i = m_new;
     }

@@ -231,6 +231,65 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
         ggml_backend_tensor_get(p.out, out.data() + (size_t) p.off*H*D, 0, ggml_nbytes(p.out));
     }
 
+    // ★ CACHE-CONTENT CHECK, COVERAGE DERIVED FROM THE READ'S ADDRESS RANGE.
+    //
+    // My earlier write gate reported "384 blocks, 0 mismatched" and it was TRUE -- it validated a
+    // region NARROWER than what the attend pass consumes, which is exactly how a coverage bug
+    // survives a passing gate. So this walks EVERY (token, head) row the read can address under the
+    // current geometry, reads the cache back, dequantises on the host and compares against the
+    // values the write was handed. No chosen sample, no chosen block.
+    //
+    // It splits the remaining search in one run: rows wrong in the cache means the WRITE is
+    // corrupting (and names which rows); rows right means the write is fine and the READ addresses
+    // something else. Those two produce an IDENTICAL output signature, which is what made the
+    // retracted decode-dequant claim look plausible.
+    if (getenv("DS4P_TEST_CACHECHK")) {
+        const size_t row_bytes = ggml_row_size(kv_type, D);
+        std::vector<uint8_t> raw(row_bytes);
+        std::vector<float>   got(D);
+        // q8_0 error is bounded by dq/2 = amax/254, ~1e-3 at these input magnitudes.
+        const double tol = (kv_type == GGML_TYPE_Q8_0) ? 3e-3 : 1e-3;
+        int bad_k = 0, bad_v = 0, first_bad = -1;
+        double worst = 0.0;
+
+        for (int t = 0; t < N; ++t) {
+            const int blk = t / BS, tib = t % BS;
+            for (int h = 0; h < HKV; ++h) {
+                for (int which = 0; which < 2; ++which) {   // 0 = K, 1 = V
+                    const size_t off = (size_t) blk*cache->nb[3]
+                                     + (size_t) (which ? HKV + h : h)*cache->nb[2]
+                                     + (size_t) tib*cache->nb[1];
+                    ggml_backend_tensor_get(cache, raw.data(), off, row_bytes);
+                    if (kv_type == GGML_TYPE_Q8_0) {
+                        const int nbk = D / (int) ggml_blck_size(GGML_TYPE_Q8_0);
+                        for (int b = 0; b < nbk; ++b) {
+                            const uint8_t * bp = raw.data() + (size_t) b*ggml_type_size(GGML_TYPE_Q8_0);
+                            const float d = ggml_fp16_to_fp32(*(const ggml_fp16_t *) bp);
+                            const int8_t * qs = (const int8_t *) (bp + sizeof(ggml_fp16_t));
+                            for (int j = 0; j < 32; ++j) { got[b*32 + j] = d * (float) qs[j]; }
+                        }
+                    } else {
+                        const ggml_fp16_t * hp = (const ggml_fp16_t *) raw.data();
+                        for (int d = 0; d < D; ++d) { got[d] = ggml_fp16_to_fp32(hp[d]); }
+                    }
+                    for (int d = 0; d < D; ++d) {
+                        const double want = which ? val_v(t, h, d) : val_k(t, h, d);
+                        const double err  = fabs(want - got[d]);
+                        if (err > worst) { worst = err; }
+                        if (err > tol) {
+                            if (which) { ++bad_v; } else { ++bad_k; }
+                            if (first_bad < 0) { first_bad = t; }
+                            break;   // one strike per row
+                        }
+                    }
+                }
+            }
+        }
+        printf("   [cachechk %-5s D=%3d N=%d NB=%d] bad_K_rows=%d bad_V_rows=%d of %d each"
+               " | first_bad_token=%d worst=%.3e\n",
+               ggml_type_name(kv_type), D, N, NB, bad_k, bad_v, N*HKV, first_bad, worst);
+    }
+
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return out;
