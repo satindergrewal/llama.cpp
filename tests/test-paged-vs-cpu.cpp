@@ -125,7 +125,7 @@ int main() {
     // 256 added: Ornith-9B has head_dim=256 and the capability predicate was refusing it on a
     // hardcoded {64,128} allow-list. NPT = (D+31)/32 with float qv[8] means D<=256 is the
     // kernel's real ceiling -- so 256 must be TESTED before the predicate is widened to admit it.
-    const int dims[] = { 64, 96, 128, 192, 256 };
+    const int dims[] = { 64, 96, 128, 192, 256, 512 };   // 512: gemma4 n_embd_head
     int n_fail = 0;
 
     // ⚠ WAS `di < 4` -- a HARDCODED bound beside a sized array. Adding 256 to dims[] silently did

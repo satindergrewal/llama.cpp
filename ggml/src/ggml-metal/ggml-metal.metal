@@ -3314,7 +3314,12 @@ kernel void kernel_paged_attn_f32(
     const uint sg   = tpitg / 32;
     const uint lane = tpitg % 32;
 
-    float qv[8]; float accv[8];
+    // ★ D CEILING RAISED 256 -> 512. NPT = (D+31)/32 indexes these, so the array length IS the
+    // head_dim ceiling: 8 -> 256, 16 -> 512. Gemma4 is n_embd_head 512 and every one of its layers
+    // was refused by paged_layer_supported for exactly this reason -- a real kernel limit, not a
+    // plumbing gap. Costs 16 extra floats per thread on the widest models and nothing on narrow
+    // ones, since the loops run to NPT, not to the array length.
+    float qv[16]; float accv[16];
     for (int i = 0; i < NPT; ++i) {
         const int d = (int) lane + i*32;
         qv[i] = (d < D) ? q[q_off + d] : 0.0f;

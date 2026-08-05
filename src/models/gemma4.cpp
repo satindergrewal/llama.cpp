@@ -1,4 +1,6 @@
 #include "models.h"
+#include "../llama-kv-cache-paged.h"
+#include "../llama-kv-cache-iswa.h"
 
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
@@ -236,11 +238,26 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             cb(Kcur, "Kcur_pos", il);
 
+            // ★ PAGED CONSUMER (generic helper, 78a397d1). visibility_window = n_swa on SWA
+            // layers -- the paged kernel already implements windowed attention, which is why SWA
+            // needed only bring-up, not a new kernel.
+            // NOTE: this arch passes `wo` INTO build_attn, so the paged branch applies it itself.
+            const auto * pg_ctx = inp_attn->mctx ? inp_attn->mctx->get_attn_paged() : nullptr;
+            ggml_tensor * cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur,
+                    hparams.f_attention_scale, il,
+                    hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
+            if (cur_pg != nullptr) {
+                cur = build_lora_mm(model.layers[il].wo, cur_pg, model.layers[il].wo_s);
+                cb(cur, "attn_out_paged", il);
+            } else {
             cur = build_attn(inp_attn, model.layers[il].wo,
                     nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     hparams.f_attention_scale, il);
+            }
         } else {
-            // reuse KV cache of earlier layers
+            // reuse KV cache of earlier layers -- DELIBERATELY NOT PAGED. This layer supplies no
+            // new K/V (Qcur only), and the paged op FUSES the KV write, so it has nothing to
+            // write and no slots of its own. Wiring it would be pattern-matching the branch above.
             cur = build_attn(inp_attn,
                     model.layers[il].wo, nullptr, model.layers[il].wo_s,
                     Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);

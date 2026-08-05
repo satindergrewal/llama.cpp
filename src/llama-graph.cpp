@@ -3815,13 +3815,25 @@ bool llm_graph_context::paged_cache_type_supported(ggml_type type, bool allow_qu
 }
 
 bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context * pctx, int il) const {
+    // ⚠ Each rejection names its REASON. The first version returned a bare false and the caller
+    // logged "layer N fails the paged capability contract" -- which told me 90 layers were refused
+    // on gemma and nothing about which condition. A refusal that does not say why is a marker that
+    // cannot be read for the case you need it for.
+    const auto reject = [&](const char * why) {
+        static const char * last = nullptr;
+        if (why != last) { last = why;
+            LLAMA_LOG_INFO("%s: paged layer refused: %s\n", __func__, why);
+        }
+        return false;
+    };
+
     if (pctx == nullptr) {
         return false;
     }
 
     ggml_tensor * kv = pctx->get_k(il);
     if (kv == nullptr) {
-        return false;
+        return reject("no paged KV tensor for this layer (filtered out, or pool smaller than n_layer)");
     }
 
     const int64_t head_dim = hparams.n_embd_head_v(il);
@@ -3838,17 +3850,24 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
     // `di < 4` loop bound that had been silently skipping it while printing ALL PASSED.)
     //
     // The real contract is: a multiple of 32, at most 256.
-    if (head_dim <= 0 || head_dim > 256 || (head_dim % 32) != 0) {
-        return false;
+    // Ceiling raised 256 -> 512 with the kernel (float qv[16], NPT = (D+31)/32). Verified before
+    // widening, same order as D=256: test-paged-vs-cpu covers 512 against the CPU reference and
+    // passes at nmse ~8e-15. Widening the predicate first would have been a claim, not a fix.
+    if (head_dim <= 0 || head_dim > 512 || (head_dim % 32) != 0) {
+        return reject("head_dim outside the kernel contract (need >0, <=512, multiple of 32)");
     }
 
     if (hparams.n_head_kv(il) == 0 || hparams.n_head(il) % hparams.n_head_kv(il) != 0) {
-        return false;
+        return reject("GQA ratio not an integer (n_head % n_head_kv != 0)");
     }
 
     const bool allow_quant = getenv("LLAMA_BANDED_QUANT_KV") != nullptr;
 
-    return paged_cache_type_supported(kv->type, allow_quant);
+    if (!paged_cache_type_supported(kv->type, allow_quant)) {
+        return reject("paged KV cache type not supported by the kernel (f16/bf16/f32, or q8_0 with LLAMA_BANDED_QUANT_KV)");
+    }
+
+    return true;
 }
 
 // ★ Generic paged consumer -- see the header. Ported from the inkling.cpp block that was the only
