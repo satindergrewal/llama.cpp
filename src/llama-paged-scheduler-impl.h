@@ -43,6 +43,7 @@ class llama_paged_scheduler_impl {
     bool check_deadlock(uint32_t n_candidates, uint32_t n_swapped, uint32_t n_waiting) const;
     bool check_livelock(uint32_t n_swapped, uint32_t prev_n_swapped);
 
+  public:
     // ★ DEDICATED ABORT CHANNEL. on_finish is GENERIC -- it fires for normal completions too, and
     // request_id IS the slot id, which the server REUSES. So a drain keyed on on_finish cannot tell
     // "the old group for slot 0 finished" from "the request currently on slot 0 was killed", and it
@@ -50,6 +51,8 @@ class llama_paged_scheduler_impl {
     // finish() already warns about exactly this ("a new request may already have reused this id").
     // Only capacity terminations land here.
     std::vector<int32_t> terminated_ids;
+
+  private:
 
     void set_running(llama_sequence_group_ptr group);
     void set_swapped(llama_sequence_group_ptr group);
