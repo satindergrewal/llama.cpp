@@ -32,7 +32,8 @@ static float val_r(int e, int h, int tok)  { return 0.50f * cosf(0.8f*e + 0.6f*h
 
 // Run the paged op once on `backend` and return the output, so the caller can run the same
 // thing twice and diff it.
-static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel, int64_t window) {
+static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel, int64_t window,
+                                    ggml_type kv_type = GGML_TYPE_F16) {
     const int H   = 4;    // query heads
     const int HKV = 2;    // kv heads (GQA 2:1)
     const int E   = 8;    // rel_extent
@@ -53,7 +54,7 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
     ggml_tensor * q_p   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H,   N);
     ggml_tensor * k_new = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, HKV, N);
     ggml_tensor * v_new = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, HKV, N);
-    ggml_tensor * cache = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, BS, 2*HKV, NB);
+    ggml_tensor * cache = ggml_new_tensor_4d(ctx, kv_type, D, BS, 2*HKV, NB);
     ggml_tensor * btab  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, NB, 1);
     ggml_tensor * slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
     ggml_tensor * clens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
@@ -157,6 +158,46 @@ int main() {
             n_fail += ok ? 0 : 1;
         }
     }
+
+    // ★ FULL-PATH q8_0 ARM. Both sides now quantise with IDENTICAL arithmetic (the CPU reference's
+    // quant_row mirrors kernel_paged_attn_write_q8_0), so this keeps the SAME 2e-3 bar as every
+    // f16 case. No loosened tolerance -- a gate widened to swallow ~8e-3 of quantisation error
+    // would also pass a genuinely broken kernel.
+    if (!same) {
+        for (int cse = 0; cse < 3; ++cse) {
+            const bool    with_rel = cse != 2;
+            const int64_t window   = (cse == 0) ? 0 : 8;
+
+            const std::vector<float> a = run_paged(backend, 128, with_rel, window, GGML_TYPE_Q8_0);
+            const std::vector<float> b = run_paged(cpu,     128, with_rel, window, GGML_TYPE_Q8_0);
+            GGML_ASSERT(a.size() == b.size());
+
+            double max_abs = 0.0, sum_sq = 0.0, ref_sq = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                const double d = (double) a[i] - b[i];
+                max_abs = fabs(d) > max_abs ? fabs(d) : max_abs;
+                sum_sq += d*d;
+                ref_sq += (double) b[i]*b[i];
+            }
+            const double nmse = ref_sq > 0 ? sum_sq/ref_sq : sum_sq;
+            const bool ok = max_abs < 2e-3 && nmse < 1e-6;
+
+            // Which SIDE is bad? nmse=nan with a finite max_abs means NaNs, not zeros -- and a
+            // verdict that cannot say which side failed sends you diagnosing the wrong backend.
+            int nan_a = 0, nan_b = 0, nz_a = 0, nz_b = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                if (std::isnan(a[i])) ++nan_a; else if (a[i] != 0.0f) ++nz_a;
+                if (std::isnan(b[i])) ++nan_b; else if (b[i] != 0.0f) ++nz_b;
+            }
+            printf("   [diag] metal: nan=%d nonzero=%d | cpu: nan=%d nonzero=%d | n=%zu\n",
+                   nan_a, nz_a, nan_b, nz_b, a.size());
+
+            printf("q8_0 D=128 case %c: with_rel=%d window=%lld max_abs=%.3e nmse=%.3e %s\n",
+                   'A' + cse, with_rel ? 1 : 0, (long long) window, max_abs, nmse, ok ? "PASS" : "FAIL");
+            n_fail += ok ? 0 : 1;
+        }
+    }
+
 
     ggml_backend_free(cpu);
     ggml_backend_free(backend);

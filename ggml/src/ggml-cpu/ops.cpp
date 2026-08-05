@@ -12260,13 +12260,22 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
             for (int h_id = 0; h_id < n_heads_kv; ++h_id) {
                 const size_t k_cache_byte_offset = ((size_t) block_id * stride_block + (size_t) h_id * stride_head +
                                                     (size_t) token_in_block * stride_token) *
-                                                   sizeof(ggml_fp16_t);
+                                                   kv_elt_size;
                 const size_t v_cache_byte_offset =
                     ((size_t) block_id * stride_block + (size_t) (n_heads_kv + h_id) * stride_head +
                      (size_t) token_in_block * stride_token) *
                     sizeof(ggml_fp16_t);
                 const size_t input_offset = (size_t) token_batch_idx * n_heads_kv * head_dim + (size_t) h_id * head_dim;
 
+                if (kv_is_q8) {
+                    // Quantise from the f32 source directly -- going via f16 first would add a
+                    // rounding step the Metal kernel does not perform, and the two must agree
+                    // EXACTLY for the full-path gate to keep its 2e-3 bar.
+                    quant_row(&k_data[input_offset], qbuf_w.data());
+                    ggml_backend_tensor_set((ggml_tensor *) kv_cache_mut, qbuf_w.data(), k_cache_byte_offset, head_bytes);
+                    quant_row(&v_data[input_offset], qbuf_w.data());
+                    ggml_backend_tensor_set((ggml_tensor *) kv_cache_mut, qbuf_w.data(), v_cache_byte_offset, head_bytes);
+                } else {
                 for (int d_id = 0; d_id < head_dim; ++d_id) {
                     staging_write_k[d_id] = GGML_FP32_TO_FP16(k_data[input_offset + d_id]);
                     staging_write_v[d_id] = GGML_FP32_TO_FP16(v_data[input_offset + d_id]);
@@ -12275,6 +12284,7 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
                                         head_bytes);
                 ggml_backend_tensor_set((ggml_tensor *) kv_cache_mut, staging_write_v.data(), v_cache_byte_offset,
                                         head_bytes);
+                }
             }
         }
     }
@@ -12322,15 +12332,24 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
                         const size_t k_byte_offset =
                             ((size_t) physical_block * stride_block + (size_t) kv_h * stride_head +
                              (size_t) token_in_block * stride_token) *
-                            sizeof(ggml_fp16_t);
+                            kv_elt_size;
                         const size_t v_byte_offset =
                             ((size_t) physical_block * stride_block + (size_t) (n_heads_kv + kv_h) * stride_head +
                              (size_t) token_in_block * stride_token) *
-                            sizeof(ggml_fp16_t);
+                            kv_elt_size;
 
                         // Fetch K and V from cache (this might involve device to host transfers)
+                        if (kv_is_q8) {
+                            // Dequantise INTO the existing f16 staging: everything below this
+                            // point is unchanged and never learns the cache was quantised.
+                            ggml_backend_tensor_get(kv_cache, qbuf_k.data(), k_byte_offset, head_bytes);
+                            ggml_backend_tensor_get(kv_cache, qbuf_v.data(), v_byte_offset, head_bytes);
+                            deq_row(qbuf_k.data(), staging_k.data());
+                            deq_row(qbuf_v.data(), staging_v.data());
+                        } else {
                         ggml_backend_tensor_get(kv_cache, staging_k.data(), k_byte_offset, head_bytes);
                         ggml_backend_tensor_get(kv_cache, staging_v.data(), v_byte_offset, head_bytes);
+                        }
 
                         // QK dot product
                         float qk = 0.0f;
