@@ -124,7 +124,7 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
 // Attention is causal, so the concatenation MUST equal the single-call result exactly -- same
 // arithmetic, same order, only the write schedule differs. Any divergence is the incremental path.
 static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool with_rel, int64_t window,
-                                          ggml_type kv_type, int n1) {
+                                          ggml_type kv_type, int n1, int n_dec = 1) {
     const int H   = 4;
     const int HKV = 2;
     const int E   = 8;
@@ -132,9 +132,15 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
     const int NB  = getenv("DS4P_TEST_NB") ? atoi(getenv("DS4P_TEST_NB")) : 2;
     const int N   = BS*NB - BS/2;
     const float scale = 1.0f / sqrtf((float) D);
-    const int   n2    = N - n1;
+    // n_dec sequential single-token DECODE calls after the prefill. n_dec >= 2 is the shape the
+    // server fails on and this harness could not previously express: a token written by one decode
+    // dispatch and read back by the NEXT one. With n_dec == 1 the decode reads only what it just
+    // wrote plus prefill, which passes.
+    const int   n_parts = 1 + n_dec;
+    const int   n_pre   = N - n_dec;   // prefill token count
+    GGML_ASSERT(n_pre >= 1 && n1 <= N);
 
-    ggml_init_params ip = { ggml_tensor_overhead()*96 + ggml_graph_overhead()*2, nullptr, true };
+    ggml_init_params ip = { ggml_tensor_overhead()*32*(size_t)(n_parts+2) + ggml_graph_overhead()*(size_t)n_parts, nullptr, true };
     ggml_context * ctx = ggml_init(ip);
 
     ggml_tensor * cache = ggml_new_tensor_4d(ctx, kv_type, D, BS, 2*HKV, NB);
@@ -143,9 +149,14 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
     struct part {
         int n, off;
         ggml_tensor *q, *k, *v, *slots, *clens, *boffs, *blens, *rel, *out;
-    } P[2] = { { n1, 0, }, { n2, n1, } };
+    };
+    std::vector<part> P;
+    P.push_back({ n_pre, 0, nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr });
+    for (int d = 0; d < n_dec; ++d) {
+        P.push_back({ 1, n_pre + d, nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr });
+    }
 
-    for (int s = 0; s < 2; ++s) {
+    for (int s = 0; s < n_parts; ++s) {
         part & p = P[s];
         p.q     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, H,   p.n);
         p.k     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, HKV, p.n);
@@ -169,7 +180,7 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
 
     std::vector<float> out((size_t) N*H*D);
 
-    for (int s = 0; s < 2; ++s) {
+    for (int s = 0; s < n_parts; ++s) {
         part & p = P[s];
         std::vector<float> tq((size_t) p.n*H*D), tk((size_t) p.n*HKV*D), tv((size_t) p.n*HKV*D);
         for (int t = 0; t < p.n; ++t) {
@@ -363,12 +374,18 @@ int main() {
             // half at six sites with no dequant, so a quantised cache was garbage there and no
             // amount of widening head_dim or block_size could ever have shown it. The gate covered
             // one of the kernel's two branches and its verdict named neither.
-            const int splits[] = { N/2, N-1 };
-            for (size_t si = 0; si < sizeof(splits)/sizeof(splits[0]); ++si) {
-            const int n1 = splits[si];
+            // n_dec = number of TRAILING single-token decode dispatches.
+            //   1 -> the decode reads only prefill-written tokens plus the one it just wrote
+            //   2 -> the second decode reads a token a PREVIOUS DECODE DISPATCH wrote  <-- the
+            //        shape the server actually fails on, and the one n_dec=1 cannot express
+            //   3 -> confirms it is not specific to the first repeat
+            const int decs[] = { 1, 2, 3 };
+            for (size_t si = 0; si < sizeof(decs)/sizeof(decs[0]); ++si) {
+            const int n_dec = decs[si];
+            const int n1    = N - n_dec;
 
             const std::vector<float> whole = run_paged      (backend, D, true, 0, kts[ki]);
-            const std::vector<float> split = run_paged_split(backend, D, true, 0, kts[ki], n1);
+            const std::vector<float> split = run_paged_split(backend, D, true, 0, kts[ki], n1, n_dec);
 
             double max_abs = 0.0;
             for (size_t i = 0; i < whole.size() && i < split.size(); ++i) {
@@ -378,10 +395,8 @@ int main() {
             // Same arithmetic in the same order -- only the WRITE SCHEDULE differs, so this is an
             // exactness check, not a tolerance. Anything above f32 noise is the incremental path.
             const bool ok = max_abs < 1e-5;
-            printf("incremental %-5s D=%3d split=%2d/%d%s: max_abs=%.3e %s\n",
-                   ggml_type_name(kts[ki]), D, n1, N,
-                   (N - n1) == 1 ? " [DECODE n_tokens=1]" : " [prefill]",
-                   max_abs, ok ? "PASS" : "FAIL");
+            printf("incremental %-5s D=%3d prefill=%2d + %d decode(s)/%d: max_abs=%.3e %s\n",
+                   ggml_type_name(kts[ki]), D, n1, n_dec, N, max_abs, ok ? "PASS" : "FAIL");
             n_fail += ok ? 0 : 1;
             }
         }
