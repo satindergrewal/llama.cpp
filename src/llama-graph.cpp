@@ -965,34 +965,84 @@ void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch* ubatch) {
         }
     }
 
-    int32_t base = INT32_MAX;
-    if (n_seq > 0 && seq_ids && offs_all) {
-        for (int32_t s = 0; s < n_seq; ++s) {
-            const int32_t sid = seq_ids[s];
-            if (sid >= 0 && sid < LLAMA_MAX_SEQ && present[sid] && offs_all[s] < base) {
-                base = offs_all[s];
-            }
-        }
-    }
-
-    std::vector<int32_t> offs_r, lens_r;
+    // ⚠⚠ AND A SEQUENCE MAY BE SPLIT ACROSS UBATCHES -- "present" is not enough.
+    //
+    // The previous version of this fix shifted by base = min(offs) over PRESENT sequences and zeroed
+    // the ABSENT ones. That is correct when each ubatch holds whole sequences, and it is WRONG the
+    // moment a co-batched ubatch carries only PART of one. Measured, from ARGDUMP:
+    //
+    //   corrupt rep   n_tokens=28  batch_offs=[0,15]  batch_lens=[15,14]   sum = 29   <- 28 != 29
+    //   clean rep     n_tokens=14  batch_offs=[0,0]   batch_lens=[14,0]    sum = 14
+    //
+    // Both sequences are present in the corrupt case, so base = min(0,15) = 0 and NOTHING was
+    // re-based, while the lengths still described the whole 29-token batch. The kernel then assigned
+    // gtok 0..14 to seq 0 and 15..27 to seq 1, so every token from index 14 on was attributed to the
+    // wrong sequence and read the wrong block -- one token of skew, and a sequence loses its own KV.
+    // That is the ~40% residual: the corrupt runs are exactly the ones where the scheduler co-batches
+    // (measured 3750 dispatches when split vs 2910 when co-batched, a perfect classifier).
+    //
+    // ★ SO DERIVE EVERYTHING FROM THE UBATCH, and never from the batch-level arrays. Counting the
+    // tokens actually present makes the invariant sum(lens) == n_tokens true by CONSTRUCTION rather
+    // than by assumption, for whole sequences, partial sequences and any mix of them.
+    std::vector<int32_t> offs_r, lens_r, slots_r;
     const int32_t * offs_use  = offs_all;
     const int32_t * lens_use  = lens_all;
     const int32_t * slots_use = slots_all;
 
-    if (base != INT32_MAX && offs_all && lens_all) {
-        offs_r.assign(offs_all, offs_all + n_seq);
-        lens_r.assign(lens_all, lens_all + n_seq);
+    if (n_seq > 0 && seq_ids && offs_all && lens_all && ubatch->seq_id) {
+        int32_t cnt[LLAMA_MAX_SEQ]   = { 0 };
+        int32_t first[LLAMA_MAX_SEQ];
+        for (int32_t i = 0; i < LLAMA_MAX_SEQ; ++i) { first[i] = -1; }
+
+        for (uint32_t t = 0; t < ubatch->n_tokens; ++t) {
+            if (!ubatch->seq_id[t]) { continue; }
+            const int32_t sid = (int32_t) ubatch->seq_id[t][0];
+            if (sid < 0 || sid >= LLAMA_MAX_SEQ) { continue; }
+            if (first[sid] < 0) { first[sid] = (int32_t) t; }
+            cnt[sid]++;
+        }
+
+        offs_r.assign(n_seq, 0);
+        lens_r.assign(n_seq, 0);
         for (int32_t s = 0; s < n_seq; ++s) {
             const int32_t sid = seq_ids[s];
-            const bool in_ubatch = (sid >= 0 && sid < LLAMA_MAX_SEQ && present[sid]);
-            if (in_ubatch) { offs_r[s] = offs_all[s] - base; }
-            else           { lens_r[s] = 0; offs_r[s] = 0; }  // absent -> can never match the scan
+            if (sid >= 0 && sid < LLAMA_MAX_SEQ && cnt[sid] > 0) {
+                offs_r[s] = first[sid];   // where this sequence starts IN THIS UBATCH
+                lens_r[s] = cnt[sid];     // how many of its tokens are IN THIS UBATCH
+            }
+            // else stays {0,0}: an empty range can never match the kernel's scan
         }
         offs_use = offs_r.data();
         lens_use = lens_r.data();
-        if (slots_all) {
-            slots_use = slots_all + base;   // write_slots[0] is this ubatch's first token
+
+        // write_slots is indexed by ABSOLUTE batch position, so a contiguous slice only works when
+        // the ubatch is a clean prefix of one sequence. Build it per token instead: a token's index
+        // within its sequence's contribution is (pos - first_new_pos), and first_new_pos is
+        // context_len - batch_len for that sequence.
+        const int32_t * ctx_lens = mctx->get_context_lens();
+        if (slots_all && ctx_lens && ubatch->pos) {
+            int32_t slot_of_seq[LLAMA_MAX_SEQ];
+            int32_t ctxl_of_seq[LLAMA_MAX_SEQ];
+            for (int32_t i = 0; i < LLAMA_MAX_SEQ; ++i) { slot_of_seq[i] = -1; ctxl_of_seq[i] = 0; }
+            for (int32_t s = 0; s < n_seq; ++s) {
+                const int32_t sid = seq_ids[s];
+                if (sid >= 0 && sid < LLAMA_MAX_SEQ) { slot_of_seq[sid] = s; ctxl_of_seq[sid] = ctx_lens[s]; }
+            }
+            slots_r.assign(ubatch->n_tokens, 0);
+            bool ok = true;
+            for (uint32_t t = 0; t < ubatch->n_tokens && ok; ++t) {
+                if (!ubatch->seq_id[t]) { ok = false; break; }
+                const int32_t sid = (int32_t) ubatch->seq_id[t][0];
+                if (sid < 0 || sid >= LLAMA_MAX_SEQ || slot_of_seq[sid] < 0) { ok = false; break; }
+                const int32_t s        = slot_of_seq[sid];
+                const int32_t first_np = ctxl_of_seq[sid] - lens_all[s];   // first NEW pos this batch
+                const int32_t idx      = offs_all[s] + ((int32_t) ubatch->pos[t] - first_np);
+                if (idx < 0) { ok = false; break; }
+                slots_r[t] = slots_all[idx];
+            }
+            // ⚠ Fall back to the old slice rather than write a half-built table: a wrong write_slots
+            // corrupts KV, which is worse than the mapping this replaces.
+            if (ok) { slots_use = slots_r.data(); }
         }
     }
 

@@ -438,6 +438,27 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
         return;
     }
 
+    // ★ DS4P_SYNC_ON_FREE -- test for the #1(c) race.
+    //
+    // Blocks are returned to the pool the moment a request finishes, but nothing waits for the GPU
+    // work referencing them to RETIRE. Checkout is LIFO, so the block just freed is literally the
+    // next one handed out: the incoming request starts writing its KV into a block while the
+    // outgoing request's in-flight writes are still landing in it.
+    //
+    // This is the only shape left. The kernel receives BYTE-IDENTICAL arguments on a corrupt rep and
+    // a clean one (4201 ARGDUMP lines, no diff), so the host bookkeeping is correct and the
+    // divergence is in the DATA. A cold server has never freed a block, which is why it is 0/24.
+    // GGML_METAL_CONCURRENCY_DISABLE did not help because it serialises ops WITHIN a graph, not
+    // across command buffers belonging to different requests; FIFO did not help because delaying
+    // reuse is not the same as WAITING for completion.
+    // ⚠ The marker is NOT decoration. A null backend handle would make both calls no-ops, and then
+    // "sync changed nothing" would mean "the sync never happened" -- an absence read as a result.
+    if (getenv("DS4P_SYNC_ON_FREE") != nullptr) {
+        LLAMA_LOG_ERROR("DS4P-SYNC-ON-FREE gpu=%d cpu=%d\n", gpu_backend != nullptr, cpu_backend != nullptr);
+        if (gpu_backend) { ggml_backend_synchronize(gpu_backend); }
+        if (cpu_backend) { ggml_backend_synchronize(cpu_backend); }
+    }
+
     // ⚠ request_id IS the slot id, and the server REUSES slot ids. A group that finishes AFTER a new
     // request has already taken the same id must NOT wipe the new request's mapping. The scheduler
     // guards the identical operation (llama-paged-scheduler-impl.cpp:250, "a new request may already
