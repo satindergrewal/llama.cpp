@@ -44,6 +44,16 @@ class llama_block_manager {
 
     uint32_t get_ref_count(uint32_t block) const;
 
+    // Blocks a request can ACTUALLY obtain: total minus the watermark safety reserve.
+    // ⚠ The distinction is not academic. With -ngpub 8 and the default 0.05 watermark,
+    // ceil(8*0.05) = 1 block is permanently reserved, so usable capacity is 7 blocks -- and a
+    // sequence that reaches exactly 7 blocks of context can never obtain an 8th, forever. A guard
+    // written against the TOTAL pool does not fire, because the sequence never exceeds the total.
+    uint32_t get_usable_gpu_blocks() const {
+        return total_num_gpu_blocks > watermark_gpu_safety_num_blocks
+             ? total_num_gpu_blocks - watermark_gpu_safety_num_blocks : 0;
+    }
+
     void release_gpu_blocks(const physical_block_ids & freed_blocks);
     void release_cpu_blocks(const physical_block_ids & freed_blocks);
 

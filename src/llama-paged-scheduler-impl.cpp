@@ -268,6 +268,37 @@ void llama_paged_scheduler_impl::swap_out_or_recompute(llama_sequence_group_ptr 
 
     const int32_t rid = group_ptr->request_id;
 
+    // ★ UNSATISFIABLE-REQUEST GUARD. Measured: -ngpub 8 --kv-block-size 16 gives 128 tokens of GPU
+    // capacity for a ~280-token job, and the scheduler LIVELOCKED -- 2,085,089 CPU->GPU swaps and
+    // 2,085,090 GPU->CPU, a tight alternation with no forward progress, ending in the residency-set
+    // teardown assert. The loop lives in process_swapped_list: swap_in succeeds, the growth
+    // allocation fails, the group is swapped back out to keep its table CPU-consistent, break for
+    // FCFS, repeat forever.
+    //
+    // ★ EVERY DECISION IN THAT LOOP IS INDIVIDUALLY CORRECT AND DOCUMENTED. The swap_out prevents a
+    // GPU-id/CPU-id underflow (there is a comment recording the measured OOB at pos 192); the break
+    // preserves FCFS; the growth check exists because a swap-returned table is one block short.
+    // Three right local choices compose into an infinite loop because NOTHING ASKS WHETHER THE ROUND
+    // TRIP ACHIEVED ANYTHING. A missing global invariant, not a bad line.
+    //
+    // Neither swapping nor recomputing can help once a sequence outgrows the ENTIRE pool: with one
+    // request it is evicting itself to make room for itself, and after a recompute it re-grows into
+    // the same wall. Retrying forever is the wrong answer to an impossible request -- say so, with
+    // the numbers.
+    const uint64_t pool_tokens = (uint64_t) kv_cache_manager->get_usable_gpu_blocks() * block_size;
+    if ((uint64_t) group_ptr->n_past + 1 > pool_tokens) {
+        LLAMA_LOG_ERROR("%s: request %d needs %llu tokens of KV but the GPU block pool holds at most "
+                        "%llu (%u blocks x %u). No eviction or recompute can create capacity that "
+                        "does not exist -- terminating the request instead of retrying forever.\n",
+                        __func__, rid, (unsigned long long) (group_ptr->n_past + 1),
+                        (unsigned long long) pool_tokens,
+                        kv_cache_manager->get_usable_gpu_blocks(), block_size);
+        // finish() asserts the status first, then frees blocks and erases our id mapping.
+        group_ptr->status = llama_sequence_group_status::FINISHED;
+        finish(*group_ptr);
+        return;
+    }
+
     const bool swap_ok = kv_cache_manager->swap_out(*group_ptr);
     if (swap_ok) {
         LLAMA_LOG_DEBUG("%s: (swapped_out) request_id=%d was swapped out to make room.\n", __func__, rid);
@@ -381,6 +412,38 @@ void llama_paged_scheduler_impl::process_swapped_list(llama_sequence_group_raw_l
         // blocks, swap-returned group at 12, OOB at pos 192). Same growth rule as the
         // running list -- no capacity, no promotion.
         if (group->n_past + 1 > group->block_table.size() * block_size) {
+            // ★ THE LIVELOCK EXITS HERE, and it must be caught on THIS path specifically. My first
+            // guard went into swap_out_or_recompute -- which this code NEVER REACHES when the CPU
+            // pool has room, because the swap_out below succeeds and we break. The fix was correct
+            // and unreachable, and the re-run proved it: still 574,155 swaps, still hanging. A fix
+            // placed on the path you assumed rather than the path measured is not a fix.
+            //
+            // When the sequence has outgrown the ENTIRE GPU pool, this round trip can never make
+            // progress: swap_in, fail to grow, swap back out, break, repeat. Route it to
+            // swap_out_or_recompute, whose capacity guard terminates it with the numbers.
+            const uint64_t pool_tokens = (uint64_t) kv_cache_manager->get_usable_gpu_blocks() * block_size;
+            // ⚠ INSTRUMENT, DO NOT GUESS. Two guards written from my model of the trigger condition
+            // failed to fire while the livelock continued (574k then 757k swaps). Rather than write
+            // a third, print the actual values at the loop point -- the same move that turned the
+            // quantised-KV hunt from four hypotheses into a lookup.
+            {
+                static int n = 0;
+                if (++n <= 20) {
+                    LLAMA_LOG_INFO("%s: DS4P-THRASH n=%d rid=%d n_past=%u table_blocks=%zu "
+                                   "block_size=%u pool_gpu_blocks=%u pool_tokens=%llu\n",
+                                   __func__, n, group->request_id, group->n_past,
+                                   group->block_table.size(), block_size,
+                                   kv_cache_manager->get_num_gpu_blocks(),
+                                   (unsigned long long) pool_tokens);
+                }
+            }
+            if ((uint64_t) group->n_past + 1 > pool_tokens) {
+                llama_sequence_group_ptr doomed = std::move(*it);
+                it = swapped.erase(it);
+                swap_out_or_recompute(std::move(doomed));
+                continue;
+            }
+
             if (!kv_cache_manager->allocate(1, *group)) {
                 // the group is ALREADY swapped in (its table now holds GPU ids). Leaving it
                 // in `swapped` would re-enter swap_in next tick and do_block_copy would

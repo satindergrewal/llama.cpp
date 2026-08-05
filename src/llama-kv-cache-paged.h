@@ -85,6 +85,8 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     void     set_paged_batch_info(const llama_paged_batch_info * info);
     uint32_t get_num_gpu_blocks() const;
+    // Total minus the watermark reserve -- what a request can actually be given.
+    uint32_t get_usable_gpu_blocks() const { return block_manager.get_usable_gpu_blocks(); }
 
     // DEBUG (fork-residual discriminator): additive checksum of the group's first
     // n_tokens of KV per layer, read back through its block table. Returns layers written.
