@@ -1050,13 +1050,32 @@ void llama_kv_cache_paged::set_seq_max_pos(llama_seq_id seq_id, llama_pos new_ma
 // llama_kv_cache_paged_context
 
 void llama_kv_cache_paged_context::set_batch_data(const llama_paged_batch_info & info) {
-    paged_write_slots   = info.write_slots;
-    paged_seq_ids       = info.seq_ids;
+    // ⚠ COPY, DO NOT ALIAS. llama.h says these arrays "are owned by the scheduler and must remain
+    // valid until the next scheduler step clears them" -- so holding raw pointers means the graph's
+    // set_input() can read arrays the scheduler has already reused or freed. That produces
+    // INTERMITTENT corruption: correct whenever set_input happens to run before the next step,
+    // garbage when it does not, which is exactly the 1-of-3 pattern multislot was showing after the
+    // offsets were re-based correctly. Own the data for as long as this context exists.
+    const int32_t ns = info.n_seq;
+    const int32_t nt = info.n_tokens;
+    const int32_t nb = info.n_blocks_per_seq;
+    auto keep = [](std::vector<int32_t> & dst, const int32_t * src, size_t n) {
+        if (src && n) { dst.assign(src, src + n); } else { dst.clear(); }
+    };
+    keep(own_write_slots,   info.write_slots,   (size_t) nt);
+    keep(own_seq_ids,       info.seq_ids,       (size_t) ns);
+    keep(own_block_table,   info.block_table,   (size_t) ns * (size_t) nb);
+    keep(own_context_lens,  info.context_lens,  (size_t) ns);
+    keep(own_batch_offsets, info.batch_offsets, (size_t) ns);
+    keep(own_batch_lens,    info.batch_lens,    (size_t) ns);
+
+    paged_write_slots   = own_write_slots.empty()   ? nullptr : own_write_slots.data();
+    paged_seq_ids       = own_seq_ids.empty()       ? nullptr : own_seq_ids.data();
     paged_n_seq         = info.n_seq;
-    paged_block_table   = info.block_table;
-    paged_context_lens  = info.context_lens;
-    paged_batch_offsets = info.batch_offsets;
-    paged_batch_lens    = info.batch_lens;
+    paged_block_table   = own_block_table.empty()   ? nullptr : own_block_table.data();
+    paged_context_lens  = own_context_lens.empty()  ? nullptr : own_context_lens.data();
+    paged_batch_offsets = own_batch_offsets.empty() ? nullptr : own_batch_offsets.data();
+    paged_batch_lens    = own_batch_lens.empty()    ? nullptr : own_batch_lens.data();
     n_tokens            = info.n_tokens;
     max_blocks          = info.n_blocks_per_seq;
     batch_size          = info.n_seq;

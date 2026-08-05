@@ -345,6 +345,15 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     int32_t * paged_seq_ids       = nullptr;  // [batch_size] request_id per candidate
     int32_t   paged_n_seq         = 0;
 
+    // OWNING copies of the scheduler's per-batch arrays. The scheduler clears its own on the next
+    // step; aliasing them made set_input() read stale memory intermittently.
+    std::vector<int32_t> own_write_slots;
+    std::vector<int32_t> own_seq_ids;
+    std::vector<int32_t> own_block_table;
+    std::vector<int32_t> own_context_lens;
+    std::vector<int32_t> own_batch_offsets;
+    std::vector<int32_t> own_batch_lens;
+
     int32_t n_tokens   = 0;
     int32_t batch_size = 0;
     int32_t max_blocks = 0;
