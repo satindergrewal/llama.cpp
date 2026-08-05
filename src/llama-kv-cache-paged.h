@@ -309,6 +309,8 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     int32_t * get_context_lens() const;
     int32_t * get_batch_offsets() const;
     int32_t * get_batch_lens() const;
+    int32_t * get_seq_ids() const;
+    int32_t   get_n_seq() const;
 
     void set_n_tokens(int32_t new_n_tokens);
     void set_batch_size(int32_t new_batch_size);
@@ -340,6 +342,8 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     int32_t * paged_context_lens  = nullptr;  // [batch_size]
     int32_t * paged_batch_offsets = nullptr;  // [batch_size]
     int32_t * paged_batch_lens    = nullptr;  // [batch_size]
+    int32_t * paged_seq_ids       = nullptr;  // [batch_size] request_id per candidate
+    int32_t   paged_n_seq         = 0;
 
     int32_t n_tokens   = 0;
     int32_t batch_size = 0;

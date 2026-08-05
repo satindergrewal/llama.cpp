@@ -1051,6 +1051,8 @@ void llama_kv_cache_paged::set_seq_max_pos(llama_seq_id seq_id, llama_pos new_ma
 
 void llama_kv_cache_paged_context::set_batch_data(const llama_paged_batch_info & info) {
     paged_write_slots   = info.write_slots;
+    paged_seq_ids       = info.seq_ids;
+    paged_n_seq         = info.n_seq;
     paged_block_table   = info.block_table;
     paged_context_lens  = info.context_lens;
     paged_batch_offsets = info.batch_offsets;
@@ -1098,6 +1100,14 @@ int32_t llama_kv_cache_paged_context::get_batch_size() const {
 
 int32_t llama_kv_cache_paged_context::get_max_blocks() const {
     return max_blocks;
+}
+
+int32_t * llama_kv_cache_paged_context::get_seq_ids() const {
+    return paged_seq_ids;
+}
+
+int32_t llama_kv_cache_paged_context::get_n_seq() const {
+    return paged_n_seq;
 }
 
 int32_t * llama_kv_cache_paged_context::get_write_slots() const {
@@ -1151,6 +1161,7 @@ void llama_kv_cache_paged::self_drive_release_info() {
     delete[] sd_info.batch_offsets;
     delete[] sd_info.batch_lens;
     delete[] sd_info.prefill_pending;
+    delete[] sd_info.seq_ids;
     sd_info = {};
 }
 
@@ -1167,6 +1178,7 @@ void llama_kv_cache_paged::self_drive_end() {
     delete[] sd_info.batch_offsets;
     delete[] sd_info.batch_lens;
     delete[] sd_info.prefill_pending;
+    delete[] sd_info.seq_ids;
     sd_info = {};
 
     free_blocks(sd_group);
@@ -1302,6 +1314,7 @@ bool llama_kv_cache_paged::self_drive_begin(int32_t n_tokens) {
     sd_info.batch_offsets    = new int32_t[1];
     sd_info.batch_lens       = new int32_t[1];
     sd_info.prefill_pending  = new int32_t[1];
+    sd_info.seq_ids          = new int32_t[1];
 
     for (int32_t b = 0; b < n_blocks; ++b) {
         sd_info.block_table[b] = (int32_t) sd_group.block_table[b];
@@ -1322,6 +1335,7 @@ bool llama_kv_cache_paged::self_drive_begin(int32_t n_tokens) {
     sd_info.batch_offsets[0]   = 0;
     sd_info.batch_lens[0]      = n_tokens;
     sd_info.prefill_pending[0] = 0;
+    sd_info.seq_ids[0]         = sd_group.request_id;
 
     sd_active = true;
     set_paged_batch_info(&sd_info);

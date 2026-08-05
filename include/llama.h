@@ -291,6 +291,11 @@ extern "C" {
         // chunked prefill: 1 = this seq's slice is a mid-prompt chunk that emits no
         // logits; the caller must NOT sample it this step (its sampled slot is ignored)
         int32_t * prefill_pending = NULL; // [n_seq]
+        // request_id (== server slot id) per CANDIDATE index. Needed because a ubatch knows its
+        // seq_id but not which row of these arrays belongs to it: llama_context splits the
+        // scheduler's batch per-sequence, and without this map the graph cannot re-base the
+        // arrays onto the ubatch it is actually dispatching.
+        int32_t * seq_ids        = NULL; // [n_seq]
     } llama_paged_batch_info;
 
     enum llama_model_kv_override_type {

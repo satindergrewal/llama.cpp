@@ -547,6 +547,7 @@ void llama_paged_scheduler_impl::clear_batch(llama_batch & batch) {
     delete[] curr_info.batch_offsets;
     delete[] curr_info.batch_lens;
     delete[] curr_info.prefill_pending;
+    delete[] curr_info.seq_ids;
     curr_info = {};  // reset to defaults
 
     if (batch.n_tokens == 0) {
@@ -659,6 +660,7 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
     curr_info.batch_offsets   = new int32_t[batch_size];
     curr_info.batch_lens      = new int32_t[batch_size];
     curr_info.prefill_pending = new int32_t[batch_size];
+    curr_info.seq_ids         = new int32_t[batch_size];
     LLAMA_LOG_DEBUG("%s: created llama_batch: n_seq=%d, n_tokens=%d, n_blocks_per_seq=%d\n", __func__, curr_info.n_seq,
                     batch.n_tokens, curr_info.n_blocks_per_seq);
 
@@ -714,6 +716,7 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         curr_info.batch_offsets[seq_id]   = token_offset;
         curr_info.batch_lens[seq_id]      = new_tokens;
         curr_info.prefill_pending[seq_id] = mid_prefill ? 1 : 0;
+        curr_info.seq_ids[seq_id]         = group->request_id;
         token_offset += new_tokens;
     }
 }

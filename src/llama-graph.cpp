@@ -923,8 +923,81 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch* ubatch) {
     GGML_ASSERT(ubatch != nullptr);
 
+    // ★★ RE-BASE THE BATCH INFO ONTO THIS UBATCH. This is the seam where the -np>1 corruption lived.
+    //
+    // The scheduler builds ONE batch (say 29 tokens, 2 sequences, batch_offsets = [0,15] -- ABSOLUTE).
+    // llama_memory_hybrid::init_batch then calls balloc.split_seq(), which yields ONE SEQUENCE PER
+    // UBATCH (15 tokens, then 14), each indexed LOCALLY from 0. These arrays used to be copied here
+    // verbatim, so a 14-token dispatch carried offsets spanning 0..28.
+    //
+    // The kernel resolves a token's sequence with
+    //     gtok >= batch_offsets[s] && gtok < batch_offsets[s] + batch_lens[s]
+    // with gtok LOCAL. Every token 0..13 therefore matched s=0 and read block_table row 0 -- the
+    // OTHER sequence's blocks. The write kernels index write_slots[gtok] the same way, so the second
+    // sequence also WROTE its KV into the first sequence's block, destroying it.
+    //
+    // Fix: give this ubatch's sequence offset 0 and length n_tokens, and set every OTHER sequence's
+    // length to 0 so the scan can never match it. block_table rows and context_lens stay indexed by
+    // candidate, so they are already correct and are copied unchanged. write_slots is sliced to this
+    // ubatch. NO KERNEL CHANGE IS NEEDED -- all four consumers (attn read, both write kernels, the
+    // champ mask) are fixed by this one edit, and sum(batch_lens) == n_tokens now holds by
+    // construction, which is what batch_offset_invariant_gate.sh asserts.
+    const int32_t   n_seq    = mctx->get_n_seq();
+    const int32_t * seq_ids  = mctx->get_seq_ids();
+    const int32_t * offs_all = mctx->get_batch_offsets();
+    const int32_t * lens_all = mctx->get_batch_lens();
+    const int32_t * slots_all = mctx->get_write_slots();
+
+    // ⚠ A UBATCH MAY CONTAIN MORE THAN ONE SEQUENCE. split_seq (hybrid path) gives one per ubatch,
+    // but split_simple (the ISWA/SWA path, llama-kv-cache-iswa.cpp:174) does NOT -- it packs a
+    // contiguous token range that can span several. An earlier version of this fix assumed one and
+    // zeroed every other sequence's length; on the SWA path that made the second sequence's tokens
+    // match NO row, the kernel took its `if (seq < 0) return;` early exit, and BOTH sequences came
+    // back as garbage. Handle the general case: shift by the ubatch's base, keep the sequences that
+    // are actually present, and zero only the ones that are not.
+    bool present[LLAMA_MAX_SEQ] = { false };
+    if (ubatch->seq_id) {
+        for (uint32_t t = 0; t < ubatch->n_tokens; ++t) {
+            if (ubatch->seq_id[t]) {
+                const int32_t sid = (int32_t) ubatch->seq_id[t][0];
+                if (sid >= 0 && sid < LLAMA_MAX_SEQ) present[sid] = true;
+            }
+        }
+    }
+
+    int32_t base = INT32_MAX;
+    if (n_seq > 0 && seq_ids && offs_all) {
+        for (int32_t s = 0; s < n_seq; ++s) {
+            const int32_t sid = seq_ids[s];
+            if (sid >= 0 && sid < LLAMA_MAX_SEQ && present[sid] && offs_all[s] < base) {
+                base = offs_all[s];
+            }
+        }
+    }
+
+    std::vector<int32_t> offs_r, lens_r;
+    const int32_t * offs_use  = offs_all;
+    const int32_t * lens_use  = lens_all;
+    const int32_t * slots_use = slots_all;
+
+    if (base != INT32_MAX && offs_all && lens_all) {
+        offs_r.assign(offs_all, offs_all + n_seq);
+        lens_r.assign(lens_all, lens_all + n_seq);
+        for (int32_t s = 0; s < n_seq; ++s) {
+            const int32_t sid = seq_ids[s];
+            const bool in_ubatch = (sid >= 0 && sid < LLAMA_MAX_SEQ && present[sid]);
+            if (in_ubatch) { offs_r[s] = offs_all[s] - base; }
+            else           { lens_r[s] = 0; offs_r[s] = 0; }  // absent -> can never match the scan
+        }
+        offs_use = offs_r.data();
+        lens_use = lens_r.data();
+        if (slots_all) {
+            slots_use = slots_all + base;   // write_slots[0] is this ubatch's first token
+        }
+    }
+
     if (paged_write_slots) {
-        ggml_backend_tensor_set(paged_write_slots, mctx->get_write_slots(), 0, ggml_nbytes(paged_write_slots));
+        ggml_backend_tensor_set(paged_write_slots, slots_use, 0, ggml_nbytes(paged_write_slots));
         last_n_tokens = paged_write_slots->ne[0];
     }
     if (paged_block_table) {
@@ -934,10 +1007,10 @@ void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch* ubatch) {
         ggml_backend_tensor_set(paged_context_lens, mctx->get_context_lens(), 0, ggml_nbytes(paged_context_lens));
     }
     if (paged_batch_offsets) {
-        ggml_backend_tensor_set(paged_batch_offsets, mctx->get_batch_offsets(), 0, ggml_nbytes(paged_batch_offsets));
+        ggml_backend_tensor_set(paged_batch_offsets, offs_use, 0, ggml_nbytes(paged_batch_offsets));
     }
     if (paged_batch_lens) {
-        ggml_backend_tensor_set(paged_batch_lens, mctx->get_batch_lens(), 0, ggml_nbytes(paged_batch_lens));
+        ggml_backend_tensor_set(paged_batch_lens, lens_use, 0, ggml_nbytes(paged_batch_lens));
     }
 }
 
