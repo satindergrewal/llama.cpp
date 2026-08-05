@@ -35,7 +35,10 @@ class llama_block_manager {
     bool has_free_gpu_blocks(uint32_t num_requested_blocks) const;
     bool has_free_cpu_blocks(uint32_t num_requested_blocks) const;
 
-    physical_block_ids checkout_gpu_blocks(uint32_t num_blocks);
+    // ★ TAGGED CHECKOUT. The ledger said four blocks were stranded; a tag says WHICH CALL SITE took
+    // them. Same move as the counter one level finer -- name the site by measuring it, not by
+    // nominating a suspect.
+    physical_block_ids checkout_gpu_blocks(uint32_t num_blocks, const char * tag = "untagged");
     physical_block_ids checkout_cpu_blocks(uint32_t num_blocks);
 
     // P1-6 COW: take an extra reference on blocks now shared by another sequence. The

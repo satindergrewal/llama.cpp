@@ -369,7 +369,7 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
         return false;
     }
 
-    llama_block_ids new_ids = block_manager.checkout_gpu_blocks(num_requested_blocks);
+    llama_block_ids new_ids = block_manager.checkout_gpu_blocks(num_requested_blocks, "allocate");
     concat_block_ids(group.block_table, new_ids);
     note_seq_blocks(group);
     LLAMA_LOG_DEBUG("%s: successfully allocated %d.\n", __func__, num_requested_blocks);
@@ -535,7 +535,7 @@ bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
         return false;
     }
 
-    llama_block_ids new_ids = block_manager.checkout_gpu_blocks(num_blocks);
+    llama_block_ids new_ids = block_manager.checkout_gpu_blocks(num_blocks, "swap_in");
     do_block_copy(group.block_table, new_ids, /*to_gpu=*/true);
 
     free_blocks(group);
@@ -869,7 +869,7 @@ void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                                  " -- falling back to recompute");
     }
 
-    llama_block_ids ids = block_manager.checkout_gpu_blocks(r_n_blocks);
+    llama_block_ids ids = block_manager.checkout_gpu_blocks(r_n_blocks, "state_read");
 
     // COALESCED, same reason as state_write: measured 204 ms to upload 355 MiB as 5,688
     // separate 64 KiB copies (~1.7 GB/s), which is most of why a warm admit lost to a cold
@@ -1190,7 +1190,18 @@ bool llama_kv_cache_paged::self_drive_begin(int32_t n_tokens) {
     self_drive_release_info();
 
     if (is_prefill) {
-        if (have_live) {
+        // ⚠ FREE ON A NON-EMPTY TABLE, NOT ON have_live. have_live is
+        //     sd_active && !sd_group.block_table.empty()
+        // so whenever sd_active is false while the table still holds ids, this skipped the free and
+        // the `sd_group = {}` below STRANDED those blocks -- checked out, unreachable, never
+        // returned. Measured ledger at -ngpub 8: two checkouts then a single RELEASE n=1 at the
+        // prefill boundary, and by the refusal 8 blocks were out, 1 returned, 3 in the table, FOUR
+        // stranded. The pool was never too small; it had been quietly drained of half its blocks.
+        //
+        // sd_active answers "is a self-drive batch in flight". The table answers "do I hold blocks".
+        // Only the second one is relevant to whether they must be returned, and conflating them made
+        // the leak conditional on an unrelated flag.
+        if (!sd_group.block_table.empty()) {
             free_blocks(sd_group);
         }
         sd_group = {};
