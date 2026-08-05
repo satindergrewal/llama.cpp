@@ -1246,6 +1246,18 @@ bool llama_kv_cache_paged::self_drive_begin(int32_t n_tokens) {
                         (unsigned long long) ds4p_blocks_checked_out(),
                         (unsigned long long) ds4p_blocks_released(),
                         (long long) (ds4p_blocks_checked_out() - ds4p_blocks_released()));
+        // ★ WHO HOLDS THE REST. The ledger proved four blocks are outstanding and not in the
+        // group's table; it could not say WHO has them. sequence_blocks is a SHADOW COPY of a
+        // group's table kept by request_id, so a superseded generation's ids can survive there
+        // after the group itself moved on. Print its size next to the group's -- if they differ,
+        // the shadow is the holder and "release at the supersede boundary" has a concrete target.
+        {
+            const auto sb = sequence_blocks.find(sd_group.request_id);
+            LLAMA_LOG_ERROR("%s: DS4P-HOLDERS group_table=%zu sequence_blocks[%d]=%zu n_seq_entries=%zu\n",
+                            __func__, sd_group.block_table.size(), sd_group.request_id,
+                            sb == sequence_blocks.end() ? (size_t) 0 : sb->second.size(),
+                            sequence_blocks.size());
+        }
         if (n_past > 0) {
             LLAMA_LOG_ERROR("%s: PAGED KV LOST. self-drive could not grow the block table for %d "
                             "token(s) at n_past=%d (table holds %zu blocks x %u = %u tokens). The "
