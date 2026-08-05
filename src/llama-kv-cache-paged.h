@@ -74,6 +74,8 @@ class llama_kv_cache_paged : public llama_memory_i {
     bool self_drive_begin(int32_t n_tokens);
     void self_drive_end();
     bool self_drive_enabled() const;
+    // true while WE own the current batch info (as opposed to a real scheduler)
+    bool self_drive_active() const { return sd_active; }
 
     void     set_paged_batch_info(const llama_paged_batch_info * info);
     uint32_t get_num_gpu_blocks() const;

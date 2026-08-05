@@ -136,9 +136,17 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         // cache's OWN allocator; the scheduler keeps multi-seq admission/eviction.
         // Deliberately narrow: exactly one ubatch, n_seq == 1. Anything else falls through
         // untouched, so the scheduler-driven path and the static default are both unchanged.
-        if (mem_attn_paged && !mem_attn_paged->has_paged_batch_info() &&
-            mem_attn_paged->self_drive_enabled() && ubatches.size() == 1 &&
-            ubatches[0].n_seqs == 1) {
+        // ⚠ WAS GATED ON !has_paged_batch_info(). That made self-drive fire EXACTLY ONCE -- on the
+        // 2-token warmup probe -- and every later prefill and decode step then ran on that stale
+        // slot map, because nothing ever clears the info. The decode gate PASSED anyway, which is
+        // precisely why it had to be instrumented: a green result produced by the wrong mechanism.
+        //
+        // Self-drive now re-derives per ubatch. self_drive_begin() already calls self_drive_end()
+        // first, so the previous allocation and info are released before the new ones are built.
+        // Still skipped when a real scheduler is driving (sd_active false + info present).
+        if (mem_attn_paged && mem_attn_paged->self_drive_enabled() &&
+            ubatches.size() == 1 && ubatches[0].n_seqs == 1 &&
+            (mem_attn_paged->self_drive_active() || !mem_attn_paged->has_paged_batch_info())) {
             mem_attn_paged->self_drive_begin((int32_t) ubatches[0].n_tokens);
         }
 

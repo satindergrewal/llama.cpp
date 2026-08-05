@@ -1109,11 +1109,15 @@ bool llama_kv_cache_paged::self_drive_begin(int32_t n_tokens) {
     set_paged_batch_info(&sd_info);
 
     {
-        static bool said = false;
-        if (!said) { said = true;
-            LLAMA_LOG_INFO("%s: DS4P-PAGED-DRIVE active -- self-driving %d tokens over %d blocks "
-                           "(n_seq=1; multi-seq admission stays with the scheduler)\n",
-                           __func__, n_tokens, n_blocks);
+        // Log the FIRST FEW calls with their token counts, not just one line. A once-per-process
+        // marker cannot answer "does this re-fire per decode step?", which is exactly the mechanism
+        // question the decode gate raised -- and a marker that cannot distinguish the cases it is
+        // being read for is the same defect class as counting log lines to count layers.
+        static int n_calls = 0;
+        ++n_calls;
+        if (n_calls <= 6) {
+            LLAMA_LOG_INFO("%s: DS4P-PAGED-DRIVE call #%d -- %d tokens over %d blocks\n",
+                           __func__, n_calls, n_tokens, n_blocks);
         }
     }
 
