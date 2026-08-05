@@ -2397,11 +2397,22 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         // static iswa allocation the user explicitly asked to avoid
                         // (measured: inkling 4M ctx = 48 GiB actual vs 19.5 GiB pool
                         // estimate -> OOM). Refuse loudly until paged hybrid support lands.
-                        if (cparams.kv_paged) {
-                            LLAMA_LOG_ERROR("%s: kv_paged is not yet supported for SWA/hybrid architectures; "
-                                    "the cache would be a full-context static allocation, not a paged one\n", __func__);
+                        // ★ SWA PAGED BRING-UP (was a hard GGML_ASSERT refusing kv_paged here).
+                        // The refusal was correct while the capability was absent, but a refusal is
+                        // not a fix. The paged KERNEL already does windowed attention -- inkling
+                        // passes visibility_window = n_swa per layer -- so only the bring-up was
+                        // missing on the PURE-SWA cache. Gated on DS4P_PAGED_SWA while it earns a
+                        // gate, exactly as the hybrid path was.
+                        const bool paged_swa_dev = cparams.kv_paged &&
+                            getenv("DS4P_PAGED_SWA") && atoi(getenv("DS4P_PAGED_SWA")) != 0;
+
+                        if (cparams.kv_paged && !paged_swa_dev) {
+                            LLAMA_LOG_ERROR("%s: kv_paged on an SWA architecture needs DS4P_PAGED_SWA=1 "
+                                    "(bring-up landed, gate pending); without it the cache would be a "
+                                    "full-context static allocation, not a paged one\n", __func__);
                         }
-                        GGML_ASSERT(!cparams.kv_paged && "kv_paged is not yet supported for SWA/hybrid architectures");
+                        GGML_ASSERT((!cparams.kv_paged || paged_swa_dev) &&
+                                "kv_paged on SWA needs DS4P_PAGED_SWA=1");
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
                             llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
@@ -2449,6 +2460,42 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     filter,
                                     reuse,
                                     share);
+                        }
+
+                        // ★ SWA PAGED POOL. Attached AFTER both llama_kv_cache_iswa branches so
+                        // either construction gets it -- attaching inside one branch is how a
+                        // capability silently applies to half the cases.
+                        if (paged_swa_dev) {
+                            LLAMA_LOG_INFO("%s: DS4P_PAGED_SWA: constructing the paged attention pool "
+                                    "for a pure-SWA architecture\n", __func__);
+
+                            const uint32_t pg_head_dim   = hparams.n_embd_head_v();
+                            const uint32_t pg_n_head     = hparams.n_head_kv();
+                            const uint32_t pg_n_layers   = hparams.n_layer();
+                            const uint32_t pg_block_size = cparams.block_size;
+
+                            auto * paged_attn = new llama_kv_cache_paged(pg_head_dim, pg_n_head,
+                                    pg_block_size, pg_n_layers, cparams.n_ubatch, cparams.n_seq_max);
+
+                            // Every layer of a pure-SWA arch holds KV (SWA changes the WINDOW, not
+                            // whether the layer has a cache), so no attention-only filter here --
+                            // unlike the hybrid path, where recurrent layers hold none.
+                            bool pg_multi_dev = false;
+                            if (layer_backends.size() == pg_n_layers) {
+                                for (uint32_t il = 1; il < pg_n_layers; ++il) {
+                                    if (layer_backends[il] != layer_backends[0]) { pg_multi_dev = true; break; }
+                                }
+                            }
+
+                            if (pg_multi_dev) {
+                                paged_attn->init_multi(layer_backends, backend_cpu, params.type_k,
+                                        cparams.n_gpu_blocks, cparams.n_cpu_blocks, cparams.kv_paged_watermark);
+                            } else {
+                                paged_attn->init(backend_gpu, backend_cpu, params.type_k,
+                                        cparams.n_gpu_blocks, cparams.n_cpu_blocks, cparams.kv_paged_watermark);
+                            }
+
+                            static_cast<llama_kv_cache_iswa *>(res)->set_attn_paged(paged_attn);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());

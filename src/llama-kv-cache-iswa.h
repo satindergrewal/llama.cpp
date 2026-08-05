@@ -11,6 +11,9 @@
 // utilizes two instances of llama_kv_cache
 //   the first instance is for the non-SWA layers of the model and the second instance is for the SWA layers
 
+class llama_kv_cache_paged;
+class llama_kv_cache_paged_context;
+
 class llama_kv_cache_iswa : public llama_memory_i {
 public:
     llama_kv_cache_iswa(
@@ -48,7 +51,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share);
 
-    ~llama_kv_cache_iswa() = default;
+    // Out-of-line (was `= default` here): mem_attn_paged is a unique_ptr to an INCOMPLETE
+    // type, so the implicit destructor cannot be generated in this header.
+    ~llama_kv_cache_iswa() override;
 
     //
     // llama_memory_i
@@ -90,11 +95,18 @@ public:
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_swa () const;
 
+
+    void                   set_attn_paged(llama_kv_cache_paged * paged);
+    llama_kv_cache_paged * get_mem_attn_paged() const;
+
 private:
     const bool unified;
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;
+
+    // non-const: handed over after construction, like the hybrid wrappers
+    std::unique_ptr<llama_kv_cache_paged> mem_attn_paged;
 };
 
 class llama_kv_cache_iswa_context : public llama_memory_context_i {
@@ -140,6 +152,9 @@ public:
     const llama_kv_cache_context * get_base() const;
     const llama_kv_cache_context * get_swa()  const;
 
+    const llama_kv_cache_paged_context * get_attn_paged() const;
+    void set_attn_paged_ctx(llama_memory_context_ptr ctx) { ctx_attn_paged = std::move(ctx); }
+
 private:
     //llama_kv_cache_iswa * kv;
 
@@ -150,6 +165,9 @@ private:
 
     const llama_memory_context_ptr ctx_base;
     const llama_memory_context_ptr ctx_swa;
+
+    // non-const: set after construction when the scheduler has batch info (see init_batch)
+    llama_memory_context_ptr ctx_attn_paged;
 
     const llama_memory_status status;
 };

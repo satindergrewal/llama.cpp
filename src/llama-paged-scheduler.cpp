@@ -37,6 +37,15 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
                 LLAMA_LOG_INFO("%s: using the hybrid wrapper's paged attention pool\n", __func__);
                 is_hybrid = true;
             }
+        } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(ctx->get_memory())) {
+            // PURE SWA (gemma-3, llama-4 class): not a hybrid at all, so neither branch above
+            // matched and the scheduler used to report "no paged cache" for a model whose pool
+            // was live. Third wrapper, same resolution.
+            paged_kv = iswa->get_mem_attn_paged();
+            if (paged_kv) {
+                LLAMA_LOG_INFO("%s: using the iswa (pure-SWA) cache's paged attention pool\n", __func__);
+                is_hybrid = true;
+            }
         }
     }
     if (!paged_kv) {

@@ -1,4 +1,5 @@
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-paged.h"
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -196,8 +197,22 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         assert(sinfos_base.size() == sinfos_swa.size());
 
-        return std::make_unique<llama_kv_cache_iswa_context>(
+        // ★ SWA PAGED: carry the paged context alongside when the pool is live AND the scheduler
+        // has set batch info. Dark otherwise -- has_paged_batch_info() is false without a driver,
+        // so this cannot disturb the static ISWA path. Mirrors llama_memory_hybrid_iswa.
+        llama_memory_context_ptr paged_ctx;
+        if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
+            paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches);   // copy: ctx owns originals
+        }
+
+        auto ctx = std::make_unique<llama_kv_cache_iswa_context>(
                 this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+
+        if (paged_ctx) {
+            ctx->set_attn_paged_ctx(std::move(paged_ctx));
+        }
+
+        return ctx;
     } while (false);
 
     // if it fails, try equal split
@@ -278,6 +293,20 @@ llama_kv_cache * llama_kv_cache_iswa::get_base() const {
 
 llama_kv_cache * llama_kv_cache_iswa::get_swa() const {
     return kv_swa.get();
+}
+
+llama_kv_cache_iswa::~llama_kv_cache_iswa() = default;
+
+void llama_kv_cache_iswa::set_attn_paged(llama_kv_cache_paged * paged) {
+    mem_attn_paged.reset(paged);
+}
+
+llama_kv_cache_paged * llama_kv_cache_iswa::get_mem_attn_paged() const {
+    return mem_attn_paged.get();
+}
+
+const llama_kv_cache_paged_context * llama_kv_cache_iswa_context::get_attn_paged() const {
+    return static_cast<const llama_kv_cache_paged_context *>(ctx_attn_paged.get());
 }
 
 //
