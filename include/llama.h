@@ -1689,6 +1689,11 @@ extern "C" {
     LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler * sched,
                                                        struct llama_batch *           batch);
 
+    // Did the last llama_paged_scheduler_prepare_batch return false because of a DEADLOCK verdict,
+    // rather than because there was simply nothing to admit? The bool return cannot express the
+    // difference, and treating the two alike makes a self-diagnosed deadlock invisible to the caller.
+    LLAMA_API bool llama_paged_scheduler_last_was_deadlock(const struct llama_paged_scheduler * sched);
+
     LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
                                                 struct llama_batch *           batch,
                                                 const llama_token *            tokens,

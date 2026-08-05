@@ -8,6 +8,16 @@
 struct llama_paged_scheduler {
     llama_paged_scheduler_impl impl;
 
+    // ★ Last verdict from step(). prepare_batch collapses DEADLOCK into `false`, which the caller
+    // cannot tell apart from the ordinary "nothing admitted this tick". Measured consequence: the
+    // scheduler logged "Scheduler deadlock detected" 4,170,155 times, once per tick, with correct
+    // counts and an actionable hint -- and the server's `if (!success ...) return;` discarded every
+    // one of them. A correct diagnosis with no channel to the caller is not a diagnosis.
+    //
+    // Additive on purpose: changing prepare_batch's return type would break every existing caller
+    // for a fact they can now simply ask for.
+    bool last_deadlock = false;
+
     llama_paged_scheduler(uint32_t n_ctx, uint32_t block_sz, uint32_t n_batch, llama_kv_cache_paged * kv_manager) :
         impl(n_ctx, block_sz, n_batch, kv_manager) {}
 };
@@ -115,6 +125,8 @@ LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler 
         return false;
     }
 
+    sched->last_deadlock = (status == llama_scheduler_status::DEADLOCK);
+
     if (status == llama_scheduler_status::DEADLOCK) {
         LLAMA_LOG_ERROR("%s: Deadlock detected.\n", __func__);
         return false;
@@ -207,6 +219,12 @@ LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler 
     out_state->t_arrival_us     = group->t_arrival_time;
     out_state->t_first_token_us = group->t_first_token_us;
     return true;
+}
+
+// True when the LAST prepare_batch returned false because the scheduler declared a deadlock,
+// as opposed to simply having nothing to admit. See the note on last_deadlock.
+LLAMA_API bool llama_paged_scheduler_last_was_deadlock(const struct llama_paged_scheduler * sched) {
+    return sched != nullptr && sched->last_deadlock;
 }
 
 LLAMA_API const struct llama_paged_batch_info * llama_paged_scheduler_get_batch_info(

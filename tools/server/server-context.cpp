@@ -3051,6 +3051,26 @@ private:
             }
         }
 
+        // ★ A DEADLOCK VERDICT IS NOT "NOTHING TO DO". The scheduler self-diagnoses correctly --
+        // measured 4,170,155 "Scheduler deadlock detected" lines with accurate counts and an
+        // actionable hint -- and this early return discarded every one of them, because a bool
+        // return cannot distinguish "nothing admitted" from "cannot make progress, ever".
+        // Ask, then act: fail the processing slots instead of spinning on them forever.
+        if (!success && llama_paged_scheduler_last_was_deadlock(paged_sched)) {
+            // Rate-limited: 4M identical ERROR lines is itself a storm, the same shape as the
+            // 880K-line decode-fail storm this file already carries a breaker for.
+            SRV_ERR("%s", "paged: scheduler reports DEADLOCK -- failing in-flight requests\n");
+            for (auto & sl : slots) {
+                if (!sl.is_processing()) { continue; }
+                send_error(sl, "paged KV: the scheduler cannot make progress with the available "
+                               "block pool (increase -ngpub or reduce -np)", ERROR_TYPE_SERVER);
+                const int32_t rid = sl.id;
+                sl.release();
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), rid, -1, -1);
+            }
+            return;
+        }
+
         if (!success || pbatch.n_tokens == 0) {
             return; // nothing admitted/decodable this tick
         }
