@@ -25,6 +25,7 @@ add_library(llama
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
             llama-kv-cache-dsa.cpp
+            llama-kv-cache-msa.cpp
             llama-kv-cache-dsv4.cpp
             llama-kv-cache-paged.cpp
             llama-block-manager.cpp

@@ -83,9 +83,27 @@ llama_block_manager::physical_block_ids llama_block_manager::checkout_gpu_blocks
         return new_ids;
     }
 
+    // ★ DS4P_FREELIST_FIFO -- a ONE-FACTOR probe for #1(c), not a perf knob.
+    //
+    // Checkout is LIFO (take from the back, release pushes to the back), so a block freed by a
+    // finishing request is the VERY NEXT block handed out. The residual corruption requires a prior
+    // finished request (WARM 7/12 corrupt, COLD 0/12) and is independent of prompt content, which
+    // leaves the CONTENT of recycled blocks as the surviving suspect -- the earlier KV_POISON
+    // exclusion was recorded as weak because it could not tell NaN-garbage from ordinary garbage.
+    //
+    // FIFO takes from the FRONT instead, so with a 512-block pool a freed block is not reissued
+    // until ~500 others have been used. Recycling still happens; IMMEDIATE recycling does not.
+    // If WARM goes clean under FIFO, stale content in a just-freed block is the mechanism.
+    // If WARM still corrupts, block reuse is exonerated and the cause is elsewhere.
+    if (getenv("DS4P_FREELIST_FIFO") != nullptr) {
+        new_ids.insert(new_ids.end(), std::make_move_iterator(free_gpu_ids.begin()),
+                       std::make_move_iterator(free_gpu_ids.begin() + num_blocks));
+        free_gpu_ids.erase(free_gpu_ids.begin(), free_gpu_ids.begin() + num_blocks);
+    } else {
     new_ids.insert(new_ids.end(), std::make_move_iterator(free_gpu_ids.end() - num_blocks),
                    std::make_move_iterator(free_gpu_ids.end()));
     free_gpu_ids.erase(free_gpu_ids.end() - num_blocks, free_gpu_ids.end());
+    }
 
     for (const uint32_t & id : new_ids) {
         gpu_registry[id].ref_count += 1;

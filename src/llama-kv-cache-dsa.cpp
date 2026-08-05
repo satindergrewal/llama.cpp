@@ -23,7 +23,8 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
-    const layer_filter_cb & filter,
+    const layer_filter_cb & filter_mla,
+    const layer_filter_cb & filter_lid,
     const  layer_reuse_cb & reuse) :
     hparams_lid(model.hparams), n_stream(unified ? 1 : n_seq_max) {
 
@@ -32,7 +33,7 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
     kv_mla = std::make_unique<llama_kv_cache>(
             model, model.hparams, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter_mla, reuse, nullptr);
 
     // we use llama_kv_cache for caching indexer keys
     // by hand-tweaking some hparams we fool it to create
@@ -53,9 +54,15 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
     // NOTE: must COMPOSE with any caller-supplied filter, not replace it. The GLM_DSA
     // call site passes a non-null filter whenever the model has NextN/MTP layers, so
     // choosing between them silently drops one of the two constraints.
+    // ⚠ MERGE 2026-08-06: upstream replaced the single `filter` parameter with TWO -- filter_mla and
+    // filter_lid -- so this block's old reference to `filter` no longer compiles, and its local was
+    // shadowing the new parameter name. It now composes with the caller-supplied filter_lid.
+    // The composition is still REQUIRED: upstream's call site passes
+    // `filter_lid = [](il) { return il < hparams.n_layer(); }`, i.e. every layer, so without this the
+    // indexer-full saving is lost entirely.
     const auto & hp_full = model.hparams;
-    llama_memory_i::layer_filter_cb filter_outer = filter;
-    llama_memory_i::layer_filter_cb filter_lid = [&hp_full, filter_outer](int32_t il) {
+    llama_memory_i::layer_filter_cb filter_outer = filter_lid;
+    llama_memory_i::layer_filter_cb filter_lid_full = [&hp_full, filter_outer](int32_t il) {
         if (filter_outer && !filter_outer(il)) {
             return false;
         }
@@ -65,7 +72,7 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter_lid, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter_lid_full, reuse, nullptr);
 }
 
 void llama_kv_cache_dsa::clear(bool data) {

@@ -1573,6 +1573,10 @@ json server_task_result_metrics::to_json() {
         { "n_reval_identity_fail",           n_reval_identity_fail },
         { "n_reval_cell_mismatch",           n_reval_cell_mismatch },
         { "n_quench_seqs_total",             n_quench_seqs_total },
+        { "n_draft_tokens_total",            n_draft_tokens_total },
+        { "n_draft_accepted_total",          n_draft_accepted_total },
+        { "n_draft_verif_steps_total",       n_draft_verif_steps_total },
+        { "n_accepted_per_pos_total",        n_accepted_per_pos_total },
 
         { "slots",                           slots_data },
     };
