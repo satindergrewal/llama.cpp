@@ -1561,15 +1561,26 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     // ★ CHECKED FIRST, BEFORE THE MODEL AND CONTEXT ARE BUILT. It was originally placed next to
     // the paged fitter, which runs AFTER context creation -- so the kv_paged n_ubatch assert fired
     // first and this was never reached. A guard downstream of the thing it guards is not a guard.
-    // ★ REFUSE QUANTISED KV ON THE PAGED PATH -- measured, not assumed.
+    // ★ REFUSE KV CACHE TYPES THE PAGED KERNELS CANNOT HOLD -- measured, not assumed.
+    //
+    // HISTORY, kept because the reasoning is what makes the current state trustworthy. This guard
+    // was added when plain `--kv-paged -ctk q8_0` produced silent garbage:
     //   --kv-paged -ctk f16  : "Paris. The capital of Germany is Berlin"   (correct)
     //   --kv-paged -ctk q8_0 : " thesssssss"                               (GARBAGE)
     //   static     -ctk q8_0 : "Paris. The capital of Germany is Berlin"   (correct -- so the
-    //                          corruption is PAGED-SPECIFIC, not a quantised-KV problem)
-    // The paged op never dispatched under q8_0 (no presence marker) and nothing warned; the server
-    // came up healthy and answered with garbage. No dev flag was needed -- plain `--kv-paged
-    // -ctk q8_0` is enough. Silent wrong answers are the worst failure available, so this refuses
-    // at startup with the reason and the fix instead of letting it run.
+    //                          corruption was PAGED-SPECIFIC, not a quantised-KV problem)
+    // The server came up healthy and answered wrong, which is the worst failure available.
+    //
+    // ★ q8_0 IS NOW SUPPORTED and passes this check. Root cause was the decode path adding an
+    // ELEMENT offset to a base built from BLOCK-unit strides and reading it as half -- correct for
+    // f16, meaningless for q8_0, and invisible because prefill staged and dequantised correctly.
+    // Retired only after the SAME end-to-end observable that created it came back clean: paged q8_0
+    // now matches static q8_0 character for character on Ornith-9B. A negative filed on an e2e
+    // observation could not have been retired by unit gates, however green.
+    //
+    // ⚠ THE GUARD ITSELF STAYS. q4_0, q5_0, q4_K and friends have no dequant path in the kernel and
+    // are still refused here. "q8_0 works" is not "quantised KV works", and this block is the only
+    // thing standing between those two sentences.
     // ⚠ ASKS THE LIBRARY, does not keep its own list. This block used to carry a local
     // {f16,bf16,f32} lambda -- a second copy of llama-graph's capability predicate, in another
     // file, with nothing tying them together. The moment the kernel gained q8_0 support, the graph

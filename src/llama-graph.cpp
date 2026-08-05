@@ -3810,8 +3810,20 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
 // ★ Generic paged capability test. See the header for why this is a capability check and not an
 // architecture allow-list.
 bool llm_graph_context::paged_cache_type_supported(ggml_type type, bool allow_quant) {
+    GGML_UNUSED(allow_quant);   // q8_0 no longer needs the dev flag -- see below
+
+    // q8_0 admitted unconditionally as of the decode-read fix. What earns it:
+    //   - op-level, both backends, every head_dim 64..512, block sizes 16/32/64, ~1e-14
+    //   - divergence check: q8_0 differs from f16 by ~1.1e-03, so quantisation is REALLY applied
+    //   - write path exact (384 blocks, 0 mismatched) and cache contents verified over the READ's
+    //     full address range (0 bad rows, worst 1.083e-03 = the q8 quantisation bound)
+    //   - incremental writes, single decode, and K sequential decodes all exact
+    //   - END-TO-END on Ornith-9B: paged q8_0 output matches static q8_0 character for character,
+    //     which is the same observable that produced the original refusal
+    // The last one is the one that counts: the refusal was filed on an e2e observation, so only an
+    // e2e observation could retire it.
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 ||
-           (allow_quant && type == GGML_TYPE_Q8_0);
+           type == GGML_TYPE_Q8_0;
 }
 
 // ★ THE SINGLE SOURCE OF TRUTH for "can the paged path hold this KV type", and the only place the
@@ -3824,12 +3836,14 @@ bool llm_graph_context::paged_cache_type_supported(ggml_type type, bool allow_qu
 // rather than "the guard is stale". That is the arch-allow-list defect wearing a guard's costume,
 // and this lane has already deleted three allow-lists for the same reason. One list, one reader.
 bool llama_kv_paged_supports_cache_type(enum ggml_type type) {
-    // Dev escape hatch: the q8_0 paged path is proven at the OP level (test-paged-vs-cpu, both
-    // backends, plus a divergence check) but not yet end-to-end, so it stays off by default.
-    // The flag widens what is REACHABLE; it never disables a check that would have run.
-    const bool allow_quant = getenv("LLAMA_BANDED_QUANT_KV") != nullptr;
-
-    return llm_graph_context::paged_cache_type_supported(type, allow_quant);
+    // LLAMA_BANDED_QUANT_KV is gone: it existed only while q8_0 was proven at the op level but not
+    // end to end, and the e2e gate now passes. Keeping a dev flag after the thing it guarded is
+    // proven just leaves a second way for behaviour to differ between runs.
+    //
+    // ⚠ STILL A REAL GATE. Every other quantised type -- q4_0, q5_0, q4_K, ... -- is still refused,
+    // because none of them has a dequant path in the kernel. This is not "quantised KV works now",
+    // it is "q8_0 works now", and the difference is exactly what the guard is for.
+    return llm_graph_context::paged_cache_type_supported(type, /*allow_quant =*/ true);
 }
 
 bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context * pctx, int il) const {
