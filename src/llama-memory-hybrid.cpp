@@ -130,6 +130,28 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         // context alongside (same ubatches -- the recurrent split constraints win). Dark until
         // the scheduler drives it: has_paged_batch_info() is false without that, so this cannot
         // trip the init ordering assert. Mirrors llama_memory_hybrid_iswa::init_batch.
+        // ⚠⚠ THIS JUSTIFICATION IS STALE AS OF 2026-08-05 -- READ BEFORE RELYING ON IT.
+        // The premise below ("nothing in llama-server calls the scheduler") is now FALSE: the
+        // server calls llama_paged_scheduler_add_request AND llama_paged_scheduler_prepare_batch
+        // (2 sites in server-context.cpp). And the consumer chain this bridged was FIXED the same
+        // day by wiring the generic capability-based paged consumer, so a graph CAN now consume the
+        // pool without this.
+        //
+        // MEASURED CONSEQUENCE: with the server driving the scheduler AND this bridge active, TWO
+        // group objects allocate for the same sequence from one pool (8 checkouts for a 4-block
+        // need; one object IS sd_group, the other is a scheduler group). Large pools hide it.
+        // At -ngpub 8 it exhausts the pool, self_drive_begin fails to grow, FREES its own KV, bails
+        // to the static path, and the output corrupts from token 48. One-factor, marker-verified:
+        //     DRIVE_ON   paged_dispatches=2  selfdrive=8  checkouts=8  -> corrupt
+        //     DRIVE_OFF  paged_dispatches=2  selfdrive=0  checkouts=4  -> clean
+        // The full quant-KV e2e gate passes ALL FIVE ARMS with this bridge OFF.
+        //
+        // NOT removed here: this lane has verified two architectures and one gate suite, which is
+        // narrower than "safe to delete" (the taint probe and other callers are unaudited). Left
+        // behaviourally untouched, annotated so the next reader does not inherit a false premise.
+        // It was TRUE when written; it aged the moment the thing it described was fixed.
+        //
+        // --- original comment, kept verbatim for provenance ---
         // ★ SELF-DRIVE bridge (DS4P_PAGED_DRIVE). Nothing in llama-server calls the scheduler's
         // step(), so has_paged_batch_info() is never true there and no graph can consume the pool
         // -- the last link of the Ornith consumer chain. Drive a single sequence here using the
