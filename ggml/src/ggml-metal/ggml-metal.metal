@@ -2951,6 +2951,72 @@ kernel void kernel_solve_tri_f32(
 // reference does this before attending; omitting it left the cache zeroed and the
 // harness reported nmse == 1.000 on every case (the signature of an all-zero output).
 // grid: (n_tokens_total, n_heads_kv, 1); threadgroup: head_dim threads.
+// ★ QUANTISED (q8_0) PAGED KV WRITE. Separate kernel, not a branch in the f16 one: the thread
+// geometry DIFFERS. f16 writes one element per thread; q8_0 has QK8_0 = 32 elements sharing one
+// scale, so a per-element store cannot produce a valid block -- that is why `--kv-paged -ctk q8_0`
+// emitted garbage rather than erroring. Here one thread owns one BLOCK.
+//
+// Preconditions the capability contract already guarantees: head_dim % 32 == 0. The constraint
+// added for the kernel's D ceiling turns out to be exactly the one quantisation needs.
+kernel void kernel_paged_attn_write_q8_0(
+        constant ggml_metal_kargs_paged_attn & args,
+        device const float        * k_new       [[buffer(1)]],
+        device const float        * v_new       [[buffer(2)]],
+        device       block_q8_0   * kv_cache    [[buffer(3)]],
+        device const int32_t      * write_slots [[buffer(4)]],
+        uint3  tgpig  [[threadgroup_position_in_grid]],
+        uint3  tpitg3 [[thread_position_in_threadgroup]]) {
+    const int D   = args.head_dim;
+    const int nbk = D / QK8_0;                 // q8_0 blocks per head row
+    const int b   = (int) tpitg3[0];           // which block of this head row
+    if (b >= nbk) { return; }
+
+    const int gtok = (int) tgpig[0];
+    const int h    = (int) tgpig[1];
+
+    const int slot           = write_slots[gtok];
+    const int block_id       = slot / args.block_size;
+    const int token_in_block = slot % args.block_size;
+
+    // Strides here are in BLOCKS, not halves: the host derives them with ggml_row_size, so a
+    // quantised row is nbk blocks wide rather than D elements.
+    const uint64_t base = (uint64_t) block_id * args.stride_block
+                        + (uint64_t) token_in_block * args.stride_token;
+    const uint64_t in   = (uint64_t) gtok * args.n_heads_kv * D + (uint64_t) h * D;
+
+    // ★ CONSUMER PROBE parity with the f16 kernel: DS4P_PAGED_TAINT must perturb this path too,
+    // or the taint gate would silently report "not consumed" for every quantised run.
+    const float taint = (args.probe == 2) ? 1.5f : 1.0f;
+
+    float tmp[QK8_0];
+
+    for (int j = 0; j < QK8_0; ++j) {
+        tmp[j] = taint * k_new[in + b*QK8_0 + j];
+    }
+    {
+        device block_q8_0 & dst = kv_cache[base + (uint64_t) h * args.stride_head + b];
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_0; ++j) { amax = MAX(amax, fabs(tmp[j])); }
+        const float dq = amax / 127.0f;
+        const float id = dq ? 1.0f/dq : 0.0f;
+        dst.d = (half) dq;
+        for (int j = 0; j < QK8_0; ++j) { dst.qs[j] = (int8_t) round(tmp[j] * id); }
+    }
+
+    for (int j = 0; j < QK8_0; ++j) {
+        tmp[j] = taint * v_new[in + b*QK8_0 + j];
+    }
+    {
+        device block_q8_0 & dst = kv_cache[base + (uint64_t) (args.n_heads_kv + h) * args.stride_head + b];
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_0; ++j) { amax = MAX(amax, fabs(tmp[j])); }
+        const float dq = amax / 127.0f;
+        const float id = dq ? 1.0f/dq : 0.0f;
+        dst.d = (half) dq;
+        for (int j = 0; j < QK8_0; ++j) { dst.qs[j] = (int8_t) round(tmp[j] * id); }
+    }
+}
+
 kernel void kernel_paged_attn_write_f32(
         constant ggml_metal_kargs_paged_attn & args,
         device const float   * k_new       [[buffer(1)]],
