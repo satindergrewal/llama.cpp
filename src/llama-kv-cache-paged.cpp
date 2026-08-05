@@ -1209,8 +1209,32 @@ bool llama_kv_cache_paged::self_drive_begin(int32_t n_tokens) {
     // allocate() tops the block table up to cover n_prompt + n_decoded (+ the extra it is asked
     // for). Counts are already final here, so ask for 0 and let it size from the group.
     if (!allocate(0, sd_group)) {
-        LLAMA_LOG_WARN("%s: self-drive could not allocate for %d tokens at n_past=%d; static path\n",
-                       __func__, n_tokens, n_past);
+        // ★ THE FALLBACK IS THE BUG, NOT THE ALLOCATION FAILURE -- and only mid-sequence.
+        //
+        // At n_past == 0 nothing has been written yet, so handing the request to the static path is
+        // a genuine graceful degrade. At n_past > 0 this sequence's KV lives in the POOL, and the
+        // lines below FREE IT and then let the static path continue with a cache that never saw
+        // those tokens. Measured on Ornith-9B at -ngpub 8: this fires once at n_past=48 and the
+        // output turns to garbage at exactly token 48 ("...seventeen, eighteen, ten, ten."), HTTP
+        // 200, no error. -ngpub 10 never fires it and is byte-identical to a large pool.
+        //
+        // Same line, safe in one context and silently destructive in the other, previously logged
+        // at WARN with the words "static path" -- which reads as a routing decision rather than
+        // data loss. The producer was correct the whole time and nothing consumed it.
+        if (n_past > 0) {
+            LLAMA_LOG_ERROR("%s: PAGED KV LOST. self-drive could not grow the block table for %d "
+                            "token(s) at n_past=%d (table holds %zu blocks x %u = %u tokens). The "
+                            "sequence's KV is in the paged pool and the static path cannot see it, "
+                            "so THIS REQUEST'S OUTPUT WILL BE CORRUPT FROM TOKEN %d ONWARD. Raise "
+                            "-ngpub (or lower --kv-block-size) so the pool can grow with the "
+                            "sequence.\n",
+                            __func__, n_tokens, n_past, sd_group.block_table.size(), block_size,
+                            (uint32_t) sd_group.block_table.size() * block_size, n_past);
+        } else {
+            // n_past == 0: nothing written yet, the static path is a real fallback.
+            LLAMA_LOG_WARN("%s: self-drive could not allocate for %d tokens at n_past=0; taking the "
+                           "static path (safe: no KV written yet)\n", __func__, n_tokens);
+        }
         free_blocks(sd_group);
         sd_group  = {};
         sd_active = false;
