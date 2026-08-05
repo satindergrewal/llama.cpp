@@ -50,6 +50,50 @@ static inline bool ds4p_layer_kv(const std::vector<uint8_t> & f, uint32_t il) {
     return f.empty() || (il < f.size() && f[il] != 0);
 }
 
+void llama_kv_cache_paged::set_layer_geometry(std::vector<uint32_t> head_dims,
+                                              std::vector<uint32_t> heads_kv) {
+    if (head_dims.empty() || heads_kv.empty()) {
+        layer_head_dim.clear();
+        layer_n_heads_kv.clear();
+        return;
+    }
+
+    // Loud rather than clever: a geometry vector of the wrong length would index out of bounds in
+    // hd_of()/hkv_of() on some later layer -- a crash or a corruption far from the mistake.
+    GGML_ASSERT(head_dims.size() == n_layers && heads_kv.size() == n_layers &&
+                "per-layer geometry must have exactly n_layers entries");
+
+    // DS4P_NO_LAYER_GEOMETRY=1 forces the uniform pool back, so this feature's effect is a
+    // ONE-FACTOR measurement inside a single binary rather than a cross-build comparison -- same
+    // reasoning as DS4P_NO_LAYER_FILTER, and the same fallback if an untested arch misbehaves.
+    if (getenv("DS4P_NO_LAYER_GEOMETRY")) {
+        LLAMA_LOG_INFO("%s: DS4P_NO_LAYER_GEOMETRY -- uniform pool geometry (per-layer disabled)\n", __func__);
+        layer_head_dim.clear();
+        layer_n_heads_kv.clear();
+        return;
+    }
+
+    layer_head_dim   = std::move(head_dims);
+    layer_n_heads_kv = std::move(heads_kv);
+
+    // State the DISTINCT geometries. "per-layer geometry is on" says nothing about whether it
+    // changed anything -- on a uniform model this prints one line and is correctly
+    // indistinguishable from the feature being off.
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        bool seen = false;
+        for (uint32_t j = 0; j < il; ++j) {
+            if (layer_head_dim[j] == layer_head_dim[il] && layer_n_heads_kv[j] == layer_n_heads_kv[il]) { seen = true; break; }
+        }
+        if (seen) { continue; }
+        uint32_t n = 0;
+        for (uint32_t j = 0; j < n_layers; ++j) {
+            if (layer_head_dim[j] == layer_head_dim[il] && layer_n_heads_kv[j] == layer_n_heads_kv[il]) { ++n; }
+        }
+        LLAMA_LOG_INFO("%s: per-layer geometry: head_dim=%u n_head_kv=%u on %u/%u layers\n",
+                       __func__, layer_head_dim[il], layer_n_heads_kv[il], n, n_layers);
+    }
+}
+
 void llama_kv_cache_paged::set_layer_filter(std::vector<uint8_t> has_kv) {
     // DS4P_NO_LAYER_FILTER=1 restores the old all-layers pool. Two reasons it exists: it makes the
     // saving a ONE-FACTOR measurement instead of a cross-build comparison, and it is the fallback
@@ -110,6 +154,16 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
     // ggml_row_size handles both cases.
     block_bytes    = 2 * block_size * n_heads_kv * ggml_row_size(kv_type, head_dim);
 
+    // Per-layer bytes, derived from per-layer geometry when present. Everything that copies or
+    // serialises a LAYER's block must use bb_of(il), never the pool-wide block_bytes.
+    layer_block_bytes.clear();
+    if (!layer_head_dim.empty()) {
+        layer_block_bytes.resize(n_layers);
+        for (uint32_t il = 0; il < n_layers; ++il) {
+            layer_block_bytes[il] = 2 * block_size * hkv_of(il) * (uint32_t) ggml_row_size(kv_type, hd_of(il));
+        }
+    }
+
     // Group layers by the device that holds them. llama.cpp's --tensor-split splits
     // by LAYER, so layer il's KV must live on dev_layer(il). Every device allocates
     // the same n_gpu_blocks, which is what keeps a block id valid on all of them and
@@ -145,7 +199,7 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
             if (layer_backends[il] != be) continue;
             if (!ds4p_layer_kv(layer_has_kv, il)) continue;   // attention-only pool
             kv_gpu_layers[il] =
-                ggml_new_tensor_4d(ctx, type, head_dim, block_size, 2 * n_heads_kv, n_gpu_blocks);
+                ggml_new_tensor_4d(ctx, type, hd_of(il), block_size, 2 * hkv_of(il), n_gpu_blocks);
         }
 
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
@@ -175,7 +229,7 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
     struct ggml_context * ctx_cpu = ggml_init(cpu_params);
     for (uint32_t il = 0; il < n_layers; ++il) {
         kv_cpu_layers.push_back(
-            ggml_new_tensor_4d(ctx_cpu, type, head_dim, block_size, 2 * n_heads_kv, n_cpu_blocks));
+            ggml_new_tensor_4d(ctx_cpu, type, hd_of(il), block_size, 2 * hkv_of(il), n_cpu_blocks));
     }
     ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
     GGML_ASSERT(buf_cpu && "Failed to allocate CPU KV cache buffer");
@@ -223,6 +277,16 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     // ggml_row_size handles both cases.
     block_bytes    = 2 * block_size * n_heads_kv * ggml_row_size(kv_type, head_dim);
 
+    // Per-layer bytes, derived from per-layer geometry when present. Everything that copies or
+    // serialises a LAYER's block must use bb_of(il), never the pool-wide block_bytes.
+    layer_block_bytes.clear();
+    if (!layer_head_dim.empty()) {
+        layer_block_bytes.resize(n_layers);
+        for (uint32_t il = 0; il < n_layers; ++il) {
+            layer_block_bytes[il] = 2 * block_size * hkv_of(il) * (uint32_t) ggml_row_size(kv_type, hd_of(il));
+        }
+    }
+
     // Set up GPU context and tensor
     // Interleaved shape: [num_blocks, 2, n_heads_kv, block_size, head_dim] (5D)
     struct ggml_init_params gpu_params;
@@ -239,7 +303,7 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
         }
         // Since GGML_MAX_DIMS is set to 4, we flatten the layout to be 4D: [num_blocks, 2 * n_heads_kv, block_size, head_dim]
         ggml_tensor * kv_layer_gpu =
-            ggml_new_tensor_4d(ctx_gpu, type, head_dim, block_size, 2 * n_heads_kv, n_gpu_blocks);
+            ggml_new_tensor_4d(ctx_gpu, type, hd_of(il), block_size, 2 * hkv_of(il), n_gpu_blocks);
         kv_gpu_layers.push_back(kv_layer_gpu);
     }
 
@@ -270,7 +334,7 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
             continue;
         }
         ggml_tensor * kv_layer_cpu =
-            ggml_new_tensor_4d(ctx_cpu, type, head_dim, block_size, 2 * n_heads_kv, n_cpu_blocks);
+            ggml_new_tensor_4d(ctx_cpu, type, hd_of(il), block_size, 2 * hkv_of(il), n_cpu_blocks);
         kv_cpu_layers.push_back(kv_layer_cpu);
     }
 
@@ -408,13 +472,22 @@ void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
     // Buffer on HOST to faciliate block data transfer
     // Note: an optimization would be to use views and async copies. Beware of
     // memory overhead heurisitcs.
-    std::vector<uint8_t> staging(block_bytes);
+    // ⚠ SIZED PER LAYER, NOT ONCE. This was a single buffer of the pool-wide block_bytes, reused
+    // across every layer. With per-layer head geometry a 256-wide layer's block is half a 512-wide
+    // one, so one shared size either truncates a copy or reads past the source -- on the GPU<->CPU
+    // eviction path, which runs rarely, only under memory pressure, and is not exercised by any
+    // gate in this lane. Silent corruption under load is the worst thing to ship, so the buffer is
+    // resized inside the loop and every offset uses bb_of(il).
+    std::vector<uint8_t> staging;
 
     for (uint32_t il = 0; il < n_layers; ++il) {
         // ★ ATTENTION-ONLY POOL: a filtered (recurrent) layer owns no tensor on either side.
         // Without this guard the swap path dereferences nullptr -- the hazard that made this
         // change worth doing carefully rather than only touching the allocation loops.
         if (!ds4p_layer_kv(layer_has_kv, il)) { continue; }
+
+        const size_t lbb = bb_of(il);
+        if (staging.size() < lbb) { staging.resize(lbb); }
 
         struct ggml_tensor * src_main = src_layers[il];
         struct ggml_tensor * dst_main = dst_layers[il];
@@ -428,13 +501,13 @@ void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
             const uint32_t src_local = to_gpu ? src_global - num_gpu_blocks : src_global;
             const uint32_t dst_local = to_gpu ? dst_global : dst_global - num_gpu_blocks;
 
-            const size_t src_offset = (size_t) src_local * block_bytes;
-            const size_t dst_offset = (size_t) dst_local * block_bytes;
+            const size_t src_offset = (size_t) src_local * lbb;
+            const size_t dst_offset = (size_t) dst_local * lbb;
 
             // Put src tensor into HOST staging buffer
-            ggml_backend_tensor_get(src_main, staging.data(), src_offset, block_bytes);
+            ggml_backend_tensor_get(src_main, staging.data(), src_offset, lbb);
             // Put tensor from HOST staging into dst tensor
-            ggml_backend_tensor_set(dst_main, staging.data(), dst_offset, block_bytes);
+            ggml_backend_tensor_set(dst_main, staging.data(), dst_offset, lbb);
         }
     }
 }
@@ -663,20 +736,28 @@ void llama_kv_cache_paged::state_write(llama_io_write_i & io, llama_seq_id seq_i
     // does far better in bulk. Runs of consecutive ids on the same device move in one call.
     const auto runs = contiguous_runs(blocks);
 
-    std::vector<uint8_t> staging(block_bytes);
+    std::vector<uint8_t> staging;
 
     for (uint32_t il = 0; il < n_layers; ++il) {
+        // ⚠ FILTERED LAYERS OWN NO TENSOR. This loop had no guard, so with an attention-only pool
+        // active it would dereference nullptr here -- the same hazard do_block_copy was fixed for,
+        // missed in the serdes because nothing in this lane saves paged state yet. Absence of a
+        // caller is not absence of a bug; it just moves the crash to whoever adds one.
+        if (!ds4p_layer_kv(layer_has_kv, il)) { continue; }
+
+        const size_t lbb = bb_of(il);   // per-layer, never the pool-wide block_bytes
+
         for (const auto & run : runs) {
             const bool     gpu   = block_manager.is_gpu(run.first);
             const uint32_t local = gpu ? run.first : run.first - num_gpu_blocks;
-            const size_t   bytes = (size_t) run.second * block_bytes;
+            const size_t   bytes = (size_t) run.second * lbb;
 
             struct ggml_tensor * layer = gpu ? kv_gpu_layers[il] : kv_cpu_layers[il];
 
             if (staging.size() < bytes) {
                 staging.resize(bytes);
             }
-            ggml_backend_tensor_get(layer, staging.data(), (size_t) local * block_bytes, bytes);
+            ggml_backend_tensor_get(layer, staging.data(), (size_t) local * lbb, bytes);
             io.write(staging.data(), bytes);
         }
     }
@@ -784,13 +865,19 @@ void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
     // prefill at 2K. Consecutive ids on the same device go up in one call.
     const auto runs = contiguous_runs(ids);
 
-    std::vector<uint8_t> staging(block_bytes);
+    std::vector<uint8_t> staging;
 
     for (uint32_t il = 0; il < n_layers; ++il) {
+        // Mirrors state_write exactly -- filtered layers own no tensor, and the two loops must
+        // skip the SAME layers or the byte stream desynchronises silently on restore.
+        if (!ds4p_layer_kv(layer_has_kv, il)) { continue; }
+
+        const size_t lbb = bb_of(il);
+
         for (const auto & run : runs) {
             const bool     gpu   = block_manager.is_gpu(run.first);
             const uint32_t local = gpu ? run.first : run.first - num_gpu_blocks;
-            const size_t   bytes = (size_t) run.second * block_bytes;
+            const size_t   bytes = (size_t) run.second * lbb;
 
             struct ggml_tensor * layer = gpu ? kv_gpu_layers[il] : kv_cpu_layers[il];
 
@@ -798,7 +885,7 @@ void llama_kv_cache_paged::state_read(llama_io_read_i & io, llama_seq_id seq_id,
                 staging.resize(bytes);
             }
             io.read(staging.data(), bytes);
-            ggml_backend_tensor_set(layer, staging.data(), (size_t) local * block_bytes, bytes);
+            ggml_backend_tensor_set(layer, staging.data(), (size_t) local * lbb, bytes);
         }
     }
 

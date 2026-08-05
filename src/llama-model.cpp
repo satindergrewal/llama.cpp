@@ -2501,28 +2501,38 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 if (n > pg_match_count) { pg_match_count = n; pg_head_dim = hd; pg_n_head = hkv; }
                             }
 
-                            std::vector<uint8_t> pg_match(pg_n_layers, 0);
-                            for (uint32_t il = 0; il < pg_n_layers; ++il) {
-                                pg_match[il] = (hparams.n_embd_head_v(il) == pg_head_dim &&
-                                                hparams.n_head_kv(il)     == pg_n_head) ? 1 : 0;
-                            }
-
-                            LLAMA_LOG_INFO("%s: paged pool geometry CHOSEN: head_dim=%u n_head_kv=%u "
-                                    "serving %u/%u layers\n", __func__,
+                            LLAMA_LOG_INFO("%s: paged pool majority geometry: head_dim=%u n_head_kv=%u "
+                                    "(%u/%u layers)\n", __func__,
                                     pg_head_dim, pg_n_head, pg_match_count, pg_n_layers);
-                            if (pg_match_count < pg_n_layers) {
-                                // Named, not silent: a layer that quietly never reaches the paged
-                                // consumer is audit finding 5 at layer granularity.
-                                LLAMA_LOG_WARN("%s: %u layer(s) have a DIFFERENT head geometry and take "
-                                        "the static path; excluded from the pool rather than allocated "
-                                        "unused. Paging them needs a second pool.\n",
-                                        __func__, pg_n_layers - pg_match_count);
-                            }
 
                             auto * paged_attn = new llama_kv_cache_paged(pg_head_dim, pg_n_head,
                                     pg_block_size, pg_n_layers, cparams.n_ubatch, cparams.n_seq_max);
 
-                            paged_attn->set_layer_filter(std::move(pg_match));
+                            // ★ PER-LAYER GEOMETRY: every layer gets a tensor shaped for ITS OWN
+                            // head_dim, so an interleaved-SWA model pages its global AND its sliding
+                            // layers from ONE pool. The majority value above survives only as the
+                            // scalar fallback for uniform architectures.
+                            //
+                            // This replaces a filter that excluded the minority geometry. The filter
+                            // was correct as far as it went -- it stopped ~400 MB of tensors being
+                            // allocated and never touched -- but it made "cannot page these layers"
+                            // permanent. Per-layer geometry is the same amount of memory saved AND
+                            // the layers actually page.
+                            //
+                            // ⚠ Deliberately NOT two pools. Two pools would need two block tables,
+                            // two allocators, two sets of scheduler state and a rule for what happens
+                            // when they disagree about which blocks are free. The pool already stored
+                            // one tensor per layer; only the DESCRIPTION of their shape was pool-wide,
+                            // by convention. Block ids stay valid everywhere because every layer keeps
+                            // the same block COUNT regardless of row width.
+                            {
+                                std::vector<uint32_t> pg_hd(pg_n_layers), pg_hkv(pg_n_layers);
+                                for (uint32_t il = 0; il < pg_n_layers; ++il) {
+                                    pg_hd[il]  = hparams.n_embd_head_v(il);
+                                    pg_hkv[il] = hparams.n_head_kv(il);
+                                }
+                                paged_attn->set_layer_geometry(std::move(pg_hd), std::move(pg_hkv));
+                            }
 
                             // Every layer of a pure-SWA arch holds KV (SWA changes the WINDOW, not
                             // whether the layer has a cache), so no attention-only filter here --

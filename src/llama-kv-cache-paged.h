@@ -71,6 +71,11 @@ class llama_kv_cache_paged : public llama_memory_i {
     // KV tensor as "not pageable" -- so no caller needs to know about this filter.
     void set_layer_filter(std::vector<uint8_t> has_kv);
 
+    // Per-layer head geometry, for interleaved-SWA architectures where global and sliding layers
+    // have different head_dim. Must be called BEFORE init()/init_multi() -- it decides allocation.
+    // Passing empty vectors (or not calling this) keeps the uniform behaviour exactly.
+    void set_layer_geometry(std::vector<uint32_t> head_dims, std::vector<uint32_t> n_heads_kv);
+
     bool self_drive_begin(int32_t n_tokens);
     void self_drive_end();
     void self_drive_release_info();
@@ -189,6 +194,29 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     // empty = every layer has KV (default, unchanged behaviour)
     std::vector<uint8_t> layer_has_kv;
+
+    // ★ PER-LAYER GEOMETRY. Empty = every layer uses the scalars below, which is the old behaviour
+    // exactly -- so architectures with uniform heads are untouched and carry no risk from this.
+    //
+    // The pool already stored ONE TENSOR PER LAYER; only the DESCRIPTION of their shape was
+    // pool-wide, by convention rather than necessity. Making it per-layer is what lets an
+    // interleaved-SWA model page its global AND its sliding layers from a single pool, instead of
+    // a second pool with its own block table, allocator and scheduler state.
+    //
+    // Block COUNT stays shared and so do block ids: a block id must be valid in every layer, and it
+    // is, because each layer's tensor has the same number of blocks regardless of row width.
+    std::vector<uint32_t> layer_head_dim;     // empty, or n_layers entries
+    std::vector<uint32_t> layer_n_heads_kv;   // empty, or n_layers entries
+    std::vector<uint32_t> layer_block_bytes;  // derived in init(); empty = use block_bytes
+
+    uint32_t hd_of(uint32_t il)  const { return layer_head_dim.empty()    ? head_dim    : layer_head_dim[il];    }
+    uint32_t hkv_of(uint32_t il) const { return layer_n_heads_kv.empty()  ? n_heads_kv  : layer_n_heads_kv[il];  }
+    // ⚠ USE THIS, NEVER block_bytes, anywhere a LAYER's bytes are meant. do_block_copy staged
+    // through one buffer sized from the pool-wide value; with per-layer widths that either truncates
+    // a copy or reads past the source, on the GPU<->CPU eviction path -- which runs rarely, under
+    // memory pressure, and is not exercised by any gate here. Silent corruption under load is the
+    // worst thing to ship, so the accessor exists to make the pool-wide value hard to use by accident.
+    uint32_t bb_of(uint32_t il)  const { return layer_block_bytes.empty() ? block_bytes : layer_block_bytes[il]; }
 
     const uint32_t head_dim;
     const uint32_t n_heads_kv;
