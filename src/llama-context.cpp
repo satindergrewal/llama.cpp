@@ -1979,7 +1979,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        // ★ DS4P_DECODE_TRACE -- two-sided bracket around the only substantial call between the
+        // scheduler's step() returning OK and this loop's `while (mctx->next())`. Built for the Hy3
+        // flat-paged hang 2026-08-06, where the server admits a request, checks out a block, step()
+        // returns OK, and then nothing is ever logged again.
+        //
+        // `sample` is blocked on this box even with the correct PID and lldb can only be used when it
+        // LAUNCHES the process, so for a HANG (as opposed to a crash) no stack is obtainable here.
+        // A marker is not a downgrade from a debugger, it is the only instrument available.
+        //
+        // Three outcomes, written down BEFORE the run so the result can falsify me:
+        //   neither line        -> we never reach process_ubatch; the hang is earlier than located
+        //   ENTER only          -> confirmed inside graph build/compute for a flat paged memory
+        //   ENTER+EXIT looping  -> the loop never satisfies its exit condition, which would
+        //                          contradict llama_kv_cache_paged_context::next() and mean that
+        //                          "it terminates" reading was wrong too
+        const bool ds4p_trace = getenv("DS4P_DECODE_TRACE") != nullptr;
+        if (ds4p_trace) {
+            LLAMA_LOG_WARN("DS4P-DECODE ENTER process_ubatch n_tokens=%u n_seqs=%u\n",
+                           ubatch.n_tokens, ubatch.n_seqs);
+        }
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (ds4p_trace) {
+            LLAMA_LOG_WARN("DS4P-DECODE EXIT  process_ubatch res=%s status=%d\n",
+                           res ? "ok" : "NULL", (int) status);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
