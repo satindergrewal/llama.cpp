@@ -1196,6 +1196,45 @@ void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch* ubatch) {
             if (bt) { fprintf(stderr, " btab[0..3]=%d,%d,%d,%d", bt[0], bt[1], bt[2], bt[3]); }
             fprintf(stderr, "\n");
         }
+
+        // ★ WRITE-SLOT COVERAGE INVARIANT, checked on EVERY ubatch rather than dumped.
+        //
+        // The write kernel stores token t at slot slots[t], and every reader addresses position p as
+        // btab[p/bs]*bs + p%bs. Those two have to agree for every token or the cache is written
+        // somewhere nothing will look. This is the last story standing after poison: a slot that
+        // disagrees is invisible on the first request -- the block holds zeros, or NaN under poison,
+        // and apparently neither perturbs the output -- and reads as another sequence's data once
+        // blocks are recycled, which is exactly the ordinal signature.
+        //
+        // A dump would need me to eyeball 50,000 numbers. An invariant fires by itself.
+        static const bool cov = getenv("DS4P_SLOT_COVER") != nullptr;
+        const int32_t * bt_c = mctx->get_block_table();
+        // block size is not exposed on the paged context, and deriving it from a slot would be
+        // circular -- take it from cparams, which is where the cache got it in the first place.
+        const int32_t bs_c = (int32_t) cparams.block_size;
+        if (cov && slots_use && bt_c && ubatch->pos && bs_c > 0) {
+            const int32_t * bt = bt_c;
+            const int32_t bs = bs_c;
+            static int64_t bad = 0, checked = 0;
+            for (uint32_t t = 0; t < ubatch->n_tokens; ++t) {
+                const int32_t pos = (int32_t) ubatch->pos[t];
+                if (pos < 0) { continue; }
+                const int32_t want = bt[pos/bs]*bs + pos%bs;
+                ++checked;
+                if (slots_use[t] != want) {
+                    if (++bad <= 8) {
+                        fprintf(stderr, "DS4P-SLOTMISMATCH t=%u pos=%d slot=%d want=%d (blk=%d bs=%d)\n",
+                                t, pos, slots_use[t], want, bt[pos/bs], bs);
+                    }
+                }
+            }
+            static int64_t last_report = 0;
+            if (checked - last_report > 200000) {
+                last_report = checked;
+                fprintf(stderr, "DS4P-SLOTCOVER checked=%lld mismatched=%lld\n",
+                        (long long) checked, (long long) bad);
+            }
+        }
     }
 }
 
