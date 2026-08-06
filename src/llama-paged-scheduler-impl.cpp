@@ -143,8 +143,18 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
 
             if (kv_cache_manager != nullptr && !group.logical_seq.empty()) {
                 const uint32_t bs = kv_cache_manager->get_block_size();
-                for (auto & src_ptr : running) {
-                    llama_sequence_group * src = src_ptr.get();
+                // ⚠ SCAN BOTH SETS. queue_request ends with set_waiting(), so a request in flight is
+                // not necessarily in `running` when the NEXT one is admitted -- it is promoted on a
+                // later step(). Scanning only `running` found an EMPTY LIST every time (measured:
+                // "DS4P-SHARE scan: running=0"), so discovery never fired and the feature was dark
+                // despite correct logic. Any group with computed KV is a valid prefix source
+                // regardless of which queue currently holds it.
+                std::vector<llama_sequence_group *> candidates;
+                for (auto & g : running) { if (g) { candidates.push_back(g.get()); } }
+                for (auto & g : waiting) { if (g) { candidates.push_back(g.get()); } }
+                for (auto * src_raw : candidates) {
+                    auto & src_ptr = src_raw;
+                    llama_sequence_group * src = src_ptr;
                     if (src == nullptr || src->request_id == group.request_id) { continue; }
 
                     // ⚠ Cap at the source's n_past, NOT its logical_seq length. logical_seq is what
@@ -165,6 +175,12 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                     n = bs ? (n / bs) * bs : 0;
                     if (n > best_n) { best_n = n; best_src = src; }
                 }
+            }
+
+            if (getenv("DS4P_DECODE_TRACE")) {
+                LLAMA_LOG_WARN("DS4P-SHARE scan: running=%zu best_n=%u src=%d my_prompt=%u\n",
+                               running.size(), best_n,
+                               best_src ? best_src->request_id : -1, group.n_prompt);
             }
 
             if (best_n > 0 && best_src != nullptr) {
