@@ -243,6 +243,15 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             // needed only bring-up, not a new kernel.
             // NOTE: this arch passes `wo` INTO build_attn, so the paged branch applies it itself.
             const auto * pg_ctx = inp_attn->mctx ? inp_attn->mctx->get_attn_paged() : nullptr;
+            // ★ Print the pointer the consumer ACTUALLY queries. The exit-A marker prints
+            // llm_graph_context::mctx, which is a DIFFERENT variable -- comparing that against
+            // DS4P-SET made three readings look contradictory when the instrument was simply
+            // aimed at the wrong object.
+            // Attribute EVERY null to its context object, not just layer 0 -- the question is
+            // whether all the static-path layers belong to one (reserve-time) context.
+            if (getenv("DS4P_DECODE_TRACE") && pg_ctx == nullptr) {
+                LLAMA_LOG_WARN("DS4P-NULLCTX ctx=%p il=%d\n", (const void *) inp_attn->mctx, il);
+            }
             ggml_tensor * cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur,
                     hparams.f_attention_scale, il,
                     hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);

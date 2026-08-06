@@ -158,6 +158,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
 }
 
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    // ★ ENTRY marker. A marker INSIDE the branch you suspect only reports on that branch; this one
+    // reports whether we are even in the right function. Gemma4 provably owns an llama_kv_cache_iswa
+    // (llama-model.cpp:2618 attaches its paged pool) yet the mid-function marker read ZERO.
+    if (getenv("DS4P_DECODE_TRACE")) {
+        LLAMA_LOG_WARN("DS4P-ISWA-ENTER init_batch\n");
+    }
     GGML_UNUSED(embd_all);
 
     // first try simple split
@@ -207,6 +213,17 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
             ubatches.size() == 1 && ubatches[0].n_seqs == 1 &&
             (mem_attn_paged->self_drive_active() || !mem_attn_paged->has_paged_batch_info())) {
             mem_attn_paged->self_drive_begin((int32_t) ubatches[0].n_tokens);
+        }
+
+        // ★ DS4P_DECODE_TRACE: is batch info visible HERE, where the paged child context is built?
+        // Gemma4 shows 330 layer-instances on the STATIC path with a paged pool allocated beside
+        // them, so this gate is denying the child context. Same condition exists in
+        // llama-memory-hybrid.cpp:176. Log it in BOTH wrappers rather than reasoning about ordering.
+        if (getenv("DS4P_DECODE_TRACE")) {
+            LLAMA_LOG_WARN("DS4P-ISWA init_batch: mem_attn_paged=%d has_paged_batch_info=%d ubatches=%zu\n",
+                           mem_attn_paged != nullptr,
+                           mem_attn_paged ? (int) mem_attn_paged->has_paged_batch_info() : -1,
+                           ubatches.size());
         }
 
         llama_memory_context_ptr paged_ctx;
@@ -267,6 +284,17 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
             mem_attn_paged->self_drive_begin((int32_t) ubatches[0].n_tokens);
         }
 
+        // ★ The EQUAL-split branch's paged block -- the one Gemma4 actually reaches. The simple-split
+        // branch above is skipped whenever unified is false, which --kv-paged requires, so every
+        // paged run on this arch lands HERE. Instrumented after mistaking "my marker was in the
+        // skipped branch" for "the block is unreachable".
+        if (getenv("DS4P_DECODE_TRACE")) {
+            LLAMA_LOG_WARN("DS4P-ISWA-EQ init_batch: mem_attn_paged=%d has_paged_batch_info=%d ubatches=%zu\n",
+                           mem_attn_paged != nullptr,
+                           mem_attn_paged ? (int) mem_attn_paged->has_paged_batch_info() : -1,
+                           ubatches.size());
+        }
+
         llama_memory_context_ptr paged_ctx2;
         if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
             paged_ctx2 = mem_attn_paged->init_batch_with_ubatches(ubatches);
@@ -277,6 +305,12 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         if (paged_ctx2) {
             ctx2->set_attn_paged_ctx(std::move(paged_ctx2));
+            // ★ INSTANCE IDENTITY. The gate passes and the graph still reads nullptr 330 times, so
+            // the question is whether the context the WRAPPER populates is the same object the GRAPH
+            // reads. Pointer value settles that in one run; no argument can.
+            if (getenv("DS4P_DECODE_TRACE")) {
+                LLAMA_LOG_WARN("DS4P-SET paged child set on iswa_ctx=%p\n", (void *) ctx2.get());
+            }
         }
 
         return ctx2;

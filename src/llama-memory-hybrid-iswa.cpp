@@ -136,6 +136,16 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
         // Dark until scheduler driving lands: has_paged_batch_info() is false without it,
         // so this cannot trip the init ordering assert.
         llama_memory_context_ptr paged_ctx;
+        // ★ DS4P_DECODE_TRACE, third of three identical gates (iswa:213, hybrid:176, here). This is
+        // the one Gemma4 uses. The comment above says "dark until scheduler driving lands" -- that
+        // landed, but the gate was never revisited, so paged stays dark on wrapper archs.
+        if (getenv("DS4P_DECODE_TRACE")) {
+            LLAMA_LOG_WARN("DS4P-HYBISWA init_batch: mem_attn_paged=%d has_paged_batch_info=%d ubatches=%zu\n",
+                           mem_attn_paged != nullptr,
+                           mem_attn_paged ? (int) mem_attn_paged->has_paged_batch_info() : -1,
+                           ubatches.size());
+        }
+
         if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
             paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches); // copy: hybrid ctx owns the originals
         }

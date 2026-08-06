@@ -2010,6 +2010,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //                          "it terminates" reading was wrong too
         const bool ds4p_trace = getenv("DS4P_DECODE_TRACE") != nullptr;
         if (ds4p_trace) {
+            // ★ FINAL DISCRIMINATOR for the Gemma4 routing bug: which context object does
+            // llama_context actually hand the graph? The wrapper attaches the paged child to the
+            // context init_batch RETURNS (DS4P-SET), and the consumer reads nullptr from a different
+            // address. If this pointer differs from the DS4P-SET ones, the context is replaced
+            // between creation and use, and the defect is here rather than in the wrapper or arch.
+            LLAMA_LOG_WARN("DS4P-CTX process_ubatch mctx=%p\n", (const void *) mctx.get());
             // ⚠ n_seqs is NOT the sequence count. llama-batch.h: "n_seqs = sequence SETS",
             // "n_seqs_unq = UNIQUE sequence ids", and split_simple passes idxs.size(), so
             // n_seqs == n_tokens BY DESIGN for a simple split. I printed n_seqs, read 4-of-4 as an
