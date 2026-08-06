@@ -12830,6 +12830,7 @@ template [[host_name("kernel_paged_attn_champ_dk64_dv64"  )]] kernel paged_champ
 template [[host_name("kernel_paged_attn_champ_dk96_dv96"  )]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16,  96,  96>;
 template [[host_name("kernel_paged_attn_champ_dk128_dv128")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 128, 128>;
 template [[host_name("kernel_paged_attn_champ_dk192_dv192")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 192, 192>;
+template [[host_name("kernel_paged_attn_champ_dk256_dv256")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>;
 
 
 // ★ PAGED CHAMPION MASK FILL. The champion derives all causality from a mask buffer; the paged op
@@ -13390,6 +13391,7 @@ template [[host_name("kernel_paged_champ_vec_dk64_dv64"  )]] kernel paged_champ_
 template [[host_name("kernel_paged_champ_vec_dk96_dv96"  )]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4,  96,  96, 4>;
 template [[host_name("kernel_paged_champ_vec_dk128_dv128")]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 128, 128, 4>;
 template [[host_name("kernel_paged_champ_vec_dk192_dv192")]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 192, 192, 4>;
+template [[host_name("kernel_paged_champ_vec_dk256_dv256")]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 256, 256, 4>;
 
 template<
     typename kd4x4_t,

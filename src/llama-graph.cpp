@@ -4262,7 +4262,29 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
     // reproduces exactly the silence the limit exists to end.
     //
     // The staged tile must fit: 2 * bs * head_dim * sizeof(half) <= 32768.
-    if ((int64_t) cparams.block_size * head_dim > 8192) {
+    // ⚠ KERNEL-AWARE. This bound is the SCALAR STAGING kernel's: it stages K and V tiles in
+    // threadgroup memory, so 2 * bs * head_dim * sizeof(half) <= 32768. The CHAMPION does not stage
+    // that way -- its footprint is flat in nsg -- and it CONTRACTUALLY REQUIRES C == block_size == 64.
+    // Applying the staging bound when the champion will serve locked it out of exactly the
+    // configuration it exists for (measured 2026-08-06: at bs=64/D=256 every layer refused and
+    // silently took the static path, making a paged run indistinguishable from static).
+    //
+    // The champion is instantiated at dk64/96/128/192/256 and Metal compiles the 256 tile with zero
+    // program_source errors, so it genuinely fits at C=64/D=256.
+    //
+    // ⚠⚠ SAFETY: this relaxation is ONLY sound because a champion refusal is FATAL below. Without
+    // that, a refused layer would fall back to the scalar kernel at a geometry it cannot run, and an
+    // out-of-budget dispatch returns PLAUSIBLE NUMBERS rather than failing -- the silent-corruption
+    // incident this bound was calibrated against. Do not relax one without the other.
+    static const bool champ_on = []() {
+        const char * e = getenv("DS4P_METAL_CHAMP");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const bool champ_geometry = champ_on && cparams.block_size == 64 &&
+                                (head_dim == 64 || head_dim == 96 || head_dim == 128 ||
+                                 head_dim == 192 || head_dim == 256);
+
+    if (!champ_geometry && (int64_t) cparams.block_size * head_dim > 8192) {
         return reject("block_size x head_dim exceeds the staged-tile budget "
                       "(need block_size*head_dim <= 8192; e.g. head_dim 512 needs block_size <= 16)");
     }
@@ -4304,9 +4326,10 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
         static int last_il = -2;
         if (il != last_il) {
             last_il = il;
-            LLAMA_LOG_WARN("%s: layer %d took the STATIC path -- no paged context (the memory in use "
-                           "does not expose one). If --kv-paged was requested, this arch is not "
-                           "reaching the paged pool.\n", __func__, il);
+            LLAMA_LOG_WARN("%s: layer %d took the STATIC path -- no paged context. mctx=%p "
+                           "(compare against DS4P-SET: same pointer = the wrapper set it and the "
+                           "consumer still sees null; different = the graph holds a stale context)\n",
+                           __func__, il, (const void *) mctx);
         }
         return nullptr;
     }

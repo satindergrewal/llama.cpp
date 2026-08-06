@@ -5116,7 +5116,12 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     //   head_dim in the instantiated set.
     if (ggml_metal_paged_champ_enabled()) {
         const int n_seq_c = (int) blens->ne[0];
-        const bool hd_ok  = (head_dim == 64 || head_dim == 96 || head_dim == 128 || head_dim == 192);
+        // 256 added 2026-08-06: the champion is now instantiated at dk256_dv256 and the Metal
+        // shader COMPILES it (0 program_source errors at pipeline load), so the tile fits. The host
+        // lookup was always generic -- it builds the pipeline name from head_dim -- so this
+        // whitelist was the only thing keeping the champion off 256-wide models like Gemma4.
+        const bool hd_ok  = (head_dim == 64 || head_dim == 96 || head_dim == 128 || head_dim == 192 ||
+                             head_dim == 256);
         // ⚠ A QUANTISED CACHE MUST REFUSE HERE, and the reason is not "unimplemented" -- it is that
         // the three stride lines further down divide nb[] by sizeof(ggml_fp16_t). Found by the
         // repo-wide sweep run after the fitter turned out to be the FIFTH site of the same f16
@@ -5137,6 +5142,25 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             if (why != last_why) { last_why = why;
                 GGML_LOG_INFO("%s: CHAMP-PAGED REFUSED (%s) D=%d bs=%d n_seq=%d n_tokens=%d\n",
                               __func__, why, head_dim, bs_pa_lpk, n_seq_c, n_tokens);
+            }
+            // ⚠⚠ FATAL WHEN THE CAPABILITY GATE WAS RELAXED FOR US. llm_graph_context skips the
+            // staged-tile bound (block_size*head_dim <= 8192) when the champion will serve, so a
+            // layer admitted under that relaxation CANNOT legally run on the scalar kernel. Falling
+            // back would issue an out-of-budget dispatch, and those return PLAUSIBLE NUMBERS rather
+            // than failing -- the silent-corruption incident that bound was calibrated against.
+            //
+            // So the relaxation and this abort are ONE safety property: admitted-by-champion means
+            // served-by-champion or stop. Only fires when DS4P_METAL_CHAMP is on AND the geometry is
+            // the relaxed one; every other refusal keeps its existing benign fallback.
+            {
+                static const bool champ_on = getenv("DS4P_METAL_CHAMP") != nullptr &&
+                                             atoi(getenv("DS4P_METAL_CHAMP")) != 0;
+                if (champ_on && bs_pa_lpk == 64 && (int64_t) bs_pa_lpk * head_dim > 8192) {
+                    GGML_ABORT("%s: champion refused (%s) at D=%d bs=%d, but the capability gate was "
+                               "RELAXED for this geometry -- the scalar kernel cannot legally run it "
+                               "and would dispatch out of budget. Refusing to produce plausible "
+                               "garbage.\n", __func__, why, head_dim, bs_pa_lpk);
+                }
             }
         } else if (n_tokens == 1) {
             // ===== PAGED CHAMPION DECODE (vec) =====
