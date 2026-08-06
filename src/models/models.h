@@ -1208,8 +1208,31 @@ struct llama_model_deepseek4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    struct graph : public llm_graph_context_dsv4_mla {
+    struct graph : public llm_graph_context {
+        graph(const llm_graph_params & params) : llm_graph_context(params) {}
         graph(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_hc_pre(
+                ggml_tensor * x,
+                ggml_tensor * hc_fn,
+                ggml_tensor * hc_scale,
+                ggml_tensor * hc_base,
+                ggml_tensor ** post,
+                ggml_tensor ** comb,
+                int il) const;
+
+        ggml_tensor * build_hc_post(
+                ggml_tensor * x,
+                ggml_tensor * residual,
+                ggml_tensor * post,
+                ggml_tensor * comb,
+                int il) const;
+
+        ggml_tensor * build_hc_head(
+                ggml_tensor * x,
+                ggml_tensor * hc_fn,
+                ggml_tensor * hc_scale,
+                ggml_tensor * hc_base) const;
 
         ggml_tensor * build_attention(
                 const llama_model & model,
@@ -1288,6 +1311,23 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * kv,
                 ggml_tensor * sinks,
                 float kq_scale,
+                int il) const;
+
+        ggml_tensor * build_raw_attention(
+                llm_graph_input_dsv4_raw * inp_attn,
+                ggml_tensor * q,
+                ggml_tensor * kv,
+                ggml_tensor * sinks,
+                float kq_scale,
+                int il) const;
+
+        ggml_tensor * build_hc_pre(
+                ggml_tensor * x,
+                ggml_tensor * weights,
+                int il) const;
+
+        ggml_tensor * build_hc_sinkhorn(
+                ggml_tensor * comb,
                 int il) const;
     };
 
