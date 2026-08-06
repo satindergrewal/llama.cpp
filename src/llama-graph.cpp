@@ -1166,6 +1166,37 @@ void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch* ubatch) {
     if (paged_batch_lens) {
         ggml_backend_tensor_set(paged_batch_lens, lens_use, 0, ggml_nbytes(paged_batch_lens));
     }
+
+    // ★ DS4P_METADUMP -- the four small arrays, first N ubatches only.
+    //
+    // Poisoning the pool with 0xFF changed every byte of KV and did not change the failure by one
+    // token, so the ~50k cross-request defect cannot involve block CONTENT. That leaves these four
+    // arrays plus the block table, which are small enough to print and diff between request 1 (which
+    // is correct) and request 2 (which is not). Bounded to the first few ubatches on purpose: an
+    // uncapped dump is what made me retract a correct finding earlier in this lane, and a capped one
+    // that lies about being capped is worse. It prints the cap it is using.
+    {
+        static const int dump_n = [](){ const char * e = getenv("DS4P_METADUMP");
+                                        return e ? atoi(e) : 0; }();
+        static int seen = 0;
+        if (dump_n > 0 && seen < dump_n) {
+            ++seen;
+            const int32_t * bt   = mctx->get_block_table();
+            const int32_t * clen = mctx->get_context_lens();
+            fprintf(stderr, "DS4P-META[%d/%d] n_tokens=%u n_seq=%d", seen, dump_n, ubatch->n_tokens, n_seq);
+            if (clen) { fprintf(stderr, " ctx_lens[0]=%d", clen[0]); }
+            if (offs_use) { fprintf(stderr, " offs[0]=%d", offs_use[0]); }
+            if (lens_use) { fprintf(stderr, " lens[0]=%d", lens_use[0]); }
+            if (slots_use) {
+                fprintf(stderr, " slots[0..3]=%d,%d,%d,%d", slots_use[0],
+                        ubatch->n_tokens > 1 ? slots_use[1] : -1,
+                        ubatch->n_tokens > 2 ? slots_use[2] : -1,
+                        ubatch->n_tokens > 3 ? slots_use[3] : -1);
+            }
+            if (bt) { fprintf(stderr, " btab[0..3]=%d,%d,%d,%d", bt[0], bt[1], bt[2], bt[3]); }
+            fprintf(stderr, "\n");
+        }
+    }
 }
 
 bool llm_graph_input_attn_kv_paged::can_reuse(const llm_graph_params & /*params*/) {
