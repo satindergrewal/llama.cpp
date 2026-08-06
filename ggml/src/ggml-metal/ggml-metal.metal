@@ -13030,15 +13030,18 @@ kernel void kernel_paged_champ_mask_tiled(
     const int nblk1 = (args.n_tokens_total + QB - 1)/QB;
     const int nblk0 = (n_kv + CB - 1)/CB;
 
-    const int kb   = (int) tgpig.x;   // kv-block
-    const int qb   = (int) tgpig.y;   // q-block
+    // ⚠ ONE THREAD PER TILE FOR blk, NOT ONE THREADGROUP. The first version of this kernel used a
+    // threadgroup per tile and bought 4.7% -- it cut the constant and kept the shape. blk needs a
+    // single byte per tile, and the mask needs only the class-1 tiles (about two per q-block), so a
+    // threadgroup now classifies 32 kv-blocks at once and then fills cooperatively.
+    const int kb0  = (int) tgpig.x * 32;
+    const int qb   = (int) tgpig.y;
     const int head = (int) tgpig.z;
-    if (kb >= nblk0 || qb >= nblk1 || head >= args.n_heads) {
+    if (qb >= nblk1 || head >= args.n_heads) {
         return;
     }
 
     const int row_lo = qb*QB;
-    const int col_lo = kb*CB;
     const int r_hi   = min(row_lo + QB, args.n_tokens_total) - 1;
 
     int s_lo = -1, s_hi = -1;
@@ -13049,54 +13052,58 @@ kernel void kernel_paged_champ_mask_tiled(
         if (r_hi   >= off && r_hi   < off + len) { s_hi = s; }
     }
 
-    char cls = 1;
-    int  seq = -1;
-    if (s_lo >= 0 && s_lo == s_hi) {
-        seq = s_lo;
-        const int first = ctx_lens[seq] - batch_lens[seq];
-        const int qp_lo = first + (row_lo - batch_offsets[seq]);
-        const int qp_hi = first + (r_hi   - batch_offsets[seq]);
-        const int W     = args.visibility_window;
+    const int  seq   = (s_lo >= 0 && s_lo == s_hi) ? s_lo : -1;
+    const int  first = seq >= 0 ? ctx_lens[seq] - batch_lens[seq] : 0;
+    const int  qp_lo = seq >= 0 ? first + (row_lo - batch_offsets[seq]) : 0;
+    const int  qp_hi = seq >= 0 ? first + (r_hi   - batch_offsets[seq]) : 0;
+    const int  W     = args.visibility_window;
 
-        const bool all_vis = (col_lo + CB - 1 <= qp_lo) && (W == 0 || col_lo > qp_hi - W);
-        const bool non_vis = (col_lo > qp_hi) || (W != 0 && col_lo + CB - 1 <= qp_lo - W);
+    // Each thread owns one kv-block: classify it and write its blk byte.
+    threadgroup short need[32];
+    need[tiisg] = -1;
 
-        if (non_vis)                              { cls = 0; }
-        else if (all_vis && args.rel_extent == 0) { cls = 2; }
-    }
-
-    if (tiisg == 0) {
+    const int kb = kb0 + (int) tiisg;
+    if (kb < nblk0) {
+        char cls = 1;
+        if (seq >= 0) {
+            const int col_lo = kb*CB;
+            const bool all_vis = (col_lo + CB - 1 <= qp_lo) && (W == 0 || col_lo > qp_hi - W);
+            const bool non_vis = (col_lo > qp_hi) || (W != 0 && col_lo + CB - 1 <= qp_lo - W);
+            if (non_vis)                              { cls = 0; }
+            else if (all_vis && args.rel_extent == 0) { cls = 2; }
+        }
         blk_skip[((uint64_t) head*nblk1 + qb)*nblk0 + kb] = cls;
+        if (cls == 1) { need[tiisg] = (short) tiisg; }
     }
 
-    if (cls != 1) {
-        return;   // the champion will not read this tile's mask
-    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int idx = (int) tiisg; idx < QB*CB; idx += 32) {
-        const int j   = idx / CB;
-        const int i   = idx % CB;
-        const int row = row_lo + j;
-        const int col = col_lo + i;
-        if (row >= args.n_tokens_total || col >= n_kv) { continue; }
+    // Cooperative fill of whichever of those 32 tiles are class 1 -- typically one, never many.
+    for (short t = 0; t < 32; ++t) {
+        if (need[t] < 0) { continue; }
+        const int col_lo = (kb0 + t)*CB;
 
-        const uint64_t moff = (uint64_t) head*args.n_tokens_total*n_kv + (uint64_t) row*n_kv + col;
-        if (seq < 0) { mask[moff] = (half) -MAXHALF; continue; }
+        for (int idx = (int) tiisg; idx < QB*CB; idx += 32) {
+            const int row = row_lo + idx / CB;
+            const int col = col_lo + idx % CB;
+            if (row >= args.n_tokens_total || col >= n_kv) { continue; }
 
-        const int q_pos = (ctx_lens[seq] - batch_lens[seq]) + (row - batch_offsets[seq]);
-        bool vis = (col <= q_pos);
-        if (vis && args.visibility_window > 0) {
-            vis = (col > q_pos - args.visibility_window);
-        }
+            const uint64_t moff = (uint64_t) head*args.n_tokens_total*n_kv + (uint64_t) row*n_kv + col;
+            if (seq < 0) { mask[moff] = (half) -MAXHALF; continue; }
 
-        half v = vis ? (half) 0.0f : (half) -MAXHALF;
-        if (vis && args.rel_extent > 0) {
-            const int rd = q_pos - col;
-            if (rd >= 0 && rd < args.rel_extent) {
-                v = (half) rel[((uint64_t) row * args.n_heads + head) * args.rel_extent + rd];
+            const int q_pos = first + (row - batch_offsets[seq]);
+            bool vis = (col <= q_pos);
+            if (vis && W > 0) { vis = (col > q_pos - W); }
+
+            half v = vis ? (half) 0.0f : (half) -MAXHALF;
+            if (vis && args.rel_extent > 0) {
+                const int rd = q_pos - col;
+                if (rd >= 0 && rd < args.rel_extent) {
+                    v = (half) rel[((uint64_t) row * args.n_heads + head) * args.rel_extent + rd];
+                }
             }
+            mask[moff] = v;
         }
-        mask[moff] = v;
     }
 }
 

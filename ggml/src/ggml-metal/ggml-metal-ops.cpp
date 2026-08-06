@@ -5347,7 +5347,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 if (tile_ok) {
                     const int nblk1 = (n_tokens + OP_FLASH_ATTN_EXT_NQPSG - 1)/OP_FLASH_ATTN_EXT_NQPSG;
                     const int nblk0 = (n_kv_c  + OP_FLASH_ATTN_EXT_NCPSG - 1)/OP_FLASH_ATTN_EXT_NCPSG;
-                    ggml_metal_encoder_dispatch_threadgroups(enc, nblk0, nblk1, n_heads, 32, 1, 1);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, (nblk0 + 31)/32, nblk1, n_heads, 32, 1, 1);
                 } else {
                     ggml_metal_encoder_dispatch_threadgroups(enc,
                         (n_kv_c + 31)/32, n_tokens, n_heads, 32, 1, 1);
