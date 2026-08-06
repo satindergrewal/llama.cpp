@@ -2809,6 +2809,11 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
 // land OUTSIDE the allocation -- silent heap corruption. Reading the env twice is the bug; read it
 // ONCE and let both sites share the answer. A comment saying "they agree in practice" is not a
 // guard, and "in practice" is what this lane keeps getting burned by.
+// Workgroups for the champion decode dispatch. ONE definition: the scratch reservation above and
+// the dispatch below must agree, and reading it from two places is how the mask workspace nearly
+// became silent heap corruption (audit #2245 finding 3).
+#define DS4P_CHAMP_VEC_NWG 32
+
 bool ggml_metal_paged_champ_enabled(void) {
     static const bool en = [] {
         const char * e = getenv("DS4P_METAL_CHAMP");
@@ -2846,7 +2851,19 @@ size_t ggml_metal_op_paged_attn_extra_mask(const ggml_tensor * op) {
     const size_t blk_sz  = GGML_PAD((size_t) n_heads_e *
                                     ((n_tokens + OP_FLASH_ATTN_EXT_NQPSG - 1)/OP_FLASH_ATTN_EXT_NQPSG) *
                                     ((n_kv + OP_FLASH_ATTN_EXT_NCPSG - 1)/OP_FLASH_ATTN_EXT_NCPSG + 1), 32);
-    return mask_sz + blk_sz;
+
+    // ★ vec_reduce scratch, DECODE SHAPE ONLY. The champion's decode dispatch was pinned at nwg=1,
+    // which is n_heads threadgroups for the whole attention -- 16 on this model, on a 40-core GPU.
+    // With nwg>1 each workgroup writes a partial result plus its S and M here, and a reduce pass
+    // combines them. Reserved only at n_tokens == 1: at prefill n_tokens the same formula would ask
+    // for gigabytes, and prefill does not take the vec path at all.
+    size_t tmp_sz = 0;
+    if (n_tokens == 1) {
+        const int64_t head_dim = op->src[0]->ne[0];
+        const int64_t nrows    = n_heads_e * n_tokens;
+        tmp_sz = GGML_PAD((size_t) nrows * DS4P_CHAMP_VEC_NWG * (head_dim + 2) * sizeof(float), 32);
+    }
+    return mask_sz + blk_sz + tmp_sz;
 }
 
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
@@ -5175,8 +5192,17 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             // SINGLE dispatch: nwg=1 means the kernel writes dst directly, no vec_reduce stage.
             // WARNING: the vec threadgroup is 2-D (32, nsg, 1) -- NOT (32*nsg, 1, 1) like the
             // prefill path. Copying the prefill shape here compiles cleanly and is wrong.
-            const int vec_nsg = 4;
-            auto vp = ggml_metal_library_get_pipeline_paged_champ_vec(lib, op, vec_nsg);
+            // ★ WORKGROUPS. This was pinned at nwg=1 -- one threadgroup per (token, head), which is
+            // n_heads threadgroups for the entire decode attention: 16 on a 40-core GPU. Upstream's
+            // own vec path runs nwg=32 for exactly this reason. DS4P_CHAMP_VEC_NWG=1 falls back to
+            // the single-dispatch form as a one-factor control.
+            int vec_nwg = DS4P_CHAMP_VEC_NWG;
+            if (const char * e = getenv("DS4P_CHAMP_VEC_NWG")) {
+                const int v = atoi(e);
+                if (v == 1 || v == DS4P_CHAMP_VEC_NWG) { vec_nwg = v; }
+            }
+            const int vec_nsg = vec_nwg == 1 ? 4 : 1;
+            auto vp = ggml_metal_library_get_pipeline_paged_champ_vec(lib, op, vec_nsg, vec_nwg);
             const uint64_t st = kv_cache->nb[1] / sizeof(ggml_fp16_t);
             const uint64_t sh = kv_cache->nb[2] / sizeof(ggml_fp16_t);
             const uint64_t sb = kv_cache->nb[3] / sizeof(ggml_fp16_t);
@@ -5254,16 +5280,38 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        6);
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(btab),     7);
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(clens),    8);
-            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),       9);
+            // At nwg>1 each workgroup writes a partial result plus its S and M into scratch, and a
+            // reduce pass combines them into dst. The scratch is carved after the mask and blk, and
+            // its size comes from the SAME DS4P_CHAMP_VEC_NWG the dispatch uses.
+            ggml_metal_buffer_id bid_tmp_d = bid_blk_d;
+            {
+                const int nblk1_d = (n_tokens + OP_FLASH_ATTN_EXT_NQPSG - 1)/OP_FLASH_ATTN_EXT_NQPSG;
+                const int nblk0_d = (n_kv_d  + OP_FLASH_ATTN_EXT_NCPSG - 1)/OP_FLASH_ATTN_EXT_NCPSG + 1;
+                bid_tmp_d.offs += GGML_PAD((size_t) n_heads * nblk1_d * nblk0_d, 32);
+            }
+            ggml_metal_encoder_set_buffer  (enc, vec_nwg == 1 ? ggml_metal_get_buffer_id(op) : bid_tmp_d, 9);
             ggml_metal_encoder_set_threadgroup_memory_size(enc, vp.smem, 0);
             {
                 static int lastd = -1;
                 if (head_dim != lastd) { lastd = head_dim;
-                    GGML_LOG_INFO("%s: CHAMP-VEC ACTIVE (decode) D=%d bs=%d nsg=%d nwg=1 smem=%zu/32768\n",
-                                  __func__, head_dim, bs_pa_lpk, vec_nsg, vp.smem);
+                    GGML_LOG_INFO("%s: CHAMP-VEC ACTIVE (decode) D=%d bs=%d nsg=%d nwg=%d smem=%zu/32768\n",
+                                  __func__, head_dim, bs_pa_lpk, vec_nsg, vec_nwg, vp.smem);
                 }
             }
-            ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, n_heads, 1, 32, vec_nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, n_heads, vec_nwg, 32, vec_nsg, 1);
+
+            if (vec_nwg > 1) {
+                ggml_metal_op_concurrency_reset(ctx);   // the reduce reads what the vec just wrote
+
+                const int32_t nrows = n_heads * n_tokens;
+                ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = { nrows };
+                auto rp = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, head_dim, vec_nwg);
+                ggml_metal_encoder_set_pipeline(enc, rp);
+                ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_tmp_d, 1);
+                ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 2);
+                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*vec_nwg, 1, 1);
+            }
             return 1;
         } else {
             // Champion smem is nsg-INVARIANT for f16 KV (10,240 B at any nsg), so more simd

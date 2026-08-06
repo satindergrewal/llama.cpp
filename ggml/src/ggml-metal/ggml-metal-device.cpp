@@ -1324,7 +1324,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_mask
 // long KV -- an optimisation, not a requirement, and correctness comes first.
 // ⚠ The vec threadgroup is 2-D (32, nsg, 1), NOT (32*nsg, 1, 1) like the prefill port.
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_vec(
-        ggml_metal_library_t lib, const ggml_tensor * op, int nsg) {
+        ggml_metal_library_t lib, const ggml_tensor * op, int nsg, int nwg) {
     char base[256];
     char name[256];
 
@@ -1333,7 +1333,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_vec(
     const int32_t ns10 = (int32_t) (kvc->nb[1] / sizeof(ggml_fp16_t));   // stride_token, elements
 
     snprintf(base, 256, "kernel_paged_champ_vec_dk%d_dv%d", head_dim, head_dim);
-    snprintf(name, 256, "%s_ns%d_nsg%d_nwg1", base, ns10, nsg);
+    snprintf(name, 256, "%s_ns%d_nsg%d_nwg%d", base, ns10, nsg, nwg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1346,7 +1346,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_vec(
         ggml_metal_cv_set_int32(cv, ns10,  FC_FLASH_ATTN_EXT_VEC + 20);
         ggml_metal_cv_set_int32(cv, ns10,  FC_FLASH_ATTN_EXT_VEC + 21);  // K and V share the pitch
         ggml_metal_cv_set_int32(cv, nsg,   FC_FLASH_ATTN_EXT_VEC + 22);
-        ggml_metal_cv_set_int32(cv, 1,     FC_FLASH_ATTN_EXT_VEC + 23);  // nwg = 1 -> single dispatch
+        // nwg > 1 splits the KV walk across workgroups; each writes a partial result plus its
+        // S and M, and kernel_flash_attn_ext_vec_reduce combines them. At nwg == 1 the kernel writes
+        // dst directly and no reduce stage runs.
+        ggml_metal_cv_set_int32(cv, nwg,   FC_FLASH_ATTN_EXT_VEC + 23);
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
         ggml_metal_cv_free(cv);
     }

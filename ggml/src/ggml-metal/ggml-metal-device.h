@@ -145,7 +145,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_att
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_champ (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_mask (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_mask_tiled(ggml_metal_library_t lib);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_vec  (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_vec  (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nwg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge     (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht              (ggml_metal_library_t lib, int n);
