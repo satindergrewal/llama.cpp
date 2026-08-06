@@ -125,6 +125,60 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                                group.block_table.size(), group.n_prompt - n_past);
             }
         } else {
+            // ★ PREFIX SHARING across INDEPENDENT requests (the vLLM/SGLang gap).
+            //
+            // The scheduler already names three admission classes: WARM (prefix restored from a
+            // disk bank), FORK (brings its own blocks), COLD (nothing). A request that could inherit
+            // a LIVE sequence's prefix currently collapses into COLD and re-prefills from zero. This
+            // is the missing fourth case, not a new concept -- the comment at the WARM path already
+            // says "bank is just another source of a prefix".
+            //
+            // MVP is a linear scan, deliberately, not a radix trie: O(live_groups * prefix_len) is
+            // nothing at these sequence counts, and it needs NO index to keep coherent under
+            // eviction, preemption and block recycling -- all of which this scheduler does, and
+            // where a stale trie entry pointing at a recycled block is a silent-corruption bug.
+            // Verify-at-use beats invalidate-on-change here. Index it later, once it is measured.
+            uint32_t               best_n   = 0;
+            llama_sequence_group * best_src = nullptr;
+
+            if (kv_cache_manager != nullptr && !group.logical_seq.empty()) {
+                const uint32_t bs = kv_cache_manager->get_block_size();
+                for (auto & src_ptr : running) {
+                    llama_sequence_group * src = src_ptr.get();
+                    if (src == nullptr || src->request_id == group.request_id) { continue; }
+
+                    // ⚠ Cap at the source's n_past, NOT its logical_seq length. logical_seq is what
+                    // the sequence WILL be; n_past is what it has actually computed into KV. Sharing
+                    // blocks for tokens the source has not prefilled hands over KV that does not
+                    // exist yet -- allocated but never written -- which surfaces as garbage output,
+                    // not a crash.
+                    const size_t lim = std::min({ src->logical_seq.size(),
+                                                  group.logical_seq.size(),
+                                                  (size_t) src->n_past });
+                    uint32_t n = 0;
+                    while (n < lim && src->logical_seq[n] == group.logical_seq[n]) { ++n; }
+
+                    // ⚠ fork_blocks shares whole PHYSICAL blocks. A 100-token match at bs=16 may
+                    // share only 96: the partial block still belongs to the source and must be
+                    // COW-copied or re-prefilled, never aliased. Sharing a partially filled block is
+                    // how two sequences end up writing the same cells -- the -np>1 defect.
+                    n = bs ? (n / bs) * bs : 0;
+                    if (n > best_n) { best_n = n; best_src = src; }
+                }
+            }
+
+            if (best_n > 0 && best_src != nullptr) {
+                const uint32_t shared = kv_cache_manager->fork_blocks(*best_src, group, best_n);
+                if (shared > 0) {
+                    group.n_past = shared;
+                    LLAMA_LOG_INFO("%s: request %d admitted SHARED: %u of %u prompt tokens inherited "
+                                   "from live request %d (%zu blocks), %u left to prefill\n",
+                                   __func__, group.request_id, shared, group.n_prompt,
+                                   best_src->request_id, group.block_table.size(),
+                                   group.n_prompt - shared);
+                }
+            }
+
             // cold request (or a fork, which brings its own blocks): nothing may be left
             // parked under this id or it pins pool blocks nobody is ever going to claim
             kv_cache_manager->discard_restored(group.request_id);
