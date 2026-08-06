@@ -1,5 +1,7 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"    // inp_kv->mctx is the HYBRID context: needed COMPLETE
+#include "llama-kv-cache-paged.h"
 
 void llama_model_kimi_linear::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -248,6 +250,17 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
     auto * inp_attn_kv = !hparams.is_mla() ? inp_kv->get_attn() : nullptr;
     auto * inp_attn_k = hparams.is_mla() ? inp_k->get_attn() : nullptr;
 
+    // ★ PAGED CONSUMER (hybrid shape). Resolve HERE, from the wrapper input, and use it below --
+    // NOT from inside the layer body via the graph mctx. On a hybrid arch the attention CHILD
+    // context does not override get_attn_paged(), so resolving there returns nullptr every time and
+    // the model silently serves on the static path (measured on Qwen3.6: 110 layer instances).
+    //
+    // is_mla() selects ONE branch per checkpoint, before the layer loop. The MLA branch passes
+    // layer.wv_b in the v_mla slot and build_attn_paged_or_null asserts v_mla == nullptr, so only
+    // the non-MLA branch below can page. MLA Kimi needs an MLA paged kernel, which does not exist.
+    const llama_kv_cache_paged_context * pg_ctx =
+        (!hparams.is_mla() && inp_kv && inp_kv->mctx) ? inp_kv->mctx->get_attn_paged() : nullptr;
+
     // Output ids for selecting which tokens to output
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -467,7 +480,15 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
 
                 // Direct softmax attention (with MHA KV cache)
                 // Use build_attn with inp_attn for proper mask handling
+                // This branch passes wo + wo_s (wo_b is NULL), so the paged branch applies exactly those two.
+                ggml_tensor * cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur, kq_scale_mla, il,
+                        hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
+                if (cur_pg != nullptr) {
+                    cur = build_lora_mm(layer.wo, cur_pg, layer.wo_s);
+                    cb(cur, "attn_out_paged", il);
+                } else {
                 cur = build_attn(inp_attn_kv, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale_mla, il);
+                }
                 cb(cur, "mla_out", il);
             }
         }
