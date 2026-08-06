@@ -84,6 +84,13 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
 }
 
 bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint32_t n_warm) {
+    // ★ ENTRY marker. Two requests register but only ONE runs the prefix-share scan, so the second
+    // leaves before reaching it. Instrument the ENTRY before the branch -- the Gemma4 lesson.
+    if (getenv("DS4P_DECODE_TRACE")) {
+        LLAMA_LOG_WARN("DS4P-QREQ enter id=%d n_prompt=%u n_warm=%u kvmgr=%d logical=%zu\n",
+                       group.request_id, group.n_prompt, n_warm,
+                       kv_cache_manager != nullptr, group.logical_seq.size());
+    }
     // Rejecting any requests that exceeds max context for a seq
     if (group.n_prompt >= n_seq_max_ctx) {
         if (kv_cache_manager != nullptr) {
@@ -155,7 +162,19 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                 for (auto * src_raw : candidates) {
                     auto & src_ptr = src_raw;
                     llama_sequence_group * src = src_ptr;
-                    if (src == nullptr || src->request_id == group.request_id) { continue; }
+                    // ⚠ Do NOT skip on request_id. request_id IS the slot id and slot ids are
+                    // REUSED, so two concurrent live requests can carry the same id (measured:
+                    // both admissions logged id=1). Skipping on it made a live source look like
+                    // "myself" and killed sharing outright. The incoming group is not yet in either
+                    // queue, so identity by address is the correct and sufficient test.
+                    if (src == nullptr || src == &group) { continue; }
+
+                    // ⚠ A valid prefix source must actually HOLD BLOCKS. A group sitting in `waiting`
+                    // has a logical_seq and may have n_past set, but no block_table until it is
+                    // scheduled -- and fork_blocks returns 0 on an empty table, so discovery would
+                    // report a 960-token match and then silently share nothing. Filter here so the
+                    // scan cannot select a source it is impossible to inherit from.
+                    if (src->block_table.empty() || src->n_past == 0) { continue; }
 
                     // ⚠ Cap at the source's n_past, NOT its logical_seq length. logical_seq is what
                     // the sequence WILL be; n_past is what it has actually computed into KV. Sharing
