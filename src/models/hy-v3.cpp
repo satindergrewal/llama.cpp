@@ -163,7 +163,10 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
             //
             // ⚠ This arch passes wo/wo_b/wo_s INTO build_attn, so the paged branch must apply them
             // itself: the paged op returns the attention output only.
-            const auto * pg_ctx = inp_attn->mctx ? inp_attn->mctx->get_attn_paged() : nullptr;
+            // ⚠ Use the GRAPH context's own mctx (base type llama_memory_context_i*), NOT inp_attn->mctx:
+            // build_attn_inp_kv() static_casts mctx to llama_kv_cache_context, which is a wrong-type
+            // cast when the live memory is a paged cache. The base pointer always answers correctly.
+            const auto * pg_ctx = mctx ? mctx->get_attn_paged() : nullptr;
             ggml_tensor * cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur, kq_scale, il,
                     hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
             if (cur_pg != nullptr) {
@@ -345,7 +348,7 @@ llama_model_hy_v3::graph_mtp::graph_mtp(const llama_model & model, const llm_gra
         // Same paged consumer as the main pass. The MTP block is an ordinary decoder layer that
         // writes real KV, so leaving it on the static-only path would reproduce the startup crash
         // here the moment MTP is enabled under --kv-paged.
-        const auto * pg_ctx_mtp = inp_attn->mctx ? inp_attn->mctx->get_attn_paged() : nullptr;
+        const auto * pg_ctx_mtp = mctx ? mctx->get_attn_paged() : nullptr;
         ggml_tensor * cur_pg_mtp = build_attn_paged_or_null(pg_ctx_mtp, Qcur, Kcur, Vcur, kq_scale, il,
                 hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
         if (cur_pg_mtp != nullptr) {
