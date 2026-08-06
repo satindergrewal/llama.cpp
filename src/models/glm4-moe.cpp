@@ -1,5 +1,11 @@
 #include "models.h"
 
+// paged consumer. llama-kv-cache.h is required because mctx is typed as the DERIVED
+// llama_kv_cache_context; the accessor is inherited from llama_memory_context_i but the derived
+// type must be complete to reach it.
+#include "../llama-kv-cache.h"
+#include "../llama-kv-cache-paged.h"
+
 void llama_model_glm4_moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
@@ -152,7 +158,13 @@ llama_model_glm4_moe::graph::graph(const llama_model & model, const llm_graph_pa
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    auto * inp_attn = build_attn_inp_kv();
+    // ★ FLAT PAGED ARCH. build_attn_inp_kv() does static_cast<const llama_kv_cache_context*>(mctx),
+    // and on a flat paged memory there is no such object behind that pointer -- the graph constructor
+    // then hangs before a single layer is built (measured on Hy3 2026-08-06: 0 layers, process_ubatch
+    // entered and never returned, server starts and stalls forever with no error). When a paged pool
+    // is live every attention layer takes build_attn_paged_or_null, so the static input is not needed.
+    const auto * pg_ctx_top = mctx ? mctx->get_attn_paged() : nullptr;
+    auto * inp_attn = pg_ctx_top ? nullptr : build_attn_inp_kv();
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -203,9 +215,21 @@ llama_model_glm4_moe::graph::graph(const llama_model & model, const llm_graph_pa
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, NULL, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            // ★ PAGED CONSUMER. Resolve from the GRAPH's base mctx, never inp_attn->mctx (which is
+            // the same wrong-type cast). This arch passes wo/wo_s INTO build_attn, so the paged
+            // branch applies them itself; it has no wo_b.
+            const float kq_scale_l = 1.0f/sqrtf(float(n_embd_head));
+            const auto * pg_ctx = mctx ? mctx->get_attn_paged() : nullptr;
+            ggml_tensor * cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur, kq_scale_l, il,
+                    hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
+            if (cur_pg != nullptr) {
+                cur = build_lora_mm(model.layers[il].wo, cur_pg, model.layers[il].wo_s);
+                cb(cur, "attn_out_paged", il);
+            } else {
+                cur = build_attn(inp_attn,
+                        model.layers[il].wo, NULL, model.layers[il].wo_s,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale_l, il);
+            }
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
