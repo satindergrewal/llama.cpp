@@ -124,7 +124,15 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
 
     inpL = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
-    auto * inp_attn = build_attn_inp_kv();
+    // ★ On a FLAT paged memory, build_attn_inp_kv() is not merely unnecessary, it is INVALID: it does
+    // static_cast<const llama_kv_cache_context *>(mctx), and on a paged arch there is no
+    // llama_kv_cache_context behind that pointer. Measured 2026-08-06: the graph constructor never
+    // returns and the layer loop below is never entered (zero DS4P-BUILD lines).
+    //
+    // When a paged context is live, every attention layer takes build_attn_paged_or_null, so the
+    // static input is not needed. It is still built for the non-paged case, which is unchanged.
+    const auto * pg_ctx_top = mctx ? mctx->get_attn_paged() : nullptr;
+    auto * inp_attn = pg_ctx_top ? nullptr : build_attn_inp_kv();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
