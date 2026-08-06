@@ -12873,10 +12873,50 @@ kernel void kernel_paged_champ_mask(
     // sequence still initialise their entries instead of returning early and leaving them garbage.
     // Classifying blocks as 0/2 is the optimisation; it is only sound once every entry is written.
     if ((row % OP_FLASH_ATTN_EXT_NQPSG) == 0 && (col % OP_FLASH_ATTN_EXT_NCPSG) == 0) {
-        const int nblk1 = (args.n_tokens_total + OP_FLASH_ATTN_EXT_NQPSG - 1)/OP_FLASH_ATTN_EXT_NQPSG;
-        const int nblk0 = (n_kv + OP_FLASH_ATTN_EXT_NCPSG - 1)/OP_FLASH_ATTN_EXT_NCPSG;
-        blk_skip[((uint64_t) head*nblk1 + row/OP_FLASH_ATTN_EXT_NQPSG)*nblk0
-                 + col/OP_FLASH_ATTN_EXT_NCPSG] = 1;
+        const short QB = OP_FLASH_ATTN_EXT_NQPSG;
+        const short CB = OP_FLASH_ATTN_EXT_NCPSG;
+        const int nblk1 = (args.n_tokens_total + QB - 1)/QB;
+        const int nblk0 = (n_kv + CB - 1)/CB;
+
+        // ★ CLASSIFY THE TILE. Causal prefill makes almost every (q-block, kv-block) pair either
+        // wholly above the diagonal or wholly below it; only the diagonal itself is mixed. Marking
+        // those 0 and 2 is what lets the champion skip a block outright or take it without loading
+        // a mask, and it is the reason the array exists at all. Writing 1 everywhere is correct and
+        // is the slowest thing the kernel can be told.
+        //
+        // ⚠ 2 IS ONLY SOUND WHEN THE MASK CARRIES NOTHING BUT CAUSALITY. A rel bias rides IN the
+        // mask buffer (see below), so a block declared fully visible would silently drop its bias.
+        // 0 stays legal with a bias, since nothing in the block is read at all.
+        char cls = 1;
+        if (args.blk_class != 0) {
+            const int r_hi = min(row + QB, args.n_tokens_total) - 1;
+
+            int s_lo = -1, s_hi = -1;
+            for (int s = 0; s < args.n_seq; ++s) {
+                const int off = batch_offsets[s];
+                const int len = batch_lens[s];
+                if (row  >= off && row  < off + len) { s_lo = s; }
+                if (r_hi >= off && r_hi < off + len) { s_hi = s; }
+            }
+
+            // A q-block straddling two sequences has no single position range, so it stays at 1.
+            if (s_lo >= 0 && s_lo == s_hi) {
+                const int first = ctx_lens[s_lo] - batch_lens[s_lo];
+                const int qp_lo = first + (row  - batch_offsets[s_lo]);   // smallest q_pos in tile
+                const int qp_hi = first + (r_hi - batch_offsets[s_lo]);   // largest  q_pos in tile
+                const int W     = args.visibility_window;                 // 0 = unbanded
+
+                const bool all_vis = (col + CB - 1 <= qp_lo) &&
+                                     (W == 0 || col > qp_hi - W);
+                const bool non_vis = (col > qp_hi) ||
+                                     (W != 0 && col + CB - 1 <= qp_lo - W);
+
+                if (non_vis)                             { cls = 0; }
+                else if (all_vis && args.rel_extent == 0) { cls = 2; }
+            }
+        }
+
+        blk_skip[((uint64_t) head*nblk1 + row/QB)*nblk0 + col/CB] = cls;
     }
 
     // Layout MUST match the champion's read: mask + (iq1+j)*nb31 + (iq2%ne32)*nb32,

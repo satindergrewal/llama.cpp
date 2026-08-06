@@ -1304,6 +1304,7 @@ typedef struct {
     int32_t  bs_fc;             // 1 = block_size from the function constant; 0 = runtime arg
     int32_t  kv_q8;             // 1 = paged pool holds q8_0 blocks (dequantise on staging)
     int32_t  probe;             // diagnostics ONLY; 0 = off. Never overload a semantic field.
+    int32_t  blk_class;         // 1 = classify champion blocks 0/2 as well as 1; 0 = always 1
     uint64_t stride_token;      // in halves
     uint64_t stride_head;
     uint64_t stride_block;

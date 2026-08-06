@@ -4918,6 +4918,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.bs_fc             =*/ 1,   // set below alongside lpk
         /*.kv_q8             =*/ 0,   // set below from the pool tensor's type
         /*.probe             =*/ 0,   // diagnostics only
+        /*.blk_class         =*/ 1,   // set again at each mask dispatch from DS4P_CHAMP_BLKCLASS
         // ⚠ UNIT DEPENDS ON THE CACHE TYPE. f16: strides in HALVES. q8_0: strides in BLOCKS,
         // because both quantised kernels index block arrays. I wrote "strides are in BLOCKS" in
         // the q8_0 kernel comment and then left this computing halves -- a comment asserting an
@@ -5189,6 +5190,11 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 auto mp = ggml_metal_library_get_pipeline_paged_champ_mask(lib);
                 ggml_metal_encoder_set_pipeline(enc, mp);
                 ggml_metal_kargs_paged_attn margs = args;
+                // ★ Block classification. ON by default; DS4P_CHAMP_BLKCLASS=0 gives a one-factor
+                // control arm that keeps every block at the always-safe 1, so the speedup can be
+                // attributed instead of assumed.
+                margs.blk_class = [](){ const char * e = getenv("DS4P_CHAMP_BLKCLASS");
+                                        return (e && atoi(e) == 0) ? 0 : 1; }();
                 ggml_metal_encoder_set_bytes (enc, &margs, sizeof(margs), 0);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(clens), 1);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(boffs), 2);
@@ -5276,6 +5282,11 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 auto mp = ggml_metal_library_get_pipeline_paged_champ_mask(lib);
                 ggml_metal_encoder_set_pipeline(enc, mp);
                 ggml_metal_kargs_paged_attn margs = args;
+                // ★ Block classification. ON by default; DS4P_CHAMP_BLKCLASS=0 gives a one-factor
+                // control arm that keeps every block at the always-safe 1, so the speedup can be
+                // attributed instead of assumed.
+                margs.blk_class = [](){ const char * e = getenv("DS4P_CHAMP_BLKCLASS");
+                                        return (e && atoi(e) == 0) ? 0 : 1; }();
                 if (getenv("DS4P_CHAMP_MASK_OPEN")) { margs.probe = 1; }  // dedicated field, not lpk
                 // ★ DS4P_MASK_TAILPROBE -- confirm-before-fix for the tail-fill defect. Reports
                 // whether any mask column is marked VISIBLE past the sequence's real key count
