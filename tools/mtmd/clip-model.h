@@ -389,6 +389,7 @@ struct qf_block {
 struct inkling_hmlp_layer {
     ggml_tensor * linear_w = nullptr;
     ggml_tensor * norm_w   = nullptr;
+};
 
 // qwen3tts code2wav: RVQ codes -> raw PCM
 struct clip_code2wav {

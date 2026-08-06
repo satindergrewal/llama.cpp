@@ -58,6 +58,13 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
 
+        // Official DSpark GGUFs carry hyper_connection_count; this early path must still
+        // mark the MLA backbone. Without it, load_arch_tensors falls through to dense
+        // attn_q/wk/wv and dies on blk.0.attn_q.weight (merge scar vs yaniss path).
+        hparams.dflash_dsv4_backbone = true;
+        LLAMA_LOG_INFO("%s: DFlash with DeepSeek-V4 backbone via hc_mult (q_lora_rank = %u, hc_mult = %u)\n",
+                __func__, hparams.n_lora_q, hparams.dsv4_hc_mult);
+
         type = LLM_TYPE_UNKNOWN;
         return;
     }
@@ -215,9 +222,9 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
             return std::make_unique<graph<true>>(*this, params);
         case LLM_GRAPH_TYPE_DEFAULT:
         case LLM_GRAPH_TYPE_DECODER:
-            if (hparams.dsv4_hc_mult > 0) {
-                return std::make_unique<graph_dsv4>(*this, params);
-            }
+            // Always use dflash::graph<false>. It dispatches to build_dsv4() when
+            // dflash_dsv4_backbone is set. graph_dsv4 (deepseek4::graph parent) is the
+            // TARGET backbone graph and is wrong for the DFlash draft encoder/decoder split.
             return std::make_unique<graph<false>>(*this, params);
         default:
             GGML_ABORT("invalid graph type");
