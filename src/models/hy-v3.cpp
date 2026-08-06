@@ -130,7 +130,15 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
+    // ★ DS4P_DECODE_TRACE, third bracket. Brackets 1 and 2 proved process_ubatch is entered once
+    // with a well-formed single-sequence batch and never reaches graph_compute -- so the hang is in
+    // graph CONSTRUCTION. This names the layer it stops on. If the last line printed is layer N,
+    // that is the defect's address.
+    const bool ds4p_trace_l = getenv("DS4P_DECODE_TRACE") != nullptr;
     for (int il = 0; il < n_layer; ++il) {
+        if (ds4p_trace_l) {
+            LLAMA_LOG_WARN("DS4P-BUILD layer %d / %d\n", il, n_layer);
+        }
         ggml_tensor * inpSA = inpL;
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
