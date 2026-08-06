@@ -12857,6 +12857,28 @@ kernel void kernel_paged_champ_mask(
     if (row >= args.n_tokens_total || col >= n_kv || head >= args.n_heads) {
         return;
     }
+
+    // ★ blk = the champion's per-block SKIP array, and its layout is [head][q-block][kv-block]
+    // (see kernel_paged_champ_impl: blk += ((head)*nblk1 + iq1/Q)*nblk0, then blk[ic0]).
+    //
+    // ⚠ THE PREVIOUS WRITE USED A DIFFERENT LAYOUT AND A SMALLER REGION -- blk_skip[row*64 + col]
+    // for col < 64 and head == 0 only. Coverage worked out to ~32768/(n_heads*n_kv) of what the
+    // reader indexes, with n_tokens cancelling entirely, so from roughly the third head onward the
+    // champion read UNINITIALISED BYTES AS CONTROL FLOW: 0 dropped a whole KV block, 2 disabled its
+    // mask and attended all 64 slots. The allocation (ggml_metal_op_paged_attn_extra_mask) was
+    // already sized to the reader's layout; only the producer disagreed.
+    //
+    // One thread per (head, q-block, kv-block) triple, writing the always-safe value 1 = "process
+    // this block with its mask". Placed BEFORE the seq lookup so rows that fall outside every
+    // sequence still initialise their entries instead of returning early and leaving them garbage.
+    // Classifying blocks as 0/2 is the optimisation; it is only sound once every entry is written.
+    if ((row % OP_FLASH_ATTN_EXT_NQPSG) == 0 && (col % OP_FLASH_ATTN_EXT_NCPSG) == 0) {
+        const int nblk1 = (args.n_tokens_total + OP_FLASH_ATTN_EXT_NQPSG - 1)/OP_FLASH_ATTN_EXT_NQPSG;
+        const int nblk0 = (n_kv + OP_FLASH_ATTN_EXT_NCPSG - 1)/OP_FLASH_ATTN_EXT_NCPSG;
+        blk_skip[((uint64_t) head*nblk1 + row/OP_FLASH_ATTN_EXT_NQPSG)*nblk0
+                 + col/OP_FLASH_ATTN_EXT_NCPSG] = 1;
+    }
+
     // Layout MUST match the champion's read: mask + (iq1+j)*nb31 + (iq2%ne32)*nb32,
     // i.e. [head][row][col] with head stride nb32 = n_tokens*n_kv.
     const uint64_t moff = (uint64_t) head*args.n_tokens_total*n_kv + (uint64_t) row*n_kv + col;
@@ -12922,11 +12944,9 @@ kernel void kernel_paged_champ_mask(
 
     mask[moff] = v;
 
-    // blk = the champion's per-block SKIP array, read whenever has_mask is true. 1 = process.
-    // Leaving it as a dummy buffer let garbage act as skip flags and blocks silently vanished.
-    if (col < 64 && head == 0) {
-        blk_skip[(uint64_t) row*64 + col] = 1;
-    }
+    // (blk_skip is written at the TOP of this kernel, in the reader's [head][q-block][kv-block]
+    //  layout. The old [token][col] write that lived here covered a quarter of what the champion
+    //  indexed and is what made whole KV blocks vanish -- see the note above.)
     // (sentinel dst-write probe REMOVED in the self-audit: it wrote 7.0f into dst and would
     //  have silently corrupted real output if ever enabled. It found its bug; it is gone.)
 }
