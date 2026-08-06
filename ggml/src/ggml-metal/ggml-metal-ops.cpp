@@ -5262,6 +5262,11 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_pipeline(enc, mp);
                 ggml_metal_kargs_paged_attn margs = args;
                 if (getenv("DS4P_CHAMP_MASK_OPEN")) { margs.probe = 1; }  // dedicated field, not lpk
+                // ★ DS4P_MASK_TAILPROBE -- confirm-before-fix for the tail-fill defect. Reports
+                // whether any mask column is marked VISIBLE past the sequence's real key count
+                // (ctx_lens), which is what the padded pool capacity admits. Does not alter the
+                // mask; writes blk_skip[0] only, so it does not depend on blk_skip's own indexing.
+                if (getenv("DS4P_MASK_TAILPROBE")) { margs.probe = 3; }
                 ggml_metal_encoder_set_bytes (enc, &margs, sizeof(margs), 0);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(clens), 1);
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(boffs), 2);

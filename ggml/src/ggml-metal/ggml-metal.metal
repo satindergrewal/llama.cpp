@@ -12874,6 +12874,31 @@ kernel void kernel_paged_champ_mask(
 
     // Causal, plus the banded visibility window when one is set.
     bool vis = (col <= q_pos);
+
+    // ⚠ NON-FUNCTIONAL PROBE -- kept only as a record, do not trust it.
+    // TWO defects, both mine: (1) it writes blk_skip[0], which NOTHING on the host reads back, so it
+    // is a producer with no consumer; (2) it was unnecessary -- the hypothesis it tests is refuted by
+    // arithmetic. On a prefill batch_lens == ctx_lens, so q_pos = i_local <= ctx_lens-1, and
+    // vis = (col <= q_pos) therefore implies col < ctx_lens. The visibility test CANNOT admit a
+    // column past the real key count. Measurement beats speculation; it does not beat algebra.
+    //
+    // ★ DS4P_MASK_PROBE -- confirm-before-fix for the tail-fill defect.
+    //
+    // MEASURED (token-exact, marker-verified, sane static baseline): the champion at D=256 is
+    // CORRECT while the final block holds <= ~11 of 64 keys and WRONG at >= ~33. col ranges over the
+    // PADDED pool capacity (n_kv = max_blk * 64), so slots in the partially filled last block are
+    // admitted as visible whenever col <= q_pos -- even though no key was ever written there. Their
+    // COUNT is exactly the tail fill, which is why a few are survivable and dozens are not.
+    //
+    // ctx_lens[seq] is the real key count. It is read once, to build q_pos, and never bounds col.
+    // This probe REPORTS the disagreement without changing behaviour: if it fires, the defect is
+    // observed rather than argued, and the fix is vis &= (col < ctx_lens[seq]).
+    if (args.probe == 3 && row == args.n_tokens_total - 1 && head == 0) {
+        const int real_keys = ctx_lens[seq];
+        if (vis && col >= real_keys) {
+            blk_skip[0] = 1;   // at least one column is visible past the written keys
+        }
+    }
     if (vis && args.visibility_window > 0) {
         vis = (col > q_pos - args.visibility_window);
     }
