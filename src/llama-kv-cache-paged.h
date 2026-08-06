@@ -53,6 +53,15 @@ class llama_kv_cache_paged : public llama_memory_i {
     // Prefix sharing truncates a token match to whole PHYSICAL blocks before calling fork_blocks,
     // so the scheduler needs the pool's block size. Read-only accessor; the member stays private.
     uint32_t get_block_size() const { return block_size; }
+
+    // The AUTHORITATIVE owner of a live sequence's blocks. group.block_table is a transient staging
+    // field: the cache copies out of it (:432) and then CLEARS it (:497), so a live, fully-prefilled
+    // sequence has n_past in the thousands and an EMPTY group.block_table. Prefix discovery must ask
+    // here, keyed by request_id, not read the group.
+    const llama_block_ids * get_sequence_blocks(int32_t request_id) const {
+        auto it = sequence_blocks.find(request_id);
+        return it == sequence_blocks.end() ? nullptr : &it->second;
+    }
     bool swap_in(llama_sequence_group & group);
     bool swap_out(llama_sequence_group & group);
 

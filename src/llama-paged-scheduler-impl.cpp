@@ -174,7 +174,18 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                     // scheduled -- and fork_blocks returns 0 on an empty table, so discovery would
                     // report a 960-token match and then silently share nothing. Filter here so the
                     // scan cannot select a source it is impossible to inherit from.
-                    if (src->block_table.empty() || src->n_past == 0) { continue; }
+                    // ★ Ask the CACHE for this sequence's blocks. group.block_table is cleared after
+                    // the cache copies it, so a live prefilled sequence shows blocks=0 there while
+                    // holding dozens of real blocks in sequence_blocks. Measured:
+                    //     DS4P-CAND id=1 blocks=0 n_past=1169 logical=1170
+                    const llama_block_ids * src_blocks =
+                        kv_cache_manager->get_sequence_blocks(src->request_id);
+                    if (getenv("DS4P_DECODE_TRACE")) {
+                        LLAMA_LOG_WARN("DS4P-CAND id=%d cache_blocks=%zu n_past=%u logical=%zu\n",
+                                       src->request_id, src_blocks ? src_blocks->size() : 0,
+                                       src->n_past, src->logical_seq.size());
+                    }
+                    if (src_blocks == nullptr || src_blocks->empty() || src->n_past == 0) { continue; }
 
                     // ⚠ Cap at the source's n_past, NOT its logical_seq length. logical_seq is what
                     // the sequence WILL be; n_past is what it has actually computed into KV. Sharing
@@ -203,7 +214,13 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
             }
 
             if (best_n > 0 && best_src != nullptr) {
-                const uint32_t shared = kv_cache_manager->fork_blocks(*best_src, group, best_n);
+                // fork_blocks reads src.block_table, which is empty on a live group. Give it a
+                // source view whose table is the cache's authoritative copy.
+                llama_sequence_group src_view = *best_src;
+                if (const auto * bl = kv_cache_manager->get_sequence_blocks(best_src->request_id)) {
+                    src_view.block_table = *bl;
+                }
+                const uint32_t shared = kv_cache_manager->fork_blocks(src_view, group, best_n);
                 if (shared > 0) {
                     group.n_past = shared;
                     LLAMA_LOG_INFO("%s: request %d admitted SHARED: %u of %u prompt tokens inherited "
