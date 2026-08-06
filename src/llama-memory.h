@@ -38,6 +38,8 @@ enum llama_memory_status {
 // useful for implementing hybrid memory types (e.g. iSWA)
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1);
 
+struct llama_kv_cache_paged_context;   // fwd: base-interface paged resolver (see get_attn_paged below)
+
 // helper function for checking if a memory status indicates a failure
 bool llama_memory_status_is_fail(llama_memory_status status);
 
@@ -64,6 +66,24 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // ★ GENERIC PAGED RESOLVER. Returns the paged attention context backing this memory context, or
+    // nullptr when no paged pool is live. Default nullptr, so a memory type that knows nothing about
+    // paging is unaffected.
+    //
+    // WHY THIS BELONGS ON THE BASE INTERFACE. get_attn_paged() previously existed ONLY on the ISWA
+    // and hybrid wrappers, so an arch could reach the paged pool only if it happened to use one of
+    // those. A FLAT arch had no supported way to ask: llama-graph.cpp:3631 resolves it with an
+    // unchecked static_cast<const llama_kv_cache_paged_context*>(mctx), which is safe only because
+    // that one call site already knows the answer.
+    //
+    // ⚠ That is the arch-allow-list problem one level down. The generic consumer
+    // (build_attn_paged_or_null) was written so paging would NOT be hand-copied per arch -- but the
+    // CONTEXT LOOKUP it depends on was still wrapper-specific, so 95 of 97 archs in src/models/
+    // never call it. Measured consequence 2026-08-06: Hy3 does not merely miss paging under
+    // --kv-paged, it FAILS TO START -- llama_kv_cache::cpy_k throws "unordered_map::at: key not
+    // found" during graph reserve, because the paged pool owns layers the static child does not.
+    virtual const llama_kv_cache_paged_context * get_attn_paged() const { return nullptr; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

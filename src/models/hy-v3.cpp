@@ -1,5 +1,11 @@
 #include "models.h"
 
+// paged consumer: inp_attn->mctx->get_attn_paged(). llama-kv-cache.h is needed because mctx is
+// typed as the DERIVED llama_kv_cache_context; the accessor itself is inherited from
+// llama_memory_context_i, but the derived type must be complete to reach it.
+#include "../llama-kv-cache.h"
+#include "../llama-kv-cache-paged.h"
+
 void llama_model_hy_v3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
@@ -146,10 +152,32 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow);
 
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-            cb(cur, "attn_out", il);
+            // ★ PAGED CONSUMER (generic helper llm_graph_context::build_attn_paged_or_null).
+            //
+            // Without these lines Hy3 does not merely miss the paged path -- it CANNOT START with
+            // --kv-paged. Measured 2026-08-06: the server dies during graph reserve with
+            //   llama_init_from_model: failed to initialize the context: unordered_map::at: key not found
+            // thrown by llama_kv_cache::cpy_k, because on a hybrid the paged pool owns layers the
+            // static child cache does not, so cpy_k's layer-map lookup misses. A missing consumer
+            // reads as a hard startup failure, not as "unoptimised".
+            //
+            // ⚠ This arch passes wo/wo_b/wo_s INTO build_attn, so the paged branch must apply them
+            // itself: the paged op returns the attention output only.
+            const auto * pg_ctx = inp_attn->mctx ? inp_attn->mctx->get_attn_paged() : nullptr;
+            ggml_tensor * cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur, kq_scale, il,
+                    hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
+            if (cur_pg != nullptr) {
+                cur = build_lora_mm(model.layers[il].wo, cur_pg, model.layers[il].wo_s);
+                if (model.layers[il].wo_b) {
+                    cur = ggml_add(ctx0, cur, model.layers[il].wo_b);
+                }
+                cb(cur, "attn_out_paged", il);
+            } else {
+                cur = build_attn(inp_attn,
+                        model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                cb(cur, "attn_out", il);
+            }
         }
 
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
@@ -314,10 +342,24 @@ llama_model_hy_v3::graph_mtp::graph_mtp(const llama_model & model, const llm_gra
 
         const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
-        cur = build_attn(inp_attn,
-                layer.wo, layer.wo_b, layer.wo_s,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-        cb(cur, "mtp_attn_out", il);
+        // Same paged consumer as the main pass. The MTP block is an ordinary decoder layer that
+        // writes real KV, so leaving it on the static-only path would reproduce the startup crash
+        // here the moment MTP is enabled under --kv-paged.
+        const auto * pg_ctx_mtp = inp_attn->mctx ? inp_attn->mctx->get_attn_paged() : nullptr;
+        ggml_tensor * cur_pg_mtp = build_attn_paged_or_null(pg_ctx_mtp, Qcur, Kcur, Vcur, kq_scale, il,
+                hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
+        if (cur_pg_mtp != nullptr) {
+            cur = build_lora_mm(layer.wo, cur_pg_mtp, layer.wo_s);
+            if (layer.wo_b) {
+                cur = ggml_add(ctx0, cur, layer.wo_b);
+            }
+            cb(cur, "mtp_attn_out_paged", il);
+        } else {
+            cur = build_attn(inp_attn,
+                    layer.wo, layer.wo_b, layer.wo_s,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            cb(cur, "mtp_attn_out", il);
+        }
     }
 
     ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);

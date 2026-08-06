@@ -328,6 +328,13 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
 
     llama_memory_status get_status() const override { return status; }
 
+    // A FLAT paged arch IS its own paged context. Before this only the ISWA and hybrid wrappers
+    // answered get_attn_paged(), so a flat arch had no supported way to reach the pool: it fell
+    // through to the static path, or crashed when the static child did not own the layer.
+    // Returning `this` makes the generic two-line consumer work identically for flat, ISWA and
+    // hybrid archs, which is what lets the remaining 95 archs be swept rather than hand-ported.
+    const llama_kv_cache_paged_context * get_attn_paged() const override { return this; }
+
   private:
     const llama_kv_cache_paged * manager;
 
