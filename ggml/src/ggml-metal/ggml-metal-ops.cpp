@@ -5177,6 +5177,13 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             int32_t n_kv_d    = max_blk_d * bs_pa_lpk;
             ggml_metal_buffer_id bid_mask_d = ggml_metal_get_buffer_id(op);
             bid_mask_d.offs += ggml_nbytes(op);
+            // ★ blk scratch, carved exactly like the prefill path does. It USED to bind `op` here,
+            // so the mask kernel's skip-array write landed in DST -- the decode kernel has no blk
+            // parameter, so the buffer was treated as a dummy and pointed at real output. A write
+            // nothing reads is harmless only until you fix its coverage, at which point it becomes
+            // n_heads*nblk1*nblk0 bytes of ones stamped over the attention result.
+            ggml_metal_buffer_id bid_blk_d = bid_mask_d;
+            bid_blk_d.offs += GGML_PAD((size_t) n_heads * n_tokens * n_kv_d * sizeof(ggml_fp16_t), 32);
 
             {
                 auto mp = ggml_metal_library_get_pipeline_paged_champ_mask(lib);
@@ -5189,10 +5196,18 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(rel ? rel : q), 4);
                 ggml_metal_encoder_set_buffer(enc, bid_mask_d, 5);
                 ggml_metal_encoder_set_bytes (enc, &n_kv_d, sizeof(n_kv_d), 6);
-                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
+                ggml_metal_encoder_set_buffer(enc, bid_blk_d, 7);
                 ggml_metal_encoder_set_buffer(enc, bid_mask_d, 8);
                 ggml_metal_encoder_dispatch_threadgroups(enc, (n_kv_d + 31)/32, n_tokens, n_heads, 32, 1, 1);
             }
+
+            // ★ THE MASK KERNEL WRITES WHAT THE ATTENTION KERNEL READS. With use_concurrency on --
+            // the default -- ggml encodes into a concurrent dispatch and nothing orders these two
+            // unless a barrier is asked for. Measured on test-paged-vs-cpu at BS=64 NB=2: 3 FAILs
+            // in 12 reps with concurrency on, 0 in 12 with GGML_METAL_CONCURRENCY_DISABLE=1, same
+            // binary, one factor. A rare wrong answer is worse than a common one; it survives
+            // exactly the kind of gate that runs three reps and calls it clean.
+            ggml_metal_op_concurrency_reset(ctx);
 
             ggml_metal_kargs_flash_attn_ext_vec fa = {};
             fa.ne01 = n_tokens; fa.ne02 = n_heads; fa.ne03 = 1;
@@ -5278,6 +5293,12 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_dispatch_threadgroups(enc,
                     (n_kv_c + 31)/32, n_tokens, n_heads, 32, 1, 1);
             }
+
+            // Same ordering requirement as the decode path above: the champion reads the mask and
+            // the blk array this kernel just wrote. The prefill cases happen to pass without it,
+            // which is not the same as being ordered -- the decode race proved the encoder does not
+            // infer the dependency, and prefill is encoded the same way.
+            ggml_metal_op_concurrency_reset(ctx);
 
             ggml_metal_kargs_flash_attn_ext fa = {};
             fa.ne01 = n_tokens;  fa.ne02 = n_heads;  fa.ne03 = 1;   // ne03=1 pins ikv3=0

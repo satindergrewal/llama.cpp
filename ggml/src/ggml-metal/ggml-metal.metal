@@ -12979,7 +12979,20 @@ template<
     short DV,       // V head size
     short NE = 4,   // head elements per thread
     short Q  = OP_FLASH_ATTN_EXT_VEC_NQPSG,  // queries per threadgroup
-    short C  = 64>   // PAGED: C MUST equal paged block_size  // cache items per threadgroup
+    // ★ C IS THE SIMD CHUNK WIDTH AND IT MUST STAY AT NW=32. It is NOT the paged block size.
+    //
+    // This template used to say "C MUST equal paged block_size" and carried C = 64. The body does
+    // not support that. ss is indexed NE*tx + ty with tx in [0, NL) and ty in [0, NE), which spans
+    // exactly NE*NL = NW = 32 entries; the identity C/NE == NL that the store relies on holds only
+    // when C == NW. At C = 64 the scores for keys 32..63 of every block were computed into mqk and
+    // never written to ss, while the V accumulation below still read ss[0..63] -- so half of every
+    // block was weighted by STALE THREADGROUP MEMORY. Measured 2.4e-02..2.7e-02 against the CPU
+    // reference on every incremental case while pure-prefill cases passed at 1e-05.
+    //
+    // The paged block size is now a separate parameter, and the block-table lookup does the
+    // chunk-to-block mapping instead of forcing the two to be the same number.
+    short C  = OP_FLASH_ATTN_EXT_VEC_NCPSG,  // cache items per threadgroup (== NW)
+    short BS_PA = 64>                        // paged block size; the champion gate enforces 64
 kernel void kernel_paged_champ_vec(
         constant ggml_metal_kargs_flash_attn_ext_vec & args,
         device const char * q,
@@ -13143,8 +13156,13 @@ kernel void kernel_paged_champ_vec(
 
             // Q*K^T
             {
-                // ★ PAGED: ic0 is the BLOCK index (C == bs) -- same contract the prefill port verified at 12/12.
-                device      const k4_t * pk4 = (device const k4_t *) (k + (uint64_t) ptab[ic0]*args.nb13);
+                // ★ PAGED: ic is the ABSOLUTE key offset, so the block index and the offset inside
+                // that block are derived from it. ic0 is NOT the block index -- it was, back when
+                // C was forced to 64 to make chunk and block the same thing, and that forcing is
+                // what broke the kernel (see the C/BS_PA note on the template).
+                device      const k4_t * pk4 = (device const k4_t *) (k
+                        + (uint64_t) ptab[ic/BS_PA]*args.nb13
+                        + (uint64_t) (ic%BS_PA)*args.nb11);
                 threadgroup const q4_t * pq4 = sq4;
 
                 pk4 += ty*NS10/4 + tx;
@@ -13159,7 +13177,14 @@ kernel void kernel_paged_champ_vec(
                             mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 +  ii*NL], (float4) pq4[ii*NL]);
                         }
                     } else {
-                        device const kd4_t * pk = (device const kd4_t *) (k + ((ic + NE*cc + ty)*args.nb11));
+                        // ⚠ THIS BRANCH ADDRESSED K WITHOUT ptab AT ALL -- the non-paged formula
+                        // k + (ic + ...)*nb11, walking a flat cache that does not exist here. It is
+                        // unreachable today only because the host refuses quantised KV on the
+                        // champion path: a REFUSAL was hiding a bug. Corrected rather than annotated,
+                        // so lifting the refusal later cannot resurrect it.
+                        device const kd4_t * pk = (device const kd4_t *) (k
+                                + (uint64_t) ptab[ic/BS_PA]*args.nb13
+                                + (uint64_t) ((ic%BS_PA) + NE*cc + ty)*args.nb11);
 
                         k4_t mk;
 
@@ -13257,7 +13282,9 @@ kernel void kernel_paged_champ_vec(
                 }
 
                 if (is_same<vd4_t, v4_t>::value) {
-                    device const v4_t * pv4 = (device const v4_t *) (v + (uint64_t) ptab[ic0]*args.nb23);
+                    device const v4_t * pv4 = (device const v4_t *) (v
+                            + (uint64_t) ptab[ic/BS_PA]*args.nb23
+                            + (uint64_t) (ic%BS_PA)*args.nb21);
 
                     pv4 += ty*NS20/4 + tx;
 
@@ -13270,7 +13297,11 @@ kernel void kernel_paged_champ_vec(
                     }
                 } else {
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                        device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
+                        // ⚠ same non-paged addressing defect as the K dequant branch above, hidden
+                        // behind the same quantised-KV refusal. Fixed here too.
+                        device const vd4_t * pv4 = (device const vd4_t *) (v
+                                + (uint64_t) ptab[ic/BS_PA]*args.nb23
+                                + (uint64_t) ((ic%BS_PA) + NE*cc + ty)*args.nb21);
 
                         FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
                             const short i = ii*NL + tx;

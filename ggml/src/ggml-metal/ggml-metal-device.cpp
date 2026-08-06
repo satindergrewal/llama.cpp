@@ -1340,7 +1340,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_vec(
         ggml_metal_cv_free(cv);
     }
 
-    // vec smem: PAD(((PAD(ne00,128) + 4*ncpsg + 2*PAD(ne20,128))*nsg)*2, 16), ncpsg = C = 64.
+    // vec smem: PAD(((PAD(ne00,128) + 4*ncpsg + 2*PAD(ne20,128))*nsg)*2, 16), ncpsg = C = 32 (NW).
+    // Kept at the larger 64-term below: it OVER-allocates, which is safe, and shrinking it is a
+    // separate change that wants its own measurement rather than riding on a correctness fix.
     {
         const int pk128 = ((head_dim + 127) / 128) * 128;
         res.smem = GGML_PAD((size_t)((pk128 + 4*64 + 2*pk128) * nsg) * (sizeof(float)/2), 16);
