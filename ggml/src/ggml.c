@@ -8238,7 +8238,8 @@ struct ggml_tensor * ggml_paged_attn(
     struct ggml_tensor  * batch_lens,
     float                 scale,
     int                   block_size,
-    int                   max_blocks) {
+    int                   max_blocks,
+    int                   max_blocks_live) {
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, q->type, ggml_n_dims(q), q->ne);
     result->op = GGML_OP_PAGED_ATTN;
@@ -8259,6 +8260,13 @@ struct ggml_tensor * ggml_paged_attn(
     int32_t * op_params_i = (int32_t *)(op_params_f + 1);
     op_params_i[0] = block_size;
     op_params_i[1] = max_blocks;
+    // ★ max_blocks is the block-TABLE STRIDE (blocks per sequence, ceil(n_ctx/bs)) and is constant
+    // for the life of the context. Anything sized from it covers the whole context window even when
+    // the cache holds a handful of tokens. max_blocks_live is the blocks actually populated, so a
+    // consumer that only needs to span real keys can use it instead. Both kernels bound their walk
+    // on plen[0] = ctx_lens, and this value is derived from that same array, so it can never be
+    // smaller than what they read.
+    op_params_i[2] = max_blocks_live;
 
     return result;
 }
@@ -8279,12 +8287,13 @@ struct ggml_tensor * ggml_paged_attn_banded(
     float                 scale,
     int                   block_size,
     int                   max_blocks,
+    int                   max_blocks_live,
     int64_t               rel_extent,
     int64_t               visibility_window) {
 
     struct ggml_tensor * result = ggml_paged_attn(ctx, q, k_new, v_new, k_cache, v_cache,
             block_table, write_slots, context_lens, batch_offsets, batch_lens,
-            scale, block_size, max_blocks);
+            scale, block_size, max_blocks, max_blocks_live);
 
     if (rel_logits) {
         GGML_ASSERT(rel_logits->type == GGML_TYPE_F32 ||

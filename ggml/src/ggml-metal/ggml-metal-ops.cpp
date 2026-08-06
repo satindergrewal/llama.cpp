@@ -2827,9 +2827,16 @@ size_t ggml_metal_op_paged_attn_extra_mask(const ggml_tensor * op) {
     const int64_t n_tokens = op->src[0]->ne[1];
     const int32_t bs       = ((const int32_t *)((const float *) op->op_params + 1))[0];
     const int32_t max_blk  = ((const int32_t *)((const float *) op->op_params + 2))[0];
+    const int32_t live_blk = ((const int32_t *)((const float *) op->op_params + 3))[0];
 
-    // Worst case: every block the table can address, padded to the champion's C-key chunk.
-    const int64_t n_kv = (int64_t) max_blk * bs;
+    // ★ SIZED FROM THE LIVE BLOCKS, NOT THE TABLE STRIDE. max_blk is ceil(n_ctx/bs) and never
+    // changes, so this reserved -- and the mask kernel swept -- the entire context window on every
+    // ubatch, including the part holding nothing yet. Both kernels break their walk at
+    // plen[0] = ctx_lens, and live_blk is derived from that same array, so a mask this wide is always
+    // at least as wide as anything they read. Falls back to max_blk when the live value is absent or
+    // nonsensical: an undersized mask is an out-of-bounds read, not a slow one.
+    const int32_t use_blk  = (live_blk > 0 && live_blk <= max_blk) ? live_blk : max_blk;
+    const int64_t n_kv = (int64_t) use_blk * bs;
 
     // mask + blk. blk is the champion's per-(head, q-block, kv-block) SKIP array, read
     // whenever has_mask is true. Binding a dummy for it meant garbage was interpreted as skip
@@ -5174,8 +5181,11 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             const uint64_t sh = kv_cache->nb[2] / sizeof(ggml_fp16_t);
             const uint64_t sb = kv_cache->nb[3] / sizeof(ggml_fp16_t);
 
-            int32_t max_blk_d = ((const int32_t *)(op_params_f + 2))[0];
-            int32_t n_kv_d    = max_blk_d * bs_pa_lpk;
+            int32_t max_blk_d  = ((const int32_t *)(op_params_f + 2))[0];
+            int32_t live_blk_d = ((const int32_t *)(op_params_f + 3))[0];
+            // live blocks, not the table stride -- see ggml_metal_op_paged_attn_extra_mask
+            int32_t use_blk_d  = (live_blk_d > 0 && live_blk_d <= max_blk_d) ? live_blk_d : max_blk_d;
+            int32_t n_kv_d     = use_blk_d * bs_pa_lpk;
             ggml_metal_buffer_id bid_mask_d = ggml_metal_get_buffer_id(op);
             bid_mask_d.offs += ggml_nbytes(op);
             // ★ blk scratch, carved exactly like the prefill path does. It USED to bind `op` here,
@@ -5270,13 +5280,35 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             const uint64_t sb = kv_cache->nb[3] / sizeof(ggml_fp16_t);
 
             // Mask workspace carved out of dst, exactly as flash-attn carves pad/blk/tmp.
-            const int32_t max_blk_c = ((const int32_t *)(op_params_f + 2))[0];
-            int32_t n_kv_c = max_blk_c * bs_pa_lpk;
+            const int32_t max_blk_c  = ((const int32_t *)(op_params_f + 2))[0];
+            const int32_t live_blk_c = ((const int32_t *)(op_params_f + 3))[0];
+            // live blocks, not the table stride -- see ggml_metal_op_paged_attn_extra_mask
+            const int32_t use_blk_c  = (live_blk_c > 0 && live_blk_c <= max_blk_c) ? live_blk_c : max_blk_c;
+            int32_t n_kv_c = use_blk_c * bs_pa_lpk;
             ggml_metal_buffer_id bid_mask = ggml_metal_get_buffer_id(op);
             bid_mask.offs += ggml_nbytes(op);
             ggml_metal_buffer_id bid_blk = bid_mask;
             bid_blk.offs += GGML_PAD((size_t) n_heads * n_tokens * n_kv_c * sizeof(ggml_fp16_t), 32);
 
+            // ⚠⚠ NON-FUNCTIONAL PROFILING ARM -- DS4P_CHAMP_SKIP. Skipping either dispatch produces
+            // WRONG OUTPUT by construction; it exists only to attribute wall-clock between the two
+            // kernels, which no per-op timer in this backend can do. Never set outside a probe.
+            //   DS4P_CHAMP_SKIP=mask  -> attention only, on a stale mask
+            //   DS4P_CHAMP_SKIP=attn  -> mask fill only, dst never written
+            // The difference between the two runs and the full run is the split. Logged loudly so a
+            // timing captured under it can never be mistaken for a real measurement later.
+            static const char * skip = getenv("DS4P_CHAMP_SKIP");
+            {
+                static bool warned = false;
+                if (skip && !warned) { warned = true;
+                    GGML_LOG_WARN("%s: ⚠ DS4P_CHAMP_SKIP=%s -- OUTPUT IS INVALID. Profiling arm only.\n",
+                                  __func__, skip);
+                }
+            }
+            const bool skip_mask = skip && strcmp(skip, "mask") == 0;
+            const bool skip_attn = skip && strcmp(skip, "attn") == 0;
+
+            if (!skip_mask)
             {   // FILL the mask: causality + banded window + rel bias, so the champion's own
                 // tested masking code provides correctness rather than hand-rolled indexing.
                 auto mp = ggml_metal_library_get_pipeline_paged_champ_mask(lib);
@@ -5353,14 +5385,24 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 static int last = -1;
                 const int key = head_dim | (champ_nsg<<16);
                 if (key != last) { last = key;
-                    GGML_LOG_INFO("%s: CHAMP-PAGED ACTIVE D=%d bs=%d nsg=%d Q=%d C=%d smem=%zu/32768\n",
+                    // ★ rel_extent and window are printed because they GATE the block classification:
+                    // a rel bias rides inside the mask, so rel_extent > 0 makes every below-diagonal
+                    // block ineligible for cls=2 and forces a per-head mask load on all of them.
+                    // Whether that is happening is a fact about the model, and inferring it from the
+                    // outside is exactly the guessing this lane keeps paying for.
+                    GGML_LOG_INFO("%s: CHAMP-PAGED ACTIVE D=%d bs=%d nsg=%d Q=%d C=%d smem=%zu/32768 "
+                                  "rel_extent=%d window=%d blk_class=%d\n",
                                   __func__, head_dim, bs_pa_lpk, champ_nsg,
-                                  OP_FLASH_ATTN_EXT_NQPSG, OP_FLASH_ATTN_EXT_NCPSG, cp.smem);
+                                  OP_FLASH_ATTN_EXT_NQPSG, OP_FLASH_ATTN_EXT_NCPSG, cp.smem,
+                                  args.rel_extent, args.visibility_window,
+                                  (getenv("DS4P_CHAMP_BLKCLASS") && atoi(getenv("DS4P_CHAMP_BLKCLASS")) == 0) ? 0 : 1);
                 }
             }
             const int nqptg = OP_FLASH_ATTN_EXT_NQPSG;
-            ggml_metal_encoder_dispatch_threadgroups(enc,
-                (n_tokens + nqptg - 1)/nqptg, n_heads, 1, 32*champ_nsg, 1, 1);
+            if (!skip_attn) {
+                ggml_metal_encoder_dispatch_threadgroups(enc,
+                    (n_tokens + nqptg - 1)/nqptg, n_heads, 1, 32*champ_nsg, 1, 1);
+            }
             return 1;
         }
     }

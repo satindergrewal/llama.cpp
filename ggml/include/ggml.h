@@ -2996,7 +2996,8 @@ extern "C" {
                                                   struct ggml_tensor  * batch_lens,
                                                   float                 scale,
                                                   int                   block_size,
-                                                  int                   max_blocks);
+                                                  int                   max_blocks,
+            int                   max_blocks_live);
 
     // paged attention with the banded relative-position bias (3b: paged hybrid archs).
     // Same op as ggml_paged_attn with rel_logits at src[10]; rel_extent and
@@ -3021,6 +3022,7 @@ extern "C" {
                                                   float                 scale,
                                                   int                   block_size,
                                                   int                   max_blocks,
+                                                  int                   max_blocks_live,
                                                   int64_t               rel_extent,
                                                   int64_t               visibility_window);
 

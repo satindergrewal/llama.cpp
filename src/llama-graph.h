@@ -977,6 +977,11 @@ struct llm_graph_qkv {
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
 };
 
+// Blocks actually populated, derived from the same ctx_lens array the kernels bound their walk
+// on. Model graphs call the paged op directly, so this needs a declared home; the definition
+// and the reasoning live in llama-graph.cpp.
+int32_t ds4p_live_blocks(const llama_kv_cache_paged_context * pctx, int32_t block_size, int32_t max_blocks);
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -1217,7 +1222,8 @@ struct llm_graph_context {
              ggml_tensor * batch_lens,      // [batch_size]
                    float   kq_scale,
                      int   block_size,
-                     int   max_blocks) const;
+                     int   max_blocks,
+                     int   max_blocks_live) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

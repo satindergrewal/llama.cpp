@@ -2675,6 +2675,23 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+// ★ Blocks actually populated, derived from the very array the kernels bound their walk on
+// (plen[0] = ctx_lens). Anything sized from max_blocks instead spans the whole context window even
+// when the cache holds a handful of tokens: at -c 36864 the first ubatch of a prefill has 2,048 keys
+// and the mask kernel was sweeping 36,864 columns. Cannot come out larger than max_blocks, and cannot
+// come out smaller than what the kernels read, because it is computed from the same source.
+int32_t ds4p_live_blocks(const llama_kv_cache_paged_context * pctx, int32_t block_size, int32_t max_blocks) {
+    if (pctx == nullptr || block_size <= 0) { return max_blocks; }
+    const int32_t * clens = pctx->get_context_lens();
+    const int32_t   nseq  = pctx->get_n_seq();
+    if (clens == nullptr || nseq <= 0) { return max_blocks; }
+    int32_t maxctx = 0;
+    for (int32_t i = 0; i < nseq; ++i) { maxctx = std::max(maxctx, clens[i]); }
+    if (maxctx <= 0) { return max_blocks; }
+    const int32_t live = (maxctx + block_size - 1)/block_size;
+    return live < max_blocks ? live : max_blocks;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha_paged(
          ggml_tensor * q,               // [n_embd_head, n_head, n_tokens]
          ggml_tensor * k_cur,           // [n_embd_head, n_head_kv, n_tokens]
@@ -2688,7 +2705,8 @@ ggml_tensor * llm_graph_context::build_attn_mha_paged(
          ggml_tensor * batch_lens,      // [batch_size]
                float   kq_scale,
                  int   block_size,
-                 int   max_blocks) const {
+                 int   max_blocks,
+                 int   max_blocks_live) const {
 
     // Paged attention kernel (write) assumes dense layout [n_tokens. n_heads_kv, head_dim].
     // Architectures like (Falcon, GPT-2, etc.) produce KV as views into a fused QKV tensor
@@ -2701,7 +2719,7 @@ ggml_tensor * llm_graph_context::build_attn_mha_paged(
     ggml_tensor * cur = ggml_paged_attn(ctx0,
                                         q, k_cur, v_cur, k_cache, v_cache,
                                         block_table, write_slots, context_lens, batch_offsets, batch_lens,
-                                        kq_scale, block_size, max_blocks);
+                                        kq_scale, block_size, max_blocks, max_blocks_live);
     return cur;
 }
 
@@ -3414,7 +3432,8 @@ ggml_tensor * llm_graph_context::build_attn(
         inp->paged_context_lens,
         inp->paged_batch_offsets,
         inp->paged_batch_lens,
-        kq_scale, cparams.block_size, max_blocks);
+        kq_scale, cparams.block_size, max_blocks,
+        ds4p_live_blocks(paged_mctx, cparams.block_size, max_blocks));
     cb(cur, "kqv_out", il);
 
     // Reshape to [attn_out_width, n_tokens] (just a view).
@@ -4304,6 +4323,7 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
 
 // ★ Generic paged consumer -- see the header. Ported from the inkling.cpp block that was the only
 // paged read path in the tree (credit: that block is where this logic was proven).
+
 ggml_tensor * llm_graph_context::build_attn_paged_or_null(
         const llama_kv_cache_paged_context * paged_ctx,
         ggml_tensor * q,
@@ -4381,6 +4401,8 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
             inp_paged->paged_context_lens, inp_paged->paged_batch_offsets,
             inp_paged->paged_batch_lens, rel_p,
             kq_scale, (int) cparams.block_size, (int) inp_paged->paged_block_table->ne[0],
+            ds4p_live_blocks(paged_ctx, (int) cparams.block_size,
+                             (int) inp_paged->paged_block_table->ne[0]),
             rel_extent, visibility_window);
 
     ggml_tensor * cur = ggml_reshape_2d(ctx0, cur_p, cur_p->ne[0]*cur_p->ne[1], cur_p->ne[2]);

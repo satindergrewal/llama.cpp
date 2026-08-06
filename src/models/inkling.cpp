@@ -490,6 +490,8 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
                     inp_paged->paged_context_lens, inp_paged->paged_batch_offsets,
                     inp_paged->paged_batch_lens, rel_p,
                     1.0f/float(head_dim), (int) cparams.block_size, (int) inp_paged->paged_block_table->ne[0],
+                    ds4p_live_blocks(paged_ctx, (int) cparams.block_size,
+                                     (int) inp_paged->paged_block_table->ne[0]),
                     rel_extent, is_swa ? (int64_t) hparams.n_swa : 0);
 
             cur = ggml_reshape_2d(ctx0, cur_p, cur_p->ne[0]*cur_p->ne[1], cur_p->ne[2]);
