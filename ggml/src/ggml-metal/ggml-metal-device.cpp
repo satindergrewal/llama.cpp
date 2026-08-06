@@ -1307,6 +1307,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_mask
     return res;
 }
 
+// Tile-parallel prefill variant: one threadgroup per (head, q-block, kv-block) instead of one
+// thread per mask element. Only the champion consults blk[], so only the prefill dispatch may use
+// this; the decode vec kernel reads the mask unconditionally and keeps the dense fill.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_mask_tiled(ggml_metal_library_t lib) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, "kernel_paged_champ_mask_tiled");
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_paged_champ_mask_tiled", "kernel_paged_champ_mask_tiled", nullptr);
+    }
+    return res;
+}
+
 // ★ PAGED CHAMPION VEC (decode) pipeline. Mirrors the champion's vec FC set exactly.
 // nwg is pinned to 1: at nwg==1 the kernel writes dst DIRECTLY and there is NO vec_reduce
 // stage, so decode is a SINGLE dispatch. The reduce only parallelises across workgroups for

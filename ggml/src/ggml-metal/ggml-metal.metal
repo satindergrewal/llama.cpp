@@ -12991,6 +12991,115 @@ kernel void kernel_paged_champ_mask(
     //  have silently corrupted real output if ever enabled. It found its bug; it is gone.)
 }
 
+// ============================================================================================
+// TILE-PARALLEL MASK + BLK FILL -- PREFILL ONLY.
+//
+// WHY THIS EXISTS. The dense kernel above launches one thread per (row, column, head): at a
+// 32,768-token context that is n_heads x n_tokens x n_kv threads per dispatch, and the
+// DS4P_CHAMP_SKIP ablation measured it at 19.1 s against an attention kernel of 13.5 s. Its cost is
+// the GRID, not the stores -- skipping ~511 of every 512 writes changed the wall clock by nothing.
+//
+// So this one is parallel over TILES instead of elements: one threadgroup per
+// (head, q-block, kv-block). Every tile writes its blk entry, and only class-1 tiles -- the diagonal,
+// plus the window edge when one is set -- write mask elements at all.
+//
+// ⚠ PREFILL ONLY, AND THAT IS THE WHOLE CORRECTNESS ARGUMENT. The champion consults blk[] and never
+// reads a class-0 or class-2 tile, so leaving those elements unwritten is safe FOR IT. The decode vec
+// kernel has NO blk parameter and reads the mask unconditionally, so it keeps the dense fill. An
+// earlier attempt skipped stores in the shared kernel and corrupted decode exactly that way: an
+// optimisation valid for one consumer, applied to a buffer with two.
+//
+// ⚠ The host must also confirm blk_class is on, rel_extent == 0 and n_seq == 1. A rel bias rides in
+// the mask and blocks class 2; a q-block straddling two sequences classifies as 1 anywhere, not just
+// on the diagonal. Either would leave a class-1 tile unwritten. Those are host-side preconditions.
+// ============================================================================================
+kernel void kernel_paged_champ_mask_tiled(
+        constant ggml_metal_kargs_paged_attn & args,
+        device const int32_t * ctx_lens      [[buffer(1)]],
+        device const int32_t * batch_offsets [[buffer(2)]],
+        device const int32_t * batch_lens    [[buffer(3)]],
+        device const float   * rel           [[buffer(4)]],
+        device       half    * mask          [[buffer(5)]],
+        constant     int32_t & n_kv          [[buffer(6)]],
+        device       char    * blk_skip      [[buffer(7)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_threadgroup]]) {
+    const short QB = OP_FLASH_ATTN_EXT_NQPSG;
+    const short CB = OP_FLASH_ATTN_EXT_NCPSG;
+
+    const int nblk1 = (args.n_tokens_total + QB - 1)/QB;
+    const int nblk0 = (n_kv + CB - 1)/CB;
+
+    const int kb   = (int) tgpig.x;   // kv-block
+    const int qb   = (int) tgpig.y;   // q-block
+    const int head = (int) tgpig.z;
+    if (kb >= nblk0 || qb >= nblk1 || head >= args.n_heads) {
+        return;
+    }
+
+    const int row_lo = qb*QB;
+    const int col_lo = kb*CB;
+    const int r_hi   = min(row_lo + QB, args.n_tokens_total) - 1;
+
+    int s_lo = -1, s_hi = -1;
+    for (int s = 0; s < args.n_seq; ++s) {
+        const int off = batch_offsets[s];
+        const int len = batch_lens[s];
+        if (row_lo >= off && row_lo < off + len) { s_lo = s; }
+        if (r_hi   >= off && r_hi   < off + len) { s_hi = s; }
+    }
+
+    char cls = 1;
+    int  seq = -1;
+    if (s_lo >= 0 && s_lo == s_hi) {
+        seq = s_lo;
+        const int first = ctx_lens[seq] - batch_lens[seq];
+        const int qp_lo = first + (row_lo - batch_offsets[seq]);
+        const int qp_hi = first + (r_hi   - batch_offsets[seq]);
+        const int W     = args.visibility_window;
+
+        const bool all_vis = (col_lo + CB - 1 <= qp_lo) && (W == 0 || col_lo > qp_hi - W);
+        const bool non_vis = (col_lo > qp_hi) || (W != 0 && col_lo + CB - 1 <= qp_lo - W);
+
+        if (non_vis)                              { cls = 0; }
+        else if (all_vis && args.rel_extent == 0) { cls = 2; }
+    }
+
+    if (tiisg == 0) {
+        blk_skip[((uint64_t) head*nblk1 + qb)*nblk0 + kb] = cls;
+    }
+
+    if (cls != 1) {
+        return;   // the champion will not read this tile's mask
+    }
+
+    for (int idx = (int) tiisg; idx < QB*CB; idx += 32) {
+        const int j   = idx / CB;
+        const int i   = idx % CB;
+        const int row = row_lo + j;
+        const int col = col_lo + i;
+        if (row >= args.n_tokens_total || col >= n_kv) { continue; }
+
+        const uint64_t moff = (uint64_t) head*args.n_tokens_total*n_kv + (uint64_t) row*n_kv + col;
+        if (seq < 0) { mask[moff] = (half) -MAXHALF; continue; }
+
+        const int q_pos = (ctx_lens[seq] - batch_lens[seq]) + (row - batch_offsets[seq]);
+        bool vis = (col <= q_pos);
+        if (vis && args.visibility_window > 0) {
+            vis = (col > q_pos - args.visibility_window);
+        }
+
+        half v = vis ? (half) 0.0f : (half) -MAXHALF;
+        if (vis && args.rel_extent > 0) {
+            const int rd = q_pos - col;
+            if (rd >= 0 && rd < args.rel_extent) {
+                v = (half) rel[((uint64_t) row * args.n_heads + head) * args.rel_extent + rd];
+            }
+        }
+        mask[moff] = v;
+    }
+}
+
 
 // ============================================================================================
 // PAGED VARIANT OF THE CHAMPION VEC (DECODE) KERNEL

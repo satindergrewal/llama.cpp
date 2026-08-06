@@ -5311,14 +5311,25 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             if (!skip_mask)
             {   // FILL the mask: causality + banded window + rel bias, so the champion's own
                 // tested masking code provides correctness rather than hand-rolled indexing.
-                auto mp = ggml_metal_library_get_pipeline_paged_champ_mask(lib);
-                ggml_metal_encoder_set_pipeline(enc, mp);
                 ggml_metal_kargs_paged_attn margs = args;
                 // ★ Block classification. ON by default; DS4P_CHAMP_BLKCLASS=0 gives a one-factor
                 // control arm that keeps every block at the always-safe 1, so the speedup can be
                 // attributed instead of assumed.
                 margs.blk_class = [](){ const char * e = getenv("DS4P_CHAMP_BLKCLASS");
                                         return (e && atoi(e) == 0) ? 0 : 1; }();
+
+                // ★ TILE-PARALLEL FILL, and every one of these conditions is load-bearing:
+                //   blk_class on   -- otherwise every tile is class 1 and there is nothing to skip
+                //   rel_extent==0  -- a rel bias rides in the mask and blocks class 2, so the
+                //                     below-diagonal tiles would be class 1 and go unwritten
+                //   n_seq==1       -- a q-block straddling two sequences classifies as 1 anywhere
+                // Prefill only: the decode vec kernel has no blk parameter and reads the mask
+                // unconditionally. DS4P_CHAMP_TILEMASK=0 forces the dense kernel as a control.
+                const bool tile_ok = margs.blk_class != 0 && args.rel_extent == 0 && args.n_seq == 1
+                                     && !(getenv("DS4P_CHAMP_TILEMASK") && atoi(getenv("DS4P_CHAMP_TILEMASK")) == 0);
+                auto mp = tile_ok ? ggml_metal_library_get_pipeline_paged_champ_mask_tiled(lib)
+                                  : ggml_metal_library_get_pipeline_paged_champ_mask(lib);
+                ggml_metal_encoder_set_pipeline(enc, mp);
                 if (getenv("DS4P_CHAMP_MASK_OPEN")) { margs.probe = 1; }  // dedicated field, not lpk
                 // ★ DS4P_MASK_TAILPROBE -- confirm-before-fix for the tail-fill defect. Reports
                 // whether any mask column is marked VISIBLE past the sequence's real key count
@@ -5333,8 +5344,14 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer(enc, bid_mask, 5);
                 ggml_metal_encoder_set_bytes (enc, &n_kv_c, sizeof(n_kv_c), 6);
                 ggml_metal_encoder_set_buffer(enc, bid_blk, 7);
-                ggml_metal_encoder_dispatch_threadgroups(enc,
-                    (n_kv_c + 31)/32, n_tokens, n_heads, 32, 1, 1);
+                if (tile_ok) {
+                    const int nblk1 = (n_tokens + OP_FLASH_ATTN_EXT_NQPSG - 1)/OP_FLASH_ATTN_EXT_NQPSG;
+                    const int nblk0 = (n_kv_c  + OP_FLASH_ATTN_EXT_NCPSG - 1)/OP_FLASH_ATTN_EXT_NCPSG;
+                    ggml_metal_encoder_dispatch_threadgroups(enc, nblk0, nblk1, n_heads, 32, 1, 1);
+                } else {
+                    ggml_metal_encoder_dispatch_threadgroups(enc,
+                        (n_kv_c + 31)/32, n_tokens, n_heads, 32, 1, 1);
+                }
             }
 
             // Same ordering requirement as the decode path above: the champion reads the mask and
