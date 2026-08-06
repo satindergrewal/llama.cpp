@@ -1490,7 +1490,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // ★ DS4P_DECODE_TRACE, second bracket. The first one proved process_ubatch is entered and never
+    // returns for a flat paged memory with a WELL-FORMED single-sequence batch (n_seqs_unq=1).
+    // This splits the remaining span in half: everything above is graph BUILD + set_inputs,
+    // everything below is graph COMPUTE. One run decides which half holds the hang.
+    const bool ds4p_trace_c = getenv("DS4P_DECODE_TRACE") != nullptr;
+    if (ds4p_trace_c) {
+        LLAMA_LOG_WARN("DS4P-DECODE built graph OK -> entering graph_compute (n_tokens=%u)\n", ubatch.n_tokens);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (ds4p_trace_c) {
+        LLAMA_LOG_WARN("DS4P-DECODE graph_compute RETURNED status=%d\n", (int) status);
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
