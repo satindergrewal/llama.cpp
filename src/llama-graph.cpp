@@ -4293,6 +4293,21 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
         ggml_tensor * rel,
         int64_t       rel_extent) const {
     if (paged_ctx == nullptr) {
+        // ⚠ THIS EXIT WAS SILENT, and that silence cost hours on Hy3 2026-08-06. The layer-contract
+        // exit below warns; this one did not, so "paged pool is live but no layer ever paged" and
+        // "the arch never asked for a paged context" were indistinguishable in the log. I inferred
+        // the branch was not taken from the ABSENCE of a cb() marker -- which proves nothing, since
+        // cb() only prints when a debug callback is installed. Make the code say which path it took.
+        //
+        // Throttled to once per (il, reason): a per-layer, per-token line would bury the log it is
+        // meant to make readable.
+        static int last_il = -2;
+        if (il != last_il) {
+            last_il = il;
+            LLAMA_LOG_WARN("%s: layer %d took the STATIC path -- no paged context (the memory in use "
+                           "does not expose one). If --kv-paged was requested, this arch is not "
+                           "reaching the paged pool.\n", __func__, il);
+        }
         return nullptr;
     }
 
