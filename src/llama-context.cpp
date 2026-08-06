@@ -1996,8 +1996,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //                          "it terminates" reading was wrong too
         const bool ds4p_trace = getenv("DS4P_DECODE_TRACE") != nullptr;
         if (ds4p_trace) {
-            LLAMA_LOG_WARN("DS4P-DECODE ENTER process_ubatch n_tokens=%u n_seqs=%u\n",
-                           ubatch.n_tokens, ubatch.n_seqs);
+            // ⚠ n_seqs is NOT the sequence count. llama-batch.h: "n_seqs = sequence SETS",
+            // "n_seqs_unq = UNIQUE sequence ids", and split_simple passes idxs.size(), so
+            // n_seqs == n_tokens BY DESIGN for a simple split. I printed n_seqs, read 4-of-4 as an
+            // anomaly, and broadcast it as a defect before reading the two lines that define the
+            // field. Print the state that can DISTINGUISH the hypotheses, and read its definition
+            // before quoting it.
+            LLAMA_LOG_WARN("DS4P-DECODE ENTER process_ubatch n_tokens=%u n_seqs=%u n_seqs_unq=%u seq0=%d\n",
+                           ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seqs_unq,
+                           (ubatch.seq_id && ubatch.seq_id[0]) ? (int) ubatch.seq_id[0][0] : -1);
         }
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
