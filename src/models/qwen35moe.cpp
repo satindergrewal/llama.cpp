@@ -1,5 +1,7 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"    // inp->mctx is the HYBRID context: needed COMPLETE here
+#include "llama-kv-cache-paged.h"   // llama_kv_cache_paged_context (threaded paged_ctx param)
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -195,7 +197,8 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il,
+                                   inp->mctx ? inp->mctx->get_attn_paged() : nullptr);
         }
 
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
@@ -284,7 +287,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
-        int                       il) {
+        int                       il,
+        const llama_kv_cache_paged_context * paged_ctx) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 

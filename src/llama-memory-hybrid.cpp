@@ -172,6 +172,18 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             mem_attn_paged->self_drive_begin((int32_t) ubatches[0].n_tokens);
         }
 
+        // ★ DS4P_DECODE_TRACE: is the batch info visible HERE, when the paged child context would be
+        // built? Measured on Qwen3.6: pool built, scheduler running, request registered, block
+        // checked out -- and get_attn_paged() still returns nullptr in the graph, so all 110 layer
+        // instances take the static path. Either prepare_batch is not setting info for this hybrid
+        // composition, or init_batch runs before it. Log it instead of reasoning about it.
+        if (getenv("DS4P_DECODE_TRACE")) {
+            LLAMA_LOG_WARN("DS4P-HYB init_batch: mem_attn_paged=%d has_paged_batch_info=%d ubatches=%zu\n",
+                           mem_attn_paged != nullptr,
+                           mem_attn_paged ? (int) mem_attn_paged->has_paged_batch_info() : -1,
+                           ubatches.size());
+        }
+
         llama_memory_context_ptr paged_ctx;
         if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
             paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches); // copy: hybrid ctx owns the originals

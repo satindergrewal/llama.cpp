@@ -2129,7 +2129,11 @@ struct llama_model_qwen35moe : public llama_model_base {
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+        // ⚠ Threaded from the CALLER, which holds the HYBRID input. Re-resolving inside this helper
+        // returns nullptr: the helper gets the ATTENTION CHILD context, which does not override
+        // get_attn_paged(). Same shape qwen35.cpp already uses.
+        const llama_kv_cache_paged_context * paged_ctx = nullptr);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
