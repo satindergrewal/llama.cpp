@@ -1,5 +1,12 @@
 #pragma once
 
+#include <cstdint>
+
+// ★ Positive count of layers that actually consumed the paged KV cache. A pool can be built while
+// NOTHING reads it (every layer degrades to the static path), which today looks exactly like success.
+void     ds4p_note_paged_consumer();
+uint64_t ds4p_paged_consumer_count();
+
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-hparams.h"

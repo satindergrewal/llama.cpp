@@ -1,5 +1,20 @@
 #include "llama-graph.h"
 
+#include <atomic>
+
+// ★★ PAGED-CONSUMER COUNTER. A paged pool can be built while ZERO layers consume it -- every layer
+// degrades to the static path -- and today that state is INDISTINGUISHABLE FROM SUCCESS: the
+// "initializing paged KV cache" line prints, paged_pool reports 1, and no error appears anywhere.
+// Measured on a sinks model: the scalar paged kernel does not implement attention sinks, so every
+// layer fell back, and --kv-paged silently bought nothing while still paying the memory.
+//
+// Counted POSITIVELY at both funnels. Inferring this from the absence of "took the STATIC path"
+// does not work -- that warning fires 88 times in arms that ARE paging correctly, because it is
+// dominated by startup reserve graph builds.
+static std::atomic<uint64_t> g_ds4p_paged_consumers{0};
+void     ds4p_note_paged_consumer()  { g_ds4p_paged_consumers.fetch_add(1, std::memory_order_relaxed); }
+uint64_t ds4p_paged_consumer_count() { return g_ds4p_paged_consumers.load(std::memory_order_relaxed); }
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -3515,6 +3530,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // either arm, so a gate that infers "paged is live" from a warning count reads zero here and
     // concludes the arch is unwired. It is wired; it is simply on the other funnel.
     LLAMA_LOG_DEBUG("%s: DS4P-CONSUME auto layer %d\n", __func__, il);
+    ds4p_note_paged_consumer();
 
     // Reshape to [attn_out_width, n_tokens] (just a view).
     //
@@ -4541,6 +4557,7 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
     // So this asserts presence positively, per layer, and its twin sits in the auto-path funnel below
     // so the marker is arch-independent across both paged consumers.
     LLAMA_LOG_DEBUG("%s: DS4P-CONSUME banded layer %d\n", __func__, il);
+    ds4p_note_paged_consumer();
 
     // The op fuses the KV write, so this output MUST be expanded into the graph or the scheduler
     // never computes it -- the exact failure DSpark hit on the deepseek4 capture hook today.

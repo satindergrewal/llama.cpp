@@ -2241,6 +2241,36 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // ★★ NO-CONSUMER GUARD. A paged pool can be allocated while ZERO layers consume it -- every
+    // layer degrades to the static attention path -- and that state is today INDISTINGUISHABLE FROM
+    // SUCCESS: the "initializing paged KV cache" line prints, the pool count reports 1, no error
+    // appears. Measured on a sinks model: the scalar paged kernel does not implement attention sinks,
+    // so every layer fell back and --kv-paged bought nothing while still paying the memory.
+    //
+    // ⚠ DO NOT REWRITE THIS AS A CHECK AT A PARTICULAR MOMENT. Three previous placements each fired
+    // on a correctly-paged run because they ran BEFORE the consuming decode:
+    //   1. in the graph-build helper  -> hit by the ~21 graph_reserve passes during construction
+    //   2. on decode()'s success path -> hit by an earlier trivial decode, not the user's request
+    //   3. same, with a debug print   -> proved consumers==0 on BOTH arms at that instant
+    // Every placement was chosen by an argument that it came "after real work". Every argument was
+    // wrong. So this is a CONDITION, not an instant: evaluate on every decode, warn once only after
+    // K decodes have elapsed with the counter still at zero, and never warn once it is non-zero.
+    // It cannot be defeated by picking the wrong moment because it does not pick one.
+    if (cparams.kv_paged) {
+        static std::atomic<uint64_t> ds4p_nc_decodes{0};
+        static std::atomic<bool>     ds4p_nc_warned{false};
+        const uint64_t n_dec = ds4p_nc_decodes.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n_dec >= 8 && ds4p_paged_consumer_count() == 0 && !ds4p_nc_warned.exchange(true)) {
+            LLAMA_LOG_WARN("%s: --kv-paged is ON and a paged pool was allocated, but after %llu "
+                           "decodes ZERO layers have consumed it -- every layer fell back to the "
+                           "static attention path. Paging is doing NOTHING here and the pool is "
+                           "wasted memory. Known cause: the scalar paged kernel does not implement "
+                           "attention sinks, so sink models degrade unless the champion kernel serves "
+                           "them (DS4P_METAL_CHAMP=1 with --kv-block-size 64).\n",
+                           __func__, (unsigned long long) n_dec);
+        }
+    }
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
