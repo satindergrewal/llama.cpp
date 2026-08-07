@@ -3026,7 +3026,8 @@ extern "C" {
                                                   int                   max_blocks_live,
                                                   struct ggml_tensor  * sinks,
                                                   int64_t               rel_extent,
-                                                  int64_t               visibility_window);
+                                                  int64_t               visibility_window,
+                                                  int                   causal);
 
 #ifdef  __cplusplus
 }

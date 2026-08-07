@@ -12112,6 +12112,9 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     // reference test-paged-vs-cpu compares against, a Metal sinks arm would diverge from a reference
     // that does not implement the feature -- indistinguishable from Metal getting sinks wrong.
     const ggml_tensor * sinks = dst->src[11];
+    // ★ CAUSAL at op_params[8]. 0 means every WRITTEN key is visible -- dflash's attention is
+    // non-causal by design. The bound becomes ctx_len rather than q_pos + 1.
+    const int causal = dst->op_params[8];
     if (sinks) {
         GGML_ASSERT(sinks->type == GGML_TYPE_F32 && ggml_is_contiguous(sinks) &&
                     "paged attention: sinks must be contiguous F32 (reference impl)");
@@ -12306,7 +12309,9 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
         for (int i = 0; i < num_new_tokens; ++i) {
             const int token_batch_idx = seq_start + i;
             const int q_pos           = (ctx_len - num_new_tokens) + i;
-            const int num_blocks      = (q_pos / block_size) + 1;
+            // non-causal: walk every block holding a written key, not just up to the diagonal
+            const int last_key        = causal ? q_pos : (ctx_len - 1);
+            const int num_blocks      = (last_key / block_size) + 1;
 
             for (int h_id = 0; h_id < n_heads; ++h_id) {
                 const int kv_h = h_id / (n_heads / n_heads_kv);
@@ -12322,7 +12327,7 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
                     const int physical_block = block_table_data[seq * max_blocks + bid];
                     const int start_token    = bid * block_size;
                     const int end_token =
-                        ((start_token + block_size) < (q_pos + 1)) ? start_token + block_size : q_pos + 1;
+                        ((start_token + block_size) < (last_key + 1)) ? start_token + block_size : last_key + 1;
 
                     for (int tok = start_token; tok < end_token; ++tok) {
                         // logical distance from the query to this key; block scattering is

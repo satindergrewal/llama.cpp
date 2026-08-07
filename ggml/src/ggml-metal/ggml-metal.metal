@@ -12937,10 +12937,16 @@ kernel void kernel_paged_champ_mask(
                 const int qp_hi = first + (r_hi - batch_offsets[s_lo]);   // largest  q_pos in tile
                 const int W     = args.visibility_window;                 // 0 = unbanded
 
-                const bool all_vis = (col + CB - 1 <= qp_lo) &&
-                                     (W == 0 || col > qp_hi - W);
-                const bool non_vis = (col > qp_hi) ||
-                                     (W != 0 && col + CB - 1 <= qp_lo - W);
+                    // ⚠ WITHOUT CAUSALITY THERE IS NO DIAGONAL. Every key below ctx_lens is visible, so a
+                    // tile is fully visible when it lies entirely inside the written keys and fully masked
+                    // when it lies entirely beyond them. Reusing the causal bounds here would classify most
+                    // tiles as class 0 and silently drop them.
+                    const bool all_vis = args.causal
+                            ? ((col + CB - 1 <= qp_lo) && (W == 0 || col > qp_hi - W))
+                            : (col + CB - 1 < ctx_lens[s_lo]);
+                    const bool non_vis = args.causal
+                            ? ((col > qp_hi) || (W != 0 && col + CB - 1 <= qp_lo - W))
+                            : (col >= ctx_lens[s_lo]);
 
                 if (non_vis)                             { cls = 0; }
                 else if (all_vis && args.rel_extent == 0) { cls = 2; }
@@ -12966,7 +12972,10 @@ kernel void kernel_paged_champ_mask(
     const int q_pos = (ctx_lens[seq] - batch_lens[seq]) + i_local;
 
     // Causal, plus the banded visibility window when one is set.
-    bool vis = (col <= q_pos);
+    // ⚠ args.causal == 0 means EVERY WRITTEN KEY IS VISIBLE. dflash's attention is non-causal by
+    // design, and paging it under a causal mask would hide the future half of its context
+    // silently. The bound is still the REAL key count, ctx_lens, not the padded pool width.
+    bool vis = args.causal ? (col <= q_pos) : (col < ctx_lens[seq]);
 
     // ⚠ NON-FUNCTIONAL PROBE -- kept only as a record, do not trust it.
     // TWO defects, both mine: (1) it writes blk_skip[0], which NOTHING on the host reads back, so it
@@ -13098,8 +13107,16 @@ kernel void kernel_paged_champ_mask_tiled(
         char cls = 1;
         if (seq >= 0) {
             const int col_lo = kb*CB;
-            const bool all_vis = (col_lo + CB - 1 <= qp_lo) && (W == 0 || col_lo > qp_hi - W);
-            const bool non_vis = (col_lo > qp_hi) || (W != 0 && col_lo + CB - 1 <= qp_lo - W);
+                // ⚠ WITHOUT CAUSALITY THERE IS NO DIAGONAL. Every key below ctx_lens is visible, so a
+                // tile is fully visible when it lies entirely inside the written keys and fully masked
+                // when it lies entirely beyond them. Reusing the causal bounds here would classify most
+                // tiles as class 0 and silently drop them.
+                const bool all_vis = args.causal
+                        ? ((col_lo + CB - 1 <= qp_lo) && (W == 0 || col_lo > qp_hi - W))
+                        : (col_lo + CB - 1 < ctx_lens[seq]);
+                const bool non_vis = args.causal
+                        ? ((col_lo > qp_hi) || (W != 0 && col_lo + CB - 1 <= qp_lo - W))
+                        : (col_lo >= ctx_lens[seq]);
             if (non_vis)                              { cls = 0; }
             else if (all_vis && args.rel_extent == 0) { cls = 2; }
         }
@@ -13123,7 +13140,7 @@ kernel void kernel_paged_champ_mask_tiled(
             if (seq < 0) { mask[moff] = (half) -MAXHALF; continue; }
 
             const int q_pos = first + (row - batch_offsets[seq]);
-            bool vis = (col <= q_pos);
+            bool vis = args.causal ? (col <= q_pos) : (col < ctx_lens[seq]);
             if (vis && W > 0) { vis = (col > q_pos - W); }
 
             half v = vis ? (half) 0.0f : (half) -MAXHALF;

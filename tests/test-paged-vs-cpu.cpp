@@ -39,7 +39,8 @@ static float val_r(int e, int h, int tok)  { return 0.50f * cosf(0.8f*e + 0.6f*h
 // defaulted parameter in the MIDDLE of a signature is a silent argument shift.
 static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel, int64_t window,
                                     ggml_type kv_type = GGML_TYPE_F16,
-                                    int sink_mode = 0) {   // 0 none, 1 finite, 2 -inf control
+                                    int sink_mode = 0,     // 0 none, 1 finite, 2 -inf control
+                                    int causal = 1) {
     // ⚠ H/HKV ARE ENV-OVERRIDABLE so the harness can be REPLAYED at the server's real geometry.
     // The ARGDUMP showed the server running head_dim=256, n_heads=16, n_heads_kv=4 (GQA 4:1) with
     // n_blocks=1 -- while this file had GQA 2:1 hardcoded. Every "PASS" it has printed was at a GQA
@@ -86,7 +87,7 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
     if (sinks_p) { ggml_set_name(sinks_p, "sinks"); }
 
     ggml_tensor * out_p = ggml_paged_attn_banded(ctx, q_p, k_new, v_new, cache, cache,
-            btab, slots, clens, boffs, blens, rel_p, scale, BS, NB, NB, sinks_p, with_rel ? E : 1, window);
+            btab, slots, clens, boffs, blens, rel_p, scale, BS, NB, NB, sinks_p, with_rel ? E : 1, window, causal);
     ggml_set_name(out_p, "out_paged");
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -160,7 +161,13 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
 // Attention is causal, so the concatenation MUST equal the single-call result exactly -- same
 // arithmetic, same order, only the write schedule differs. Any divergence is the incremental path.
 static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool with_rel, int64_t window,
-                                          ggml_type kv_type, int n1, int n_dec = 1) {
+                                          ggml_type kv_type, int n1, int n_dec = 1,
+                                          // ⚠ LAST. I moved sink_mode to the end of run_paged one hour
+                                          // ago for exactly this reason and then inserted causal in
+                                          // front of two non-defaulted parameters here. The compiler
+                                          // caught it this time; in run_paged it did not, because
+                                          // there the shifted argument still type-checked.
+                                          int causal = 1) {
     const int H   = getenv("DS4P_TEST_H")   ? atoi(getenv("DS4P_TEST_H"))   : 4;
     const int HKV = getenv("DS4P_TEST_HKV") ? atoi(getenv("DS4P_TEST_HKV")) : 2;
     const int E   = 8;
@@ -204,7 +211,7 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
         p.rel   = with_rel ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, H, p.n) : nullptr;
         p.out   = ggml_paged_attn_banded(ctx, p.q, p.k, p.v, cache, cache,
                       btab, p.slots, p.clens, p.boffs, p.blens, p.rel,
-                      scale, BS, NB, NB, nullptr, with_rel ? E : 1, window);
+                      scale, BS, NB, NB, nullptr, with_rel ? E : 1, window, causal);
     }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -372,6 +379,25 @@ int main() {
                 for (size_t i = 0; i < as.size() && i < bs.size(); ++i) m = std::max(m, (double) fabs(as[i]-bs[i]));
                 printf("D=%3d sinks finite : max_abs=%.3e %s\n", D, m, m < 2e-3 ? "PASS" : "FAIL");
                 n_fail += m < 2e-3 ? 0 : 1;
+
+                // ★ NON-CAUSAL ARM. Metal against the CPU op, both with causal=0. Its control is
+                // the ALL PASSED above: the same code path with causal=1 reproduces every existing
+                // answer, so a non-causal divergence cannot be the branch merely existing.
+                const std::vector<float> anc = run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 0, 0);
+                const std::vector<float> bnc = run_paged(cpu,     D, with_rel, window, GGML_TYPE_F16, 0, 0);
+                double mn = 0.0;
+                for (size_t i = 0; i < anc.size() && i < bnc.size(); ++i) mn = std::max(mn, (double) fabs(anc[i]-bnc[i]));
+                printf("D=%3d non-causal   : max_abs=%.3e %s\n", D, mn, mn < 2e-3 ? "PASS" : "FAIL");
+                n_fail += mn < 2e-3 ? 0 : 1;
+
+                // ⚠ AND IT MUST ACTUALLY DIFFER FROM THE CAUSAL ANSWER. If non-causal produced the
+                // same numbers, the flag would be doing nothing and the arm above would pass while
+                // testing nothing -- the exact shape of a gate that cannot fail.
+                double dc = 0.0;
+                for (size_t i = 0; i < anc.size() && i < a.size(); ++i) dc = std::max(dc, (double) fabs(anc[i]-a[i]));
+                printf("D=%3d non-causal differs from causal: max_abs=%.3e %s\n",
+                       D, dc, dc > 1e-3 ? "PASS" : "FAIL (flag is a no-op)");
+                n_fail += dc > 1e-3 ? 0 : 1;
 
                 const std::vector<float> ai = run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 2);
                 double c = 0.0;

@@ -4943,6 +4943,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.kv_q8             =*/ 0,   // set below from the pool tensor's type
         /*.probe             =*/ 0,   // diagnostics only
         /*.blk_class         =*/ 1,   // set again at each mask dispatch from DS4P_CHAMP_BLKCLASS
+        /*.causal            =*/ op->op_params[8] != 0,
         // ⚠ UNIT DEPENDS ON THE CACHE TYPE. f16: strides in HALVES. q8_0: strides in BLOCKS,
         // because both quantised kernels index block arrays. I wrote "strides are in BLOCKS" in
         // the q8_0 kernel comment and then left this computing halves -- a comment asserting an

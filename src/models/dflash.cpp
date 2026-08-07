@@ -1,5 +1,8 @@
 #include "models.h"
 
+#include "../llama-kv-cache.h"
+#include "../llama-kv-cache-paged.h"
+
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -321,10 +324,15 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     llm_graph_input_attn_kv      * inp_attn      = nullptr;
     llm_graph_input_attn_kv_iswa * inp_attn_iswa = nullptr;
-    if (use_iswa) {
-        inp_attn_iswa = build_attn_inp_kv_iswa();
-    } else {
-        inp_attn = build_attn_inp_kv();
+    // ★ PAGED CONSUMER. Both builders static_cast mctx to a static-cache context type; on a paged
+    // memory neither object exists and the graph constructor dies inside the builder.
+    const auto * pg_ctx_top = mctx ? mctx->get_attn_paged() : nullptr;
+    if (!pg_ctx_top) {
+        if (use_iswa) {
+            inp_attn_iswa = build_attn_inp_kv_iswa();
+        } else {
+            inp_attn = build_attn_inp_kv();
+        }
     }
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
@@ -449,9 +457,19 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Vcur, "Vcur", il);
 
         // cache-aware, non-causal attention
-        ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        // ⚠ NON-CAUSAL, and that is why this arch could not be paged until now. The comment above
+        // says it: cache-aware, non-causal attention. Under the paged mask's causal default every
+        // layer would have lost the future half of its context, silently. causal=false is passed
+        // explicitly rather than left to a default.
+        const auto * pg_ctx = mctx ? mctx->get_attn_paged() : nullptr;
+        ggml_tensor * cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur, kq_scale, il,
+                use_iswa && hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0,
+                nullptr, 0, nullptr, /*causal=*/false);
+        ggml_tensor * cur = cur_pg
+            ? build_lora_mm(layer.wo, cur_pg, nullptr)
+            : (use_iswa
+                ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
+                : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il));
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "ffn_inp", il);

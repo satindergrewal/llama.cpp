@@ -1208,7 +1208,9 @@ struct llm_graph_context {
             int64_t       visibility_window = 0,
             ggml_tensor * rel               = nullptr,
             int64_t       rel_extent        = 0,
-            ggml_tensor * sinks             = nullptr) const;
+            ggml_tensor * sinks             = nullptr,
+            // ⚠ LAST, and defaulted true. dflash is non-causal by design; everything else is causal.
+            bool          causal            = true) const;
 
     ggml_tensor * build_attn_mha_paged(
              ggml_tensor * q,               // [n_embd_head, n_head, n_tokens]

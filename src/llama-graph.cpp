@@ -4408,7 +4408,8 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
         int64_t       visibility_window,
         ggml_tensor * rel,
         int64_t       rel_extent,
-        ggml_tensor * sinks) const {
+        ggml_tensor * sinks,
+        bool          causal) const {
     if (paged_ctx == nullptr) {
         // ⚠ THIS EXIT WAS SILENT, and that silence cost hours on Hy3 2026-08-06. The layer-contract
         // exit below warns; this one did not, so "paged pool is live but no layer ever paged" and
@@ -4478,7 +4479,7 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
             kq_scale, (int) cparams.block_size, (int) inp_paged->paged_block_table->ne[0],
             ds4p_live_blocks(paged_ctx, (int) cparams.block_size,
                              (int) inp_paged->paged_block_table->ne[0]),
-            sinks, rel_extent, visibility_window);
+            sinks, rel_extent, visibility_window, causal ? 1 : 0);
 
     ggml_tensor * cur = ggml_reshape_2d(ctx0, cur_p, cur_p->ne[0]*cur_p->ne[1], cur_p->ne[2]);
 

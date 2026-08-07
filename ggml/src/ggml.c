@@ -8274,6 +8274,10 @@ struct ggml_tensor * ggml_paged_attn(
     // on plen[0] = ctx_lens, and this value is derived from that same array, so it can never be
     // smaller than what they read.
     op_params_i[2] = max_blocks_live;
+    // ★ CAUSAL defaults to 1 here and the banded entry point overrides it. op_params int32 slots
+    // [0..3] hold scale/block_size/max_blocks/max_blocks_live and [4..7] hold rel_extent and
+    // visibility_window as int64 pairs, so [8] is the first free slot.
+    result->op_params[8] = 1;
 
     return result;
 }
@@ -8297,7 +8301,8 @@ struct ggml_tensor * ggml_paged_attn_banded(
     int                   max_blocks_live,
     struct ggml_tensor  * sinks,
     int64_t               rel_extent,
-    int64_t               visibility_window) {
+    int64_t               visibility_window,
+    int                   causal) {
 
     struct ggml_tensor * result = ggml_paged_attn(ctx, q, k_new, v_new, k_cache, v_cache,
             block_table, write_slots, context_lens, batch_offsets, batch_lens,
@@ -8317,6 +8322,10 @@ struct ggml_tensor * ggml_paged_attn_banded(
     // occupy bytes [0,12) above)
     memcpy(&result->op_params[4], &rel_extent,        sizeof(rel_extent));
     memcpy(&result->op_params[6], &visibility_window, sizeof(visibility_window));
+    // ⚠ NON-CAUSAL IS A REAL MODE, not a convenience. dflash's attention is non-causal by design
+    // ("cache-aware, non-causal attention" in dflash.cpp); paging it under a causal mask would mask
+    // out the future half of every layer's context, silently.
+    result->op_params[8] = causal ? 1 : 0;
 
     return result;
 }
