@@ -5157,10 +5157,20 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         // dequant staging at all -- that lives only in the scalar/LPK path -- so correct strides
         // would merely deliver correctly-addressed q8_0 bytes to code that reads them as f16.
         // Refusing hands the work to the scalar path, which genuinely handles q8_0.
+        // ⚠ THE QUANTISED-KV REFUSAL IS GONE, and the two reasons it gave were both wrong:
+        //   "champion has no dequant staging"  -- it has. kernel_paged_champ_impl carries ggml's own
+        //      dequant branch; it was never INSTANTIATED, which is a different problem with a
+        //      mechanical fix (5 q8_0 instantiations, one per head dim).
+        //   "strides 17x too large on a q8_0 pool"  -- the divide-then-multiply round trip it blamed
+        //      is lossless whenever the row stride is even, and a 256-wide q8_0 row is 8 blocks =
+        //      272 B. The round trip was a landmine for some odd-stride type, not a q8_0 bug. It is
+        //      now gone entirely: byte strides come straight from kv_cache->nb[].
+        // Both were reasons the work was not done, and neither survived being checked. What DID need
+        // fixing first was the dequant branches' addressing -- they used the non-paged formula and
+        // were unreachable only behind this refusal.
         const char * why  = bs_pa_lpk != 64 ? "bs!=64"
                           : n_seq_c   != 1  ? "n_seq!=1"
                           : !hd_ok          ? "head_dim"
-                          : args.kv_q8      ? "quantised KV (champion has no dequant staging)"
                                             : nullptr;
         if (why) {
             static const char * last_why = nullptr;
@@ -5203,9 +5213,10 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             }
             const int vec_nsg = vec_nwg == 1 ? 4 : 1;
             auto vp = ggml_metal_library_get_pipeline_paged_champ_vec(lib, op, vec_nsg, vec_nwg);
+            // ⚠ st is the ELEMENT stride and exists ONLY for ns10/ns20, which the f16 branch uses
+            // for simdgroup_load. The quantised branch addresses through nb11/nb21 in BYTES and never
+            // reads it. sh/sb were removed with the byte-stride round trip below.
             const uint64_t st = kv_cache->nb[1] / sizeof(ggml_fp16_t);
-            const uint64_t sh = kv_cache->nb[2] / sizeof(ggml_fp16_t);
-            const uint64_t sb = kv_cache->nb[3] / sizeof(ggml_fp16_t);
 
             int32_t max_blk_d  = ((const int32_t *)(op_params_f + 2))[0];
             int32_t live_blk_d = ((const int32_t *)(op_params_f + 3))[0];
@@ -5259,9 +5270,10 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             fa.ne11 = n_kv_d;
             fa.ne_12_2 = n_heads_kv; fa.ne_12_3 = 1;
             fa.ns10 = (int32_t) st;            fa.ns20 = (int32_t) st;
-            fa.nb11 = st*sizeof(ggml_fp16_t);  fa.nb21 = st*sizeof(ggml_fp16_t);
-            fa.nb12 = sh*sizeof(ggml_fp16_t);  fa.nb22 = sh*sizeof(ggml_fp16_t);
-            fa.nb13 = sb*sizeof(ggml_fp16_t);  fa.nb23 = sb*sizeof(ggml_fp16_t);
+            // byte strides straight from the pool tensor -- see the note on the prefill path
+            fa.nb11 = kv_cache->nb[1];  fa.nb21 = kv_cache->nb[1];
+            fa.nb12 = kv_cache->nb[2];  fa.nb22 = kv_cache->nb[2];
+            fa.nb13 = kv_cache->nb[3];  fa.nb23 = kv_cache->nb[3];
             fa.ne31 = n_tokens; fa.ne32 = n_heads; fa.ne33 = 1;
             fa.nb31 = (uint64_t) n_kv_d*sizeof(ggml_fp16_t);
             fa.nb32 = (uint64_t) n_tokens*n_kv_d*sizeof(ggml_fp16_t);
@@ -5323,9 +5335,8 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 if (v == 4 || v == 8) { champ_nsg = v; }   // dispatcher only instantiates 4 and 8
             }
             auto cp = ggml_metal_library_get_pipeline_paged_attn_champ(lib, op, champ_nsg);
+            // element stride, for ns10/ns20 on the f16 branch only -- see the decode path note
             const uint64_t st = kv_cache->nb[1] / sizeof(ggml_fp16_t);   // stride_token, elements
-            const uint64_t sh = kv_cache->nb[2] / sizeof(ggml_fp16_t);
-            const uint64_t sb = kv_cache->nb[3] / sizeof(ggml_fp16_t);
 
             // Mask workspace carved out of dst, exactly as flash-attn carves pad/blk/tmp.
             const int32_t max_blk_c  = ((const int32_t *)(op_params_f + 2))[0];
@@ -5417,9 +5428,15 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             fa.ne_12_2 = n_heads_kv;           // ALSO carries the V head offset in the port
             fa.ne_12_3 = 1;
             fa.ns10 = (int32_t) st;            fa.ns20 = (int32_t) st;
-            fa.nb11 = st*sizeof(ggml_fp16_t);  fa.nb21 = st*sizeof(ggml_fp16_t);
-            fa.nb12 = sh*sizeof(ggml_fp16_t);  fa.nb22 = sh*sizeof(ggml_fp16_t);
-            fa.nb13 = sb*sizeof(ggml_fp16_t);  fa.nb23 = sb*sizeof(ggml_fp16_t);  // BLOCK stride
+            // ★ BYTE STRIDES TAKEN DIRECTLY FROM THE POOL TENSOR. These were st*sizeof(ggml_fp16_t)
+            // where st was itself nb[1]/sizeof(ggml_fp16_t) -- a divide-then-multiply round trip that
+            // encodes an f16 assumption and buys nothing. It is lossless only while the row stride is
+            // even, which is true for f16 and happens to be true for q8_0 (a 256-wide row is 8 blocks
+            // = 272 B), and would silently truncate for any type where it is not. Reading nb[] means
+            // the assumption cannot exist at all.
+            fa.nb11 = kv_cache->nb[1];  fa.nb21 = kv_cache->nb[1];
+            fa.nb12 = kv_cache->nb[2];  fa.nb22 = kv_cache->nb[2];
+            fa.nb13 = kv_cache->nb[3];  fa.nb23 = kv_cache->nb[3];  // BLOCK stride
             fa.ne31 = n_tokens; fa.ne32 = n_heads; fa.ne33 = 1;
             fa.nb31 = (uint64_t) n_kv_c*sizeof(ggml_fp16_t);
             fa.nb32 = (uint64_t) n_tokens*n_kv_c*sizeof(ggml_fp16_t);   // per-head mask plane

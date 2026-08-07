@@ -1377,8 +1377,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_champ
     const ggml_tensor * kvc = op->src[3];
     const int32_t ns10 = (int32_t) (kvc->nb[1] / sizeof(ggml_fp16_t));   // stride_token, elements
 
-    snprintf(base, 256, "kernel_paged_attn_champ_dk%d_dv%d", head_dim, head_dim);
-    snprintf(name, 256, "%s_nsg%d_ns%d", base, nsg, ns10);
+    // ★ TYPE IN THE PIPELINE NAME. The champion is instantiated at f16 and q8_0; picking the wrong
+    // one delivers correctly-addressed bytes to code that reads them as the other type, which is
+    // exactly the silent-wrongness this port keeps producing. The pool tensor decides, not a flag.
+    const bool kv_q8 = op->src[3]->type == GGML_TYPE_Q8_0;
+    if (kv_q8) {
+        snprintf(base, 256, "kernel_paged_attn_champ_q8_0_dk%d_dv%d", head_dim, head_dim);
+    } else {
+        snprintf(base, 256, "kernel_paged_attn_champ_dk%d_dv%d", head_dim, head_dim);
+    }
+    snprintf(name, 256, "%s_nsg%d_ns%d", base, nsg, ns10);   // base already carries the KV type
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1409,7 +1417,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_champ
         // is_q=0 for f16 KV drops the 16*32*nsg term. DS4P_CHAMP_SMEM_FULL adds it back as a
         // one-factor test of whether nsg=8's 6/12 failure is a silent threadgroup overrun --
         // the ONLY remaining suspect after row indexing was refuted by reading.
-        const int is_q = getenv("DS4P_CHAMP_SMEM_FULL") ? 1 : 0;
+        // ★ is_q FOLLOWS THE POOL TYPE. It was hardcoded 0 with the comment "our paged KV is f16" --
+        // true when written, false the moment q8_0 was instantiated. That term is the K/V dequant
+        // STAGING space (sk4x4/sv4x4), the buffer the quantised branch writes into: with it dropped
+        // the branch stages into memory that was never allocated and the kernel produces nothing.
+        // Measured before the fix: q8_0 prefill nmse = 1.000 at every head dim, while f16 stayed
+        // clean. DS4P_CHAMP_SMEM_FULL still forces it on as a one-factor arm.
+        const int is_q = (kv_q8 || getenv("DS4P_CHAMP_SMEM_FULL")) ? 1 : 0;
         res.smem = GGML_PAD((size_t)(nqptg*(head_dim + 2*pv64 + 2*(2*ncpsg)) + is_q*(16*32*nsg)) * (sizeof(float)/2), 16);
     }
 

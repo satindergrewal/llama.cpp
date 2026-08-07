@@ -12459,7 +12459,18 @@ void kernel_paged_champ_impl(
                     qk8x8_t mqk = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
 
                     for (short ii = 0; ii < DK16; ii += 4) {
-                        device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k + ((ic + 8*cc + ty)*args.nb11)); // NOT PORTED: f16 KV only
+                        // ★ PAGED. This read the NON-PAGED formula -- k + (ic + ...)*nb11, walking a
+                        // flat cache that does not exist here -- and was unreachable only because the
+                        // host refuses quantised KV on this path. The identical defect was live in
+                        // the vec kernel's dequant branches. Instantiating q8_0 makes this branch
+                        // REACHABLE, so it is corrected BEFORE the instantiation lands: a refusal is
+                        // not a fix, it is a lid.
+                        //
+                        // C == block_size is host-enforced on the prefill path, so ic0 IS the block
+                        // index and the within-block offset is just 8*cc + ty.
+                        device const kd4x4_t * pk4x4 = (device const kd4x4_t *) (k
+                                + (uint64_t) ptab[ic0]*args.nb13
+                                + (uint64_t) (8*cc + ty)*args.nb11);
 
                         if (DK16%4 == 0) {
                             // the head is evenly divisible by 4*16 = 64, so no need for bound checks
@@ -12650,7 +12661,12 @@ void kernel_paged_champ_impl(
                         simdgroup_load(vs, ss + 8*cc, SH, 0, false);
 
                         for (short ii = 4*sgitg; ii < DV16; ii += 4*NSG) {
-                            device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v + ((ic + 8*cc + ty)*args.nb21));
+                            // ★ PAGED -- same correction as the K dequant branch above, and hidden
+                            // behind the same quantised-KV refusal. Fixed before q8_0 is
+                            // instantiated, not after.
+                            device const vd4x4_t * pv4x4 = (device const vd4x4_t *) (v
+                                    + (uint64_t) ptab[ic0]*args.nb23
+                                    + (uint64_t) (8*cc + ty)*args.nb21);
 
                             if (DV16%4 == 0) {
                                 // no need for bound checks
@@ -12831,6 +12847,21 @@ template [[host_name("kernel_paged_attn_champ_dk96_dv96"  )]] kernel paged_champ
 template [[host_name("kernel_paged_attn_champ_dk128_dv128")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 128, 128>;
 template [[host_name("kernel_paged_attn_champ_dk192_dv192")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 192, 192>;
 template [[host_name("kernel_paged_attn_champ_dk256_dv256")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>;
+
+// ★ q8_0 INSTANTIATIONS. The template signature is one-for-one with upstream's flash_attn_ext, which
+// instantiates q8_0 fifteen ways; this port instantiated f16 five ways and left the dequant branch
+// inside kernel_paged_champ_impl unreachable. Swapping half4x4/1/dequantize_f16 for
+// block_q8_0/2/dequantize_q8_0 is the whole difference.
+//
+// ⚠ THESE MAKE THE DEQUANT BRANCHES REACHABLE. Both of them addressed K and V with the NON-PAGED
+// formula until this session -- k + (ic + ...)*nb11, a flat cache that does not exist in this port.
+// They were repaged first, deliberately: instantiating before fixing would have produced a q8 path
+// that runs and is silently wrong, which is the failure mode this lane keeps manufacturing.
+template [[host_name("kernel_paged_attn_champ_q8_0_dk64_dv64")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 64, 64>;
+template [[host_name("kernel_paged_attn_champ_q8_0_dk96_dv96")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 96, 96>;
+template [[host_name("kernel_paged_attn_champ_q8_0_dk128_dv128")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 128, 128>;
+template [[host_name("kernel_paged_attn_champ_q8_0_dk192_dv192")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 192, 192>;
+template [[host_name("kernel_paged_attn_champ_q8_0_dk256_dv256")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 256, 256>;
 
 
 // ★ PAGED CHAMPION MASK FILL. The champion derives all causality from a mask buffer; the paged op
