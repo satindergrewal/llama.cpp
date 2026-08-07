@@ -1,5 +1,8 @@
 #include "models.h"
 
+#include "../llama-kv-cache.h"
+#include "../llama-kv-cache-paged.h"
+
 std::unique_ptr<llm_graph_context> llama_model_ernie4_5_moe::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
 }
@@ -19,7 +22,11 @@ llama_model_ernie4_5_moe::graph::graph(const llama_model & model, const llm_grap
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    auto * inp_attn = build_attn_inp_kv();
+    // ★ PAGED CONSUMER. build_attn_inp_kv() static_casts mctx to llama_kv_cache_context; on a paged
+    // memory there is no such object and the graph constructor dies there. With a paged pool live,
+    // every attention layer takes build_attn_paged_or_null and the static input is never built.
+    const auto * pg_ctx_top = mctx ? mctx->get_attn_paged() : nullptr;
+    auto * inp_attn = pg_ctx_top ? nullptr : build_attn_inp_kv();
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -47,9 +54,20 @@ llama_model_ernie4_5_moe::graph::graph(const llama_model & model, const llm_grap
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, NULL, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
+            // ⚠ mctx, NOT inp_attn->mctx -- the attention child context answers nullptr for
+            // get_attn_paged(). That gave Qwen3.6 a pool 110 layers never read.
+            const float kq_scale_pg = 1.0f / sqrtf(float(n_embd_head));
+            const auto * pg_ctx = mctx ? mctx->get_attn_paged() : nullptr;
+            ggml_tensor * cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur, kq_scale_pg, il,
+                    hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
+            if (cur_pg != nullptr) {
+                    // wo is applied inside build_attn on this arch, so the paged branch applies it
+                    cur = build_lora_mm(model.layers[il].wo, cur_pg, model.layers[il].wo_s);
+            } else {
+                    cur = build_attn(inp_attn,
+                            model.layers[il].wo, NULL, model.layers[il].wo_s,
+                            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale_pg, il);
+            }
             cb(cur, "attn_out", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {

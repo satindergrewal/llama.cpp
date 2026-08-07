@@ -1,5 +1,8 @@
 #include "models.h"
 
+#include "../llama-kv-cache.h"
+#include "../llama-kv-cache-paged.h"
+
 void llama_model_qwen3vl::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NUM_DEEPSTACK_LAYERS, hparams.n_deepstack_layers, false);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, true);
@@ -76,7 +79,11 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    auto * inp_attn = build_attn_inp_kv();
+    // ★ PAGED CONSUMER. build_attn_inp_kv() static_casts mctx to llama_kv_cache_context; on a paged
+    // memory there is no such object and the graph constructor dies there. With a paged pool live,
+    // every attention layer takes build_attn_paged_or_null and the static input is never built.
+    const auto * pg_ctx_top = mctx ? mctx->get_attn_paged() : nullptr;
+    auto * inp_attn = pg_ctx_top ? nullptr : build_attn_inp_kv();
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -117,9 +124,22 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            // ⚠ mctx, NOT inp_attn->mctx -- the attention child context does not override
+            // get_attn_paged() and answers nullptr. That gave Qwen3.6 a live pool 110 layers
+            // never read: correct output, zero paging.
+            const float kq_scale_pg = 1.0f/sqrtf(float(n_embd_head));
+            const auto * pg_ctx = mctx ? mctx->get_attn_paged() : nullptr;
+            ggml_tensor * cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur, kq_scale_pg, il,
+                    hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
+            if (cur_pg != nullptr) {
+                    // this arch applies wo inside build_attn, so the paged branch applies it too
+                    cur = build_lora_mm(model.layers[il].wo, cur_pg, model.layers[il].wo_s);
+                    if (model.layers[il].wo_b) { cur = ggml_add(ctx0, cur, model.layers[il].wo_b); }
+            } else {
+                    cur = build_attn(inp_attn,
+                            model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale_pg, il);
+            }
         }
 
         if (il == n_layer - 1 && inp_out_ids) {
