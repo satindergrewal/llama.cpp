@@ -5163,11 +5163,31 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                               (long long) ggml_nelements(t), s.c_str(),
                               n < (int) ggml_nelements(t) ? " ..." : "");
             };
+            GGML_LOG_INFO("%s: ARGDUMP causal=%d\n", __func__, (int) args.causal);
             dump_i32("block_table",  btab,        32);
             dump_i32("write_slots",  op->src[6],  32);
             dump_i32("context_lens", clens,        8);
             dump_i32("batch_offs",   boffs,        8);
             dump_i32("batch_lens",   blens,        8);
+        }
+    }
+
+    // ★ MULTI-ROW DECODE PROBE. The ARGDUMP budget is eaten by llama-server's ~21 startup reserve
+    // passes before the first request (count-only-work-after-the-work-starts). This fires only on a
+    // small batch whose per-seq row count exceeds 1 -- i.e. a speculative decode, never prefill.
+    if (getenv("DS4P_MROW_PROBE") && n_tokens > 1 && n_tokens <= 16) {
+        std::vector<int32_t> bl((size_t) ggml_nelements(blens));
+        std::vector<int32_t> cl((size_t) ggml_nelements(clens));
+        ggml_backend_tensor_get((ggml_tensor *) blens, bl.data(), 0, bl.size()*sizeof(int32_t));
+        ggml_backend_tensor_get((ggml_tensor *) clens, cl.data(), 0, cl.size()*sizeof(int32_t));
+        for (size_t i = 0; i < bl.size(); ++i) {
+            if (bl[i] > 1) {
+                GGML_LOG_INFO("%s: DS4P-MROW causal=%d seq=%zu batch_len=%d ctx_len=%d "
+                              "=> q_pos row0=%d rowN=%d lastkey_row0=%d\n", __func__,
+                              (int) args.causal, i, bl[i], cl[i],
+                              cl[i] - bl[i], cl[i] - 1,
+                              args.causal ? (cl[i] - bl[i]) : (cl[i] - 1));
+            }
         }
     }
 

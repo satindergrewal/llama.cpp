@@ -3225,6 +3225,7 @@ private:
                         }
                     }
                 }
+                setenv("DS4P_CALLSITE", "STORMBREAK", 1);
                 llama_paged_scheduler_update(paged_sched, &pbatch, fail_sampled.data(), fail_stops.data(),
                                                  /*n_accepted =*/ nullptr);
                 for (int32_t i = 0; i < fail_info->n_seq; ++i) {
@@ -3341,6 +3342,7 @@ private:
                 // emitted rows can be a PREFIX of what was staged. Using the staged length would be
                 // an off-by-tail that only appears under batch pressure.
                 const int32_t n_verified = n_rows - 1;
+                const int s_id_for_probe = slot->id;
                 std::vector<int> spec_idxs(n_rows);
                 for (int32_t k = 0; k < n_rows; ++k) {
                     spec_idxs[k] = info->batch_offsets[i] + k;
@@ -3356,6 +3358,11 @@ private:
                                                               spec_idxs, spec_draft_used);
                 GGML_ASSERT(!accepted.empty() && "verify returned no tokens");
                 n_accepted_v[i] = (int32_t) accepted.size();
+                if (getenv("DS4P_TOK_PROBE")) {
+                    SRV_WRN("DS4P-TOK sid=%d n_rows=%d n_acc=%d tok0=%d draft0=%d\n",
+                            s_id_for_probe, n_rows, (int) accepted.size(), (int) accepted[0],
+                            spec_draft_used.empty() ? -1 : (int) spec_draft_used[0]);
+                }
                 // ⚠ accepted.size() - 1: the last entry is the target's own bonus token, not a
                 // draft acceptance. Passing the full size would inflate every drafter's internal
                 // acceptance statistics and, for adaptive drafters, change how much they draft next.
@@ -3489,9 +3496,32 @@ private:
         // sentinel rows included -- the contract set with step D. So when any row speculated, the
         // whole call switches buffers.
         if (any_spec) {
+            setenv("DS4P_CALLSITE", "NORMAL-SPEC", 1);
             llama_paged_scheduler_update(paged_sched, &pbatch, sampled_off.data(), stops.data(),
                                          n_accepted_v.data());
+
+            // ★★ TWO LEDGERS. update()'s step E trims llama_kv_cache_paged::set_seq_max_pos -- the
+            // PAGED manager. The batch validator reads a DIFFERENT object: the context's memory
+            // module (llama-batch.cpp:271 reads memory->seq_pos_max). A partial accept leaves the
+            // rejected draft positions in that second ledger, so the next batch opens at
+            // last_accepted+1 while the memory module still reports the last SUBMITTED position,
+            // and init() rejects it with X = 15, Y = 13.
+            //
+            // The static speculative path drops the rejected tail from the context. The paged path
+            // never inherited it. Trim the same span here.
+            for (int32_t i = 0; i < info->n_seq; ++i) {
+                const int32_t n_acc = n_accepted_v[i];
+                const int32_t n_sub = info->batch_lens[i];
+                if (n_acc < 0 || n_acc >= n_sub) {
+                    continue;  // sentinel row, or nothing was rejected
+                }
+                const int32_t   off      = info->batch_offsets[i];
+                const llama_seq_id rid   = pbatch.seq_id[off][0];
+                const llama_pos last_acc = pbatch.pos[off + n_acc - 1];
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), rid, last_acc + 1, -1);
+            }
         } else {
+            setenv("DS4P_CALLSITE", "NORMAL-LEGACY", 1);
             llama_paged_scheduler_update(paged_sched, &pbatch, sampled.data(), stops.data(),
                                          /*n_accepted =*/ nullptr);
         }
@@ -3560,9 +3590,32 @@ private:
                 //
                 // One success followed by three failures, repeating, on a 4-token block. dflash's
                 // accept() ignores its arguments and does not rewind, so the caller must.
+                //
+                // ⚠⚠ AND THE BOUND MUST NOT COME FROM s.prompt.n_tokens(). That counter is the
+                // STATIC path's ledger; the paged loop advances the scheduler's n_past instead and
+                // never moves it in step. Measured: the rm was handed 16 while the next draft wrote
+                // 12, so it removed nothing, ctx_dft kept the three REJECTED positions, and the
+                // draft decode failed X = 15 / Y = 12 on the consecutive-position rule -- 23 times,
+                // once per generated token. THIRD ledger for the same concept.
+                //
+                // The target context's memory module IS trimmed to the accepted tail (see the
+                // partial-accept trim above), so its pos_max is exactly n_past - 1: the position the
+                // next draft decode starts on. Rewind ctx_dft to there.
                 if (ctx_dft) {
-                    llama_memory_seq_rm(llama_get_memory(ctx_dft), s.id,
-                                        (llama_pos) s.prompt.n_tokens() - 1, -1);
+                    const llama_pos tgt_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), s.id);
+                    //
+                    // ⚠ tgt_max + 1, NOT tgt_max. The static path arms its draft BEFORE pushing the
+                    // sampled token, so it rewinds to n_past-1; this loop generates the draft AFTER
+                    // update(), so n_past already includes that token and the draft opens at
+                    // tgt_max + 1. Measured across four steps: tgt_max 11,12,13,14 -> draft Y
+                    // 12,13,14,15. Rewinding to tgt_max removed the position the draft needs to
+                    // attend to and left X = 10 against Y = 12 forever -- drafts went fully inert.
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), s.id, tgt_max + 1, -1);
+                    if (getenv("DS4P_NPAST_PROBE")) {
+                        SRV_WRN("DS4P-DFTREWIND sid=%d tgt_max=%d rm_from=%d dft_max_after=%d\n",
+                                       s.id, tgt_max, tgt_max + 1,
+                                       llama_memory_seq_pos_max(llama_get_memory(ctx_dft), s.id));
+                    }
                 }
 
                 s.spec_ckpt.update_pos(
@@ -3595,10 +3648,24 @@ private:
                     /* .result   = */ &s.spec_draft,
                 };
             }
+            // ★ MATCHED CONTROL. Skips ONLY the draft staging, so the paged loop runs single-row
+            // through the identical binary, gate, prompt and seed. Anything that differs between
+            // this and the speculative run is caused by the extra ROWS, nothing else.
+            if (getenv("DS4P_SPEC_OFF")) {
+                for (auto & s : slots) { s.spec_draft.clear(); }
+            } else {
             common_speculative_draft(spec.get());
             for (auto & s : slots) {
                 if (!s.is_processing() || s.spec_draft.empty()) {
                     continue;
+                }
+                // ⚠ ONE-FACTOR PROBE. Replaces draft CONTENT only -- row count, sampler path and
+                // verify call untouched, and spec_draft is what verify compares against, so both
+                // sides stay consistent. If row 0's sampled token moves when only the draft VALUES
+                // change, row 0's logits depend on rows it must not see: the causal mask leaks
+                // across newly-submitted rows.
+                if (const char * pz = getenv("DS4P_DRAFT_POISON")) {
+                    std::fill(s.spec_draft.begin(), s.spec_draft.end(), (llama_token) atoi(pz));
                 }
                 if (!llama_paged_scheduler_set_draft(paged_sched, s.id,
                                                      s.spec_draft.data(), (int32_t) s.spec_draft.size())) {
@@ -3606,6 +3673,7 @@ private:
                     // above cannot compare against a draft the scheduler never emitted
                     s.spec_draft.clear();
                 }
+            }
             }
         }
 

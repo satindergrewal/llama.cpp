@@ -845,6 +845,12 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
             curr_info.write_slots[batch_start_id] = calculate_global_slot_index(token_pos, group->block_table);
             LLAMA_LOG_DEBUG("%s: llama_batch seq_id: %d (req_id %d) token %d: pos: %d, global_slot_idx=%d\n", __func__,
                             seq_id, group->request_id, token_idx, token_pos, curr_info.write_slots[batch_start_id]);
+            if (getenv("DS4P_EMIT_PROBE")) {
+                LLAMA_LOG_WARN("DS4P-EMIT rid=%d row=%d pos=%d tok=%d n_past=%u lseq=%zu lseq_back=%d\n",
+                               group->request_id, token_idx, token_pos, (int) batch.token[batch_start_id],
+                               group->n_past, group->logical_seq.size(),
+                               group->logical_seq.empty() ? -1 : (int) group->logical_seq.back());
+            }
         }
 
         // Populate block table (1D): [batch_size * max_blocks]
@@ -987,16 +993,26 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
         // A sentinel row still contributes exactly ONE token; it just reads it at batch_offsets[i].
         const int32_t n_sub = n_sub_e;
         if (n_accepted == nullptr || n_accepted[i] < 0) {
+            const uint32_t np_before = group->n_past;
             group->n_past    += n_sub;
             group->n_decoded += n_sub;
             group->logical_seq.push_back(n_accepted == nullptr ? new_tokens[i]
                                                                : new_tokens[token_offset]);  // ONE
+            if (getenv("DS4P_NPAST_PROBE")) {
+                LLAMA_LOG_WARN("DS4P-NPAST site=%s legacy rid=%d n_sub=%d n_past %u -> %u\n",
+                               getenv("DS4P_CALLSITE") ? getenv("DS4P_CALLSITE") : "?", group->request_id, n_sub, np_before, group->n_past);
+            }
         } else {
             const int32_t n_acc = n_accepted[i];
             GGML_ASSERT(n_acc >= 1 && n_acc <= n_sub &&
                         "accepted count must be between 1 and the number of tokens submitted");
+                const uint32_t np_before = group->n_past;
             group->n_past    += n_acc;
             group->n_decoded += n_acc;
+            if (getenv("DS4P_NPAST_PROBE")) {
+                LLAMA_LOG_WARN("DS4P-NPAST site=%s spec rid=%d n_sub=%d n_acc=%d n_past %u -> %u\n",
+                               getenv("DS4P_CALLSITE") ? getenv("DS4P_CALLSITE") : "?", group->request_id, n_sub, n_acc, np_before, group->n_past);
+            }
             for (int32_t k = 0; k < n_acc; ++k) {
                 group->logical_seq.push_back(new_tokens[token_offset + k]);
             }

@@ -208,7 +208,15 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
                                           // front of two non-defaulted parameters here. The compiler
                                           // caught it this time; in run_paged it did not, because
                                           // there the shifted argument still type-checked.
-                                          int causal = 1) {
+                                          int causal = 1,
+                                          // ★ ROWS PER DECODE DISPATCH. 1 is every arm that existed
+                                          // before speculation; >1 is a SPECULATIVE row set -- one
+                                          // verify row plus drafts, submitted together, where the
+                                          // later rows MUST be invisible to the earlier ones. The
+                                          // server produces this shape and this harness could not
+                                          // express it, which is why 7 archs pass with the mask
+                                          // untested across newly-submitted decode rows.
+                                          int rows_dec = 1) {
     const int H   = getenv("DS4P_TEST_H")   ? atoi(getenv("DS4P_TEST_H"))   : 4;
     const int HKV = getenv("DS4P_TEST_HKV") ? atoi(getenv("DS4P_TEST_HKV")) : 2;
     const int E   = 8;
@@ -221,7 +229,7 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
     // dispatch and read back by the NEXT one. With n_dec == 1 the decode reads only what it just
     // wrote plus prefill, which passes.
     const int   n_parts = 1 + n_dec;
-    const int   n_pre   = N - n_dec;   // prefill token count
+    const int   n_pre   = N - n_dec*rows_dec;   // prefill token count
     GGML_ASSERT(n_pre >= 1 && n1 <= N);
 
     ggml_init_params ip = { ggml_tensor_overhead()*32*(size_t)(n_parts+2) + ggml_graph_overhead()*(size_t)n_parts, nullptr, true };
@@ -237,7 +245,7 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
     std::vector<part> P;
     P.push_back({ n_pre, 0, nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr });
     for (int d = 0; d < n_dec; ++d) {
-        P.push_back({ 1, n_pre + d, nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr });
+        P.push_back({ rows_dec, n_pre + d*rows_dec, nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr });
     }
 
     for (int s = 0; s < n_parts; ++s) {
@@ -413,7 +421,11 @@ int main() {
 
             // ★ SINKS. Finite sink against the CPU op (which now implements them), plus the -inf
             // control against the NO-SINKS answer on the same backend.
-            if (cse == 0) {
+            // ★ The scalar kernel does not implement sinks and ABORTS rather than silently
+            // dropping them. That abort fires before every later arm, so at block_size 16 -- THE
+            // SIZE THE SERVER ACTUALLY RUNS -- this file has never once executed past this point.
+            // Skippable so the remaining arms can be measured in the server's own geometry.
+            if (cse == 0 && !getenv("DS4P_TEST_SKIP_SINKS")) {
                 const std::vector<float> as = run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 1);
                 const std::vector<float> bs = run_paged(cpu,     D, with_rel, window, GGML_TYPE_F16, 1);
                 double m = 0.0;
@@ -646,6 +658,38 @@ int main() {
             printf("incremental %-5s D=%3d prefill=%2d + %d decode(s)/%d: max_abs=%.3e %s\n",
                    ggml_type_name(kts[ki]), D, n1, n_dec, N, max_abs, ok ? "PASS" : "FAIL");
             n_fail += ok ? 0 : 1;
+            }
+
+            // ★★ MULTI-ROW DECODE ARM. Every arm above submits decode dispatches of exactly ONE
+            // row. A speculative row set submits R rows at once -- one verify row plus R-1 drafts --
+            // and the later rows sit at HIGHER positions than the earlier ones, so a causal mask
+            // MUST hide them from row 0. Nothing in this file had ever submitted that shape.
+            //
+            // Attention is causal, so splitting the same N tokens into R-row dispatches must give
+            // BIT-IDENTICAL results to computing them in one call. Any divergence means a row saw a
+            // row it must not see. No sampler, no model, no server in the comparison.
+            //
+            // MEASURED against the server: single-row and 4-row decode agree for two steps and then
+            // diverge (row-0 sample 198 vs 271 at the same position, identical binary and prompt).
+            const int rows[] = { 2, 4 };
+            for (size_t ri = 0; ri < sizeof(rows)/sizeof(rows[0]); ++ri) {
+                const int R     = rows[ri];
+                const int n_dec = 2;                 // >=2 so a row set reads what a PREVIOUS set wrote
+                const int n1    = N - n_dec*R;
+                if (n1 < 1) { continue; }
+
+                const std::vector<float> whole = run_paged      (backend, D, true, 0, kts[ki]);
+                const std::vector<float> split = run_paged_split(backend, D, true, 0, kts[ki], n1, n_dec, getenv("MROW_NEGCTL") ? 0 : 1, R);
+
+                double max_abs = 0.0;
+                for (size_t i = 0; i < whole.size() && i < split.size(); ++i) {
+                    const double d = fabs((double) whole[i] - split[i]);
+                    max_abs = d > max_abs ? d : max_abs;
+                }
+                const bool ok = max_abs < 1e-5;
+                printf("multirow     %-5s D=%3d prefill=%2d + %d x %d-row decode/%d: max_abs=%.3e %s\n",
+                       ggml_type_name(kts[ki]), D, n1, n_dec, R, N, max_abs, ok ? "PASS" : "FAIL");
+                n_fail += ok ? 0 : 1;
             }
         }
     }
