@@ -3218,6 +3218,15 @@ private:
 
         std::vector<llama_token> sampled;
         std::vector<int8_t>      stops;
+
+        // ★ SPECULATION. n_accepted_v is per-SEQUENCE (how many of its submitted rows were kept);
+        // sampled_off is the BATCH-OFFSET buffer the scheduler reads when n_accepted is non-null.
+        // Both are sized here so the -1 sentinel (legacy semantics for a row) is the default and a
+        // row only opts in by being written.
+        std::vector<int32_t>     n_accepted_v(info->n_seq, -1);
+        std::vector<llama_token> sampled_off(
+            (size_t) info->batch_offsets[info->n_seq - 1] + (size_t) info->batch_lens[info->n_seq - 1], 0);
+        bool any_spec = false;
         std::vector<int32_t>     finished_seqs;
         sampled.reserve(info->n_seq);
         stops.reserve(info->n_seq);
@@ -3276,10 +3285,55 @@ private:
                 continue;
             }
 
-            const int32_t tok_idx = info->batch_offsets[i] + info->batch_lens[i] - 1;
+            // ★★ SPECULATIVE VERIFY. batch_lens[i] rows were emitted: row 0 is the last accepted
+            // token, rows 1..n are the staged draft. Sample every row and keep the accept-prefix.
+            //
+            // ⚠ SIZE AGAINST batch_lens[i], NEVER against slot->spec_draft.size(). The scheduler's
+            // chunker CLAMPS the row count to the remaining batch budget, so the emitted rows can be
+            // a PREFIX of what was staged. Using the staged length would be an off-by-tail that only
+            // appears under batch pressure -- invisible at np=1 with a short prompt, which is every
+            // checkpoint run so far.
+            const int32_t n_rows  = info->batch_lens[i];
+            const int32_t tok_idx = info->batch_offsets[i] + n_rows - 1;
 
-            const llama_token id = common_sampler_sample(slot->smpl.get(), ctx_tgt, tok_idx);
-            common_sampler_accept(slot->smpl.get(), id, true);
+            // ⚠⚠ n_rows > 1 MEANS TWO DIFFERENT THINGS AND THEY MUST NOT BE CONFLATED. A final
+            // PREFILL CHUNK also emits many rows -- with logits on the LAST one only -- while a
+            // speculative row set emits logits on ALL of them. Treating every multi-row set as
+            // speculative made prefill sample row 0 instead of the last row, and all three
+            // checkpoint archs went red immediately.
+            //
+            // This is the same conflation that broke step D (advance-count vs append-count on
+            // prefill chunks). The discriminator is the STAGED DRAFT, not the row count.
+            const bool is_spec = !slot->spec_draft.empty() && n_rows > 1;
+
+            std::vector<llama_token> accepted;
+            if (is_spec) {
+                // ⚠ SIZE AGAINST batch_lens[i], NEVER against slot->spec_draft.size(). The
+                // scheduler's chunker CLAMPS the row count to the remaining batch budget, so the
+                // emitted rows can be a PREFIX of what was staged. Using the staged length would be
+                // an off-by-tail that only appears under batch pressure.
+                const int32_t n_verified = n_rows - 1;
+                std::vector<int> spec_idxs(n_rows);
+                for (int32_t k = 0; k < n_rows; ++k) {
+                    spec_idxs[k] = info->batch_offsets[i] + k;
+                }
+                llama_tokens spec_draft_used(
+                    slot->spec_draft.begin(),
+                    slot->spec_draft.begin() + std::min<size_t>((size_t) n_verified, slot->spec_draft.size()));
+
+                // ⚠ THE HELPER ACCEPTS INTO THE SAMPLER CHAIN AS IT GOES, including the token it
+                // stops on. The caller must NOT re-accept -- pattern-matching the non-speculative
+                // path here would double-accept every token.
+                accepted = common_sampler_sample_and_accept_n(slot->smpl.get(), ctx_tgt,
+                                                              spec_idxs, spec_draft_used);
+                GGML_ASSERT(!accepted.empty() && "verify returned no tokens");
+                n_accepted_v[i] = (int32_t) accepted.size();
+            } else {
+                const llama_token id0 = common_sampler_sample(slot->smpl.get(), ctx_tgt, tok_idx);
+                common_sampler_accept(slot->smpl.get(), id0, true);
+                accepted.push_back(id0);
+            }
+            const llama_token id = accepted.back();
 
             // P1-5: the sampled token is now part of this sequence's KV, so it belongs in
             // the prompt-token mirror too -- otherwise the mirror would stop matching the
@@ -3360,10 +3414,30 @@ private:
 
             sampled.push_back(id);
             stops.push_back(cont ? 0 : 1);
+
+            // ★ Record the accept-prefix at the BATCH OFFSETS. A row with more than one emitted
+            // token is a speculative row; anything else keeps the -1 sentinel and legacy semantics.
+            if (is_spec) {
+                any_spec = true;
+                for (size_t k = 0; k < accepted.size(); ++k) {
+                    sampled_off[(size_t) info->batch_offsets[i] + k] = accepted[k];
+                }
+            } else {
+                n_accepted_v[i] = -1;
+                sampled_off[(size_t) info->batch_offsets[i]] = id;
+            }
         }
 
-        llama_paged_scheduler_update(paged_sched, &pbatch, sampled.data(), stops.data(),
-                                     /*n_accepted =*/ nullptr);   // one token per seq -- speculation not wired here yet
+        // ⚠ ONE LAYOUT PER CALL. Non-null n_accepted means EVERY row reads at the batch offsets,
+        // sentinel rows included -- the contract set with step D. So when any row speculated, the
+        // whole call switches buffers.
+        if (any_spec) {
+            llama_paged_scheduler_update(paged_sched, &pbatch, sampled_off.data(), stops.data(),
+                                         n_accepted_v.data());
+        } else {
+            llama_paged_scheduler_update(paged_sched, &pbatch, sampled.data(), stops.data(),
+                                         /*n_accepted =*/ nullptr);
+        }
 
         // clear finished sequences AFTER the scheduler's update: update() writes this
         // batch's positions back into the memory's per-seq bookkeeping, so clearing
