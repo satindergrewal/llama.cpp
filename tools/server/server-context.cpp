@@ -3336,7 +3336,18 @@ private:
             const bool is_spec = !slot->spec_draft.empty() && n_rows > 1;
 
             std::vector<llama_token> accepted;
-            if (is_spec) {
+            // ★ ONE-FACTOR PROBE. Still submits the full speculative ROW SET, but samples row 0 with
+            // the PLAIN sampler instead of common_sampler_sample_and_accept_n. That isolates the
+            // only remaining difference between the speculative arm and the matched single-row
+            // control: the sampler helper's accept behaviour vs the extra rows themselves.
+            const bool spec_sample1 = is_spec && getenv("DS4P_SPEC_SAMPLE1");
+            if (spec_sample1) {
+                const llama_token id1 = common_sampler_sample(slot->smpl.get(), ctx_tgt, info->batch_offsets[i]);
+                common_sampler_accept(slot->smpl.get(), id1, true);
+                accepted.push_back(id1);
+                n_accepted_v[i] = 1;
+                common_speculative_accept(spec.get(), slot->id, 0);
+            } else if (is_spec) {
                 // ⚠ SIZE AGAINST batch_lens[i], NEVER against slot->spec_draft.size(). The
                 // scheduler's chunker CLAMPS the row count to the remaining batch budget, so the
                 // emitted rows can be a PREFIX of what was staged. Using the staged length would be
@@ -3518,7 +3529,15 @@ private:
                 const int32_t   off      = info->batch_offsets[i];
                 const llama_seq_id rid   = pbatch.seq_id[off][0];
                 const llama_pos last_acc = pbatch.pos[off + n_acc - 1];
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), rid, last_acc + 1, -1);
+                // ⚠ THE RETURN VALUE IS LOAD-BEARING ON A HYBRID. For a recurrent/SSM memory a
+                // mid-sequence rm CANNOT be honoured -- there is no per-position slot to drop, the
+                // state has already been advanced through every submitted token. It returns false.
+                const bool rm_ok = llama_memory_seq_rm(llama_get_memory(ctx_tgt), rid, last_acc + 1, -1);
+                if (!rm_ok) {
+                    SRV_WRN("DS4P-RMFAIL rid=%d from=%d -- recurrent state NOT rewound; the %d "
+                            "rejected draft token(s) remain folded into the SSM state\n",
+                            rid, last_acc + 1, n_sub - n_acc);
+                }
             }
         } else {
             setenv("DS4P_CALLSITE", "NORMAL-LEGACY", 1);
@@ -3648,10 +3667,55 @@ private:
                     /* .result   = */ &s.spec_draft,
                 };
             }
+            // ★★ THE BOUND THE STATIC PATH RESPECTS AND THIS LOOP DID NOT.
+            //
+            // common_context_can_seq_rm() reports RS when the context keeps RECURRENT state: partial
+            // sequence removal works, but only within llama_n_rs_seq() tokens. Beyond that the state
+            // cannot be rewound by position at all, and the static path stops trying -- it restores a
+            // full checkpoint and replays ("partial acceptance is not supported by the context ->
+            // truncate the draft and restore the state", server-context.cpp:4829, ckpt.load_tgt).
+            //
+            // THIS LOOP HAS NO load_tgt AND NO CHECKPOINT. So a draft longer than the bound folds the
+            // REJECTED tokens permanently into the SSM state. Cap the draft at the bound rather than
+            // corrupt state we cannot restore.
+            static bool rs_reported = false;
+            const int n_rs = llama_n_rs_seq(ctx_tgt);
+            if (!rs_reported) {
+                rs_reported = true;
+                SRV_WRN("DS4P-RSBOUND n_rs_seq(ctx_tgt)=%d\\n", n_rs);
+            }
+
+            // ★★ GUARD: NO PAGED SPECULATION ON A CONTEXT THAT KEEPS RECURRENT STATE.
+            //
+            // Rejected draft tokens advance the SSM state and this loop cannot roll it back. The
+            // static path handles it by restoring a full checkpoint and replaying (:4829,
+            // ckpt.load_tgt); the paged loop has no load_tgt and no checkpoint. Measured damage,
+            // monotonic in the number of rejected tokens per step:
+            //
+            //   --spec-draft-n-max 1  accepted=1  "1 Paris, France** *  **Fact:** It is home to the"
+            //   --spec-draft-n-max 2  accepted=2  "<think>  12. 3. 4. 5. 6. 7."
+            //   --spec-draft-n-max 3  accepted=0  "Here are:  1.  1.  1.1.1.1.1.1"
+            //   static                accepted=13 "Thinking Process:  1.  **Analyze the Request:**"
+            //
+            // Even n_max=1 is wrong, so this is not merely exceeding the n_rs_seq bound. Refuse
+            // rather than emit silently-corrupted text; wrong output that looks fluent is the worst
+            // failure mode this lane can ship. DS4P_ALLOW_RS_SPEC=1 re-enables it for measurement --
+            // it is the negative control for this guard and must reproduce the damage above.
+            if (n_rs > 0 && !getenv("DS4P_ALLOW_RS_SPEC")) {
+                static bool refused = false;
+                if (!refused) {
+                    refused = true;
+                    SRV_WRN("%s", "paged speculation REFUSED: this context keeps recurrent state "
+                            "(n_rs_seq > 0) and the paged loop cannot roll it back on rejection. "
+                            "Serving without speculation. Set DS4P_ALLOW_RS_SPEC=1 to override.\\n");
+                }
+            }
+            const bool rs_refuse = (n_rs > 0 && !getenv("DS4P_ALLOW_RS_SPEC"));
+
             // ★ MATCHED CONTROL. Skips ONLY the draft staging, so the paged loop runs single-row
             // through the identical binary, gate, prompt and seed. Anything that differs between
             // this and the speculative run is caused by the extra ROWS, nothing else.
-            if (getenv("DS4P_SPEC_OFF")) {
+            if (rs_refuse || getenv("DS4P_SPEC_OFF")) {
                 for (auto & s : slots) { s.spec_draft.clear(); }
             } else {
             common_speculative_draft(spec.get());
