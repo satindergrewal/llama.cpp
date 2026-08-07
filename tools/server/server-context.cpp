@@ -3234,33 +3234,21 @@ private:
             }
             return;
         }
-        // ★★ SYNCHRONIZE ONLY WHEN THIS STEP ACTUALLY READS RESULTS BACK.
+        // ⚠ MEASURED NO-OP, DO NOT RE-DERIVE. update_slots_paged synchronises after every decode
+        // while the static loop does not (it synchronises implicitly by sampling, and a mid-prefill
+        // chunk samples nothing). A stack sample put 4123/4127 samples in ggml_metal_synchronize, so
+        // making this conditional on the step actually reading results back LOOKED like the fix.
         //
-        // The STATIC loop never calls llama_synchronize explicitly -- it synchronises implicitly as a
-        // side effect of SAMPLING, and on a mid-prefill chunk (which emits no logits) it samples
-        // nothing and therefore never stalls. This loop synchronised unconditionally after every
-        // decode. On a 225k prefill only the LAST chunk emits logits, so static stalls ~once and this
-        // stalled ~440 times, serialising CPU and GPU for the whole prompt.
-        //
-        // MEASURED: a live stack sample of the paged server put 4123 of 4127 samples in
-        // update_slots_paged -> llama_context::synchronize -> ggml_metal_synchronize.
-        //
-        // get_batch_info() reads HOST-side scheduler state, so it is safe to consult before any
-        // sync. If every sequence in this batch is a mid-prefill chunk, nothing reads GPU output
-        // this step and the stall buys nothing.
+        // It is not. A/B at 225k, differing in exactly this one thing:
+        //     bs64+CHAMP, lazy sync OFF -> wall 1091 s, decode 25.5 tok/s
+        //     bs64+CHAMP, lazy sync ON  -> wall 1105 s, decode 25.9 tok/s
+        // Within noise, and the arm WITHOUT it was nominally faster. The redundant syncs are real and
+        // are not the cost -- the CPU was blocked there because the GPU was genuinely busy.
+        // The actual lever was the attention kernel (--kv-block-size 64 engaging the champion).
         const llama_paged_batch_info * info = llama_paged_scheduler_get_batch_info(paged_sched);
         GGML_ASSERT(info != nullptr);
 
-        bool needs_readback = true;
-        if (getenv("DS4P_LAZY_SYNC")) {
-            needs_readback = false;
-            for (int32_t i = 0; i < info->n_seq; ++i) {
-                if (info->prefill_pending == nullptr || info->prefill_pending[i] == 0) { needs_readback = true; break; }
-            }
-        }
-        if (needs_readback) {
-            llama_synchronize(ctx_tgt);
-        }
+        llama_synchronize(ctx_tgt);
 
         std::vector<llama_token> sampled;
         std::vector<int8_t>      stops;
