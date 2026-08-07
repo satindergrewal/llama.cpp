@@ -8242,6 +8242,28 @@ struct ggml_tensor * ggml_paged_attn(
     int                   max_blocks_live,
     struct ggml_tensor  * sinks) {
 
+    // ★★ THE LAYOUT CONTRACT, ASSERTED AT THE OP RATHER THAN TRUSTED IN EACH CALLER.
+    //
+    // Every paged kernel reads q/k_new/v_new as DENSE [.., n_head(_kv), n_tokens]. Architectures with
+    // a fused wqkv hand out ggml_view_3d slices of one packed tensor instead, carrying the fused
+    // tensor's strides. Feeding those in does not crash and does not warn: starcoder returned eight
+    // spaces with 384 consume events, zero fallbacks and a completely clean log.
+    //
+    // ⚠ THE LESSON IS WHERE THE KNOWLEDGE LIVED. The auto funnel had always called ggml_cont for
+    // exactly this, with a comment naming Falcon and GPT-2. The banded funnel never did. The
+    // requirement was known, written down, and enforced in ONE of the two callers -- so it held right
+    // up until a fused checkpoint reached the other one. A contract kept by convention in each caller
+    // is a contract already broken somewhere nobody has looked.
+    //
+    // Asserting HERE makes the class catchable at graph-build time for every caller that exists and
+    // every one added later, instead of by whichever checkpoint happens to be packed that way.
+    GGML_ASSERT(ggml_is_contiguous(q) &&
+        "paged attn: q must be contiguous (fused-QKV views need ggml_cont first)");
+    GGML_ASSERT((k_new == NULL || ggml_is_contiguous(k_new)) &&
+        "paged attn: k_new must be contiguous (fused-QKV views need ggml_cont first)");
+    GGML_ASSERT((v_new == NULL || ggml_is_contiguous(v_new)) &&
+        "paged attn: v_new must be contiguous (fused-QKV views need ggml_cont first)");
+
     struct ggml_tensor * result = ggml_new_tensor(ctx, q->type, ggml_n_dims(q), q->ne);
     result->op = GGML_OP_PAGED_ATTN;
     // ★ ATTENTION SINKS at src[11] -- the slot GGML_MAX_SRC=12 was raised for. The Metal champion
