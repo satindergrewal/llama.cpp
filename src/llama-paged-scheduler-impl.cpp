@@ -910,15 +910,37 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
         // The assert below caught it on the first run, on four known-good architectures. Without it
         // the failure would have been a slow, plausible-looking context corruption at long prompts --
         // the ~50k defect's exact signature.
+        // ⚠⚠⚠ ADVANCE-COUNT AND APPEND-COUNT ARE NOT THE SAME NUMBER, AND FUSING THEM IS A SILENT
+        // LONG-CONTEXT CORRUPTION. The original code advanced n_past by batch_lens[i] and appended
+        // EXACTLY ONE token, always. On a FINAL PREFILL CHUNK batch_lens[i] is the chunk size, so a
+        // single loop over one fused count appends the sampled token chunk-size times: a 7-token
+        // prompt puts 7 copies of the first sampled token into logical_seq and shifts every later
+        // token by 6.
+        //
+        // I committed exactly that, labelled "no-op, checkpointed", and all four verified archs
+        // stayed GREEN -- because nothing in a single short request reads the INTERIOR of
+        // logical_seq. Decode reads .back(). The interior is read by the preemption/recompute requeue
+        // (:417-424, which replays logical_seq into KV under memory pressure), fork inheritance
+        // (llama-kv-cache-paged.cpp:414), the prefix-share matcher (:199) and on_finish (:348) --
+        // none of which a short cold prompt exercises.
+        //
+        // So the legacy branch stays BYTE-IDENTICAL and the ragged branch owns the loop. They are
+        // written apart rather than unified, because the thing that makes them look unifiable is
+        // exactly the thing that is false.
         const int32_t n_sub = curr_info.batch_lens[i];
-        const int32_t n_acc = n_accepted ? n_accepted[i] : n_sub;
-        GGML_ASSERT(n_acc >= 1 && n_acc <= n_sub &&
-                    "accepted count must be between 1 and the number of tokens submitted");
-
-        group->n_past    += n_acc;
-        group->n_decoded += n_acc;
-        for (int32_t k = 0; k < n_acc; ++k) {
-            group->logical_seq.push_back(n_accepted ? new_tokens[token_offset + k] : new_tokens[i]);
+        if (n_accepted == nullptr) {
+            group->n_past    += n_sub;
+            group->n_decoded += n_sub;
+            group->logical_seq.push_back(new_tokens[i]);   // ONE, always -- as before
+        } else {
+            const int32_t n_acc = n_accepted[i];
+            GGML_ASSERT(n_acc >= 1 && n_acc <= n_sub &&
+                        "accepted count must be between 1 and the number of tokens submitted");
+            group->n_past    += n_acc;
+            group->n_decoded += n_acc;
+            for (int32_t k = 0; k < n_acc; ++k) {
+                group->logical_seq.push_back(new_tokens[token_offset + k]);
+            }
         }
 
         // Default stop flags are n_seq_max
