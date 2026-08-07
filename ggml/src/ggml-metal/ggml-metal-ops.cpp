@@ -5560,6 +5560,23 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         const size_t pad = (size_t) atol(e);
         if (smem_use + pad <= smem_budget) { smem_use += pad; }
     }
+    // ⚠⚠ SINKS ARE NOT IMPLEMENTED ON THE SCALAR PATH, so reaching here with them is a WRONG ANSWER,
+    // not a slow one. The champion carries sink handling and this kernel does not; silently running
+    // without the sink drops probability mass from every softmax and produces fluent, plausible,
+    // incorrect output -- exactly the failure this port keeps manufacturing.
+    //
+    // Aborting is the honest interim state. Half-implementing sinks across this kernel's several
+    // sub-paths, each with its own running max and sum and no way to verify them independently, is
+    // how a silent wrong answer gets built on purpose. The numeric gate caught the gap on its first
+    // execution (sinks arm PASSES with the champion, FAILS without); this makes it impossible to hit
+    // by accident until the kernel actually supports them.
+    if (op->src[11] != nullptr) {
+        GGML_ABORT("%s: paged attention reached the SCALAR kernel with attention sinks, which it does "
+                   "not implement. Running would silently drop the sink from every layer. Use a "
+                   "geometry the champion serves (block_size 64, n_seq 1, head_dim in the "
+                   "instantiated set) or add sink support to this kernel.\n", __func__);
+    }
+
     // ⚠ THE SCALAR PATH HAD NO BUDGET CHECK AT ALL. The LPK arm gates on smem_lpk <= smem_budget
     // and the MMA arm on mma_smem() <= smem_budget; the plain staged path gated on NOTHING, so
     // bs=64 with head_dim=512 requested 131,072 B of threadgroup memory and produced silently
