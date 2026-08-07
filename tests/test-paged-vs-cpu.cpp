@@ -160,6 +160,21 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out_p);
     if (out_ro) { ggml_build_forward_expand(gf, out_ro); }
+
+    // ⚠ STRUCTURAL CONTROL ON THE READ-ONLY ARM. Its PASS condition is "out_ro equals out_p", which
+    // is trivially true if the two were ever folded into ONE node -- common-subexpression elimination
+    // or any graph optimiser deciding the ops are equivalent. Then the arm would compare a tensor
+    // against itself and pass forever, no matter what read-only does. Checking the numbers cannot
+    // detect that; only counting the nodes can.
+    if (out_ro) {
+        int n_paged = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            if (ggml_graph_node(gf, i)->op == GGML_OP_PAGED_ATTN) { n_paged++; }
+        }
+        GGML_ASSERT(n_paged == 2 &&
+                    "read-only arm needs TWO distinct paged-attn nodes; one means the graph folded "
+                    "them and the comparison is against the same tensor");
+    }
     ggml_backend_graph_compute(backend, gf);
 
     std::vector<float> out(ggml_nelements(out_p));
