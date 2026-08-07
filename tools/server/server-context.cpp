@@ -3248,42 +3248,6 @@ private:
         const llama_paged_batch_info * info = llama_paged_scheduler_get_batch_info(paged_sched);
         GGML_ASSERT(info != nullptr);
 
-        // ★★ PER-BATCH PREFILL PROGRESS FOR THE PAGED LOOP.
-        //
-        // The static loop emits slot::print_timings_pp() per batch, which is what makes a binned
-        // tok/s-vs-context curve computable for it. The paged loop never called it, so paged produced
-        // ONE average and the per-bin parity comparison was structurally impossible on that arm.
-        //
-        // ⚠ NOT done by calling print_timings_pp() here. It reads slot counters the paged loop does
-        // not maintain the same way: t_prompt_processing is set ONCE at :3433 after prefill ends, and
-        // n_prompt_tokens_processed is credited in one lump when the prompt is staged (:3296), not per
-        // decoded batch. Calling it mid-prefill computes a rate from an unset clock and would print a
-        // plausible curve made of fiction. Mechanism PRESENT is not state MAINTAINED -- the same
-        // inference that cost this lane eleven hours ("pool built, therefore paging happened").
-        //
-        // So: a purpose-built marker from data the paged loop already owns, leaving the slot counters
-        // (read by the kv bank at :3441 and by metrics) untouched.
-        //
-        // SELF-CHECK, free: sum(tokens)/sum(seconds) over these lines must match the response JSON's
-        // prompt_per_second, which the server computes independently. If it does not, the curve is
-        // rejected rather than analysed.
-        if (getenv("DS4P_PP_TRACE")) {
-            for (int32_t i = 0; i < info->n_seq; ++i) {
-                const int32_t rid = pbatch.seq_id[info->batch_offsets[i]][0];
-                for (auto & s : slots) {
-                    if (s.id != rid || !s.is_processing()) { continue; }
-                    llama_paged_seq_state st = {};
-                    if (!llama_paged_scheduler_get_seq_state(paged_sched, rid, &st)) { break; }
-                    const double el = (ggml_time_us() - s.t_start_process_prompt) / 1e6;
-                    if (el > 0.0) {
-                        SRV_WRN("DS4P-PP rid=%d n_past=%u elapsed=%.3f s rate=%.2f tok/s\n",
-                                rid, (unsigned) st.n_past, el, (double) st.n_past / el);
-                    }
-                    break;
-                }
-            }
-        }
-
         llama_synchronize(ctx_tgt);
 
         std::vector<llama_token> sampled;
