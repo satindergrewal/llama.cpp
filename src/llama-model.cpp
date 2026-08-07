@@ -2477,6 +2477,48 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         GGML_ASSERT((!cparams.kv_paged || paged_swa_dev) &&
                                 "kv_paged on SWA needs DS4P_PAGED_SWA=1");
 
+                        // ★★ KV-SHARING MODELS RUN SPLIT-BRAIN UNDER --kv-paged. REFUSE THEM.
+                        //
+                        // When only the first N of n_layer layers own KV, the rest REUSE an earlier
+                        // layer's cache, and gemma4.cpp routes those shared layers to
+                        // build_attn(inp_attn, ...) -- the STATIC ISWA cache -- while the KV-owning
+                        // layers write the PAGED pool. Under paging nothing fills the static cache,
+                        // so the shared layers attend over EMPTY KV.
+                        //
+                        //     gemma-4-E2B-it   15 of 35 layers own KV   static " Paris."  paged " a."
+                        //     gemma4-26B-A4B   all 30 own KV            PASSES, 240 consume events
+                        //
+                        // Coherent, not gibberish: fifteen layers correct, twenty starved.
+                        //
+                        // ⚠ THE CONDITION IS `< n_layer()`, NOT `>= 0`. My first version tested only
+                        // >= 0 and aborted the 26B model too -- which owns KV on every layer and had
+                        // been PASSING. It is set-but-equal-to-n_layer there, meaning "all layers have
+                        // KV", i.e. no sharing at all. A guard that fires on the flag's PRESENCE
+                        // rather than on the CONDITION IT IMPLIES breaks working configurations, and
+                        // this one did until the control caught it.
+                        //
+                        // ⚠ Refusing is the loud half, not the fix. The real fix routes shared layers
+                        // to the paged pool as READ-ONLY calls at the reuse index -- the mapping
+                        // already exists as the layer_reuse_cb above, and read-only paged attention
+                        // was implemented the same day (cce5d6959).
+                        //
+                        // ⚠ Message text is deliberately stable: the ds4-gates harnesses match
+                        // designed refusals on TEXT, not on enumerated arch lists.
+                        if (cparams.kv_paged &&
+                            hparams.n_layer_kv_from_start >= 0 &&
+                            (uint32_t) hparams.n_layer_kv_from_start < hparams.n_layer()) {
+                            LLAMA_LOG_ERROR("%s: kv_paged is not yet supported for KV-SHARING "
+                                    "architectures (only %d of %d layers own KV): the layers that "
+                                    "reuse an earlier layer's cache read the STATIC cache, which "
+                                    "paging never fills, so they would attend over empty KV and the "
+                                    "answer would be silently wrong. Serve without --kv-paged.\n",
+                                    __func__, hparams.n_layer_kv_from_start, hparams.n_layer());
+                        }
+                        GGML_ASSERT((!cparams.kv_paged ||
+                                     hparams.n_layer_kv_from_start < 0 ||
+                                     (uint32_t) hparams.n_layer_kv_from_start >= hparams.n_layer()) &&
+                                "kv_paged is not yet supported for KV-sharing architectures");
+
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
                             llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
 
