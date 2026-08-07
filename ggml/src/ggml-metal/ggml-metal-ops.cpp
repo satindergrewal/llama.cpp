@@ -4838,7 +4838,21 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     const int head_dim   = (int) q->ne[0];
     const int n_heads    = (int) q->ne[1];
     const int n_tokens   = (int) q->ne[2];
-    const int n_heads_kv = (int) k_new->ne[1];
+
+    // ★ n_heads_kv FROM THE CACHE, NOT FROM k_new. The paged pool is allocated as
+    //     ne = [head_dim, block_size, 2*n_head_kv, n_blocks]      (llama-kv-cache-paged.cpp:202)
+    // with K heads then V heads interleaved, so the head count is exact from ne[2]/2 and does not
+    // depend on this call carrying new K/V at all. That is what makes read-only expressible: a
+    // read-only call has no k_new to ask.
+    //
+    // ⚠ AND IT IS DERIVED ON EVERY CALL, not only read-only ones, with k_new checked against it when
+    // present. A derivation used ONLY on the new path is a derivation whose first real exercise is
+    // the case nobody has tested. This way every existing paged request is a test of it, and the two
+    // sources disagreeing surfaces immediately instead of on the first gemma4-assistant decode.
+    GGML_ASSERT(kv_cache->ne[2] % 2 == 0 && "paged pool must hold K and V heads in pairs");
+    const int n_heads_kv = (int) (kv_cache->ne[2] / 2);
+    GGML_ASSERT((k_new == nullptr || (int) k_new->ne[1] == n_heads_kv) &&
+                "k_new head count disagrees with the paged pool's");
 
     // ---- MMA prefill eligibility and TILE SIZING.
     // The threadgroup-memory budget is what sizes the tile, so it is computed here as
@@ -4977,20 +4991,27 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // op's contract was fused write-then-read with no way to express that, which is why the arch
     // could not be wired. Skipping the write is the whole difference -- the attention phase already
     // addresses the pool through the block table and ctx_lens and never consults k_new.
-    // ⚠⚠ READ-ONLY IS NOT SUPPORTED YET, AND "SKIP THE WRITE" WAS NOT THE WHOLE FIX. Making the
-    // write conditional compiled, did not regress anything, and SEGFAULTED the moment a read-only
-    // call actually ran: k_new/v_new are dereferenced for SHAPES elsewhere -- ggml-cpu/ops.cpp reads
-    // n_heads_kv = k_new->ne[1], and this file derives geometry from them too. The gap is a contract,
-    // not a branch.
+    // ⚠ THE EARLIER ATTEMPT AT THIS SEGFAULTED, AND THE REASON IS WHY THE FIX LOOKS LIKE THIS.
+    // "Make the write conditional" compiled and regressed nothing -- then crashed the moment a
+    // read-only call actually ran, because k_new was still dereferenced for SHAPES: n_heads_kv came
+    // from k_new->ne[1] here and in ggml-cpu/ops.cpp. The gap was a contract, not a branch, and
+    // skipping the write without moving the geometry off k_new fixes the half you can see.
     //
-    // Aborting until it is implemented and exercised. gemma4-assistant's NextN head needs this; it
-    // stays unwired rather than wired onto a path that crashes.
-    if (op->src[1] == nullptr || op->src[2] == nullptr) {
-        GGML_ABORT("%s: paged attention called with no new K/V (read-only). Not implemented: the "
-                   "write can be skipped, but K/V shapes are still read for geometry. "
-                   "gemma4-assistant's NextN head needs this path.\n", __func__);
+    // Both halves are now done: geometry comes from the pool above, and the write phase below is
+    // skipped. Exactly one thing must remain true for this to be correct -- the attention phase
+    // addresses the pool through the block table and ctx_lens and never consults k_new/v_new.
+    const bool read_only = (op->src[1] == nullptr || op->src[2] == nullptr);
+    if (read_only) {
+        GGML_ASSERT(op->src[1] == nullptr && op->src[2] == nullptr &&
+                    "read-only paged attention needs BOTH k_new and v_new absent; one of the two "
+                    "present means a caller dropped a tensor rather than requesting a read");
+        static bool said = false;
+        if (!said) { said = true;
+            GGML_LOG_INFO("%s: DS4P-READONLY paged attention (no new K/V) -- write phase skipped, "
+                          "n_heads_kv=%d derived from the pool\n", __func__, n_heads_kv);
+        }
     }
-    {
+    if (!read_only) {
         auto wpipe = ggml_metal_library_get_pipeline_paged_attn_write(lib, op);
 
         // ⚠ THREAD WIDTH MUST FOLLOW THE KERNEL. The f16 kernel is one thread per head-dim

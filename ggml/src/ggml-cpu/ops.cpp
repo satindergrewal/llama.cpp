@@ -12159,7 +12159,27 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     const int head_dim   = q->ne[0];
     const int n_heads    = q->ne[1];
     const int n_seq      = batch_lens->ne[0];
-    const int n_heads_kv = k_new->ne[1];
+
+    // ★ READ-ONLY: no new K/V, attend over what the main graph already stored. gemma4-assistant's
+    // NextN head calls build_attn this way. BOTH sources of geometry had to move off k_new -- this
+    // file and ggml-metal-ops.cpp each read n_heads_kv = k_new->ne[1], and fixing one leaves the
+    // other to crash in a different backend. That is how the previous attempt failed: the write was
+    // made conditional, the shapes were not, and it segfaulted on the first read-only call.
+    //
+    // The pool carries the head count exactly:
+    //   ne = [head_dim, block_size, 2*n_head_kv, n_blocks]      (llama-kv-cache-paged.cpp:202)
+    //
+    // ⚠ Derived UNCONDITIONALLY and cross-checked against k_new when present, so every existing
+    // paged request exercises the derivation. A derivation used only on the new path has its first
+    // real test in the case nobody has run.
+    const bool read_only = (k_new == nullptr || v_new == nullptr);
+    GGML_ASSERT((k_new == nullptr) == (v_new == nullptr) &&
+                "read-only paged attention needs BOTH k_new and v_new absent; one present means a "
+                "caller dropped a tensor rather than requesting a read");
+    GGML_ASSERT(kv_cache->ne[2] % 2 == 0 && "paged pool must hold K and V heads in pairs");
+    const int n_heads_kv = (int) (kv_cache->ne[2] / 2);
+    GGML_ASSERT((k_new == nullptr || (int) k_new->ne[1] == n_heads_kv) &&
+                "k_new head count disagrees with the paged pool's");
 
     GGML_ASSERT(block_size != 0 && "block_size cannot be 0.");
     GGML_ASSERT(n_heads != 0 && "n_head cannot be 0.");
@@ -12177,8 +12197,8 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
 
     // Accessing tensors via backend API to make the CPU reference implementation backend agnostic
     std::vector<float>   q_host(ggml_nelements(q));
-    std::vector<float>   k_host(ggml_nelements(k_new));
-    std::vector<float>   v_host(ggml_nelements(v_new));
+    std::vector<float>   k_host(read_only ? 0 : ggml_nelements(k_new));
+    std::vector<float>   v_host(read_only ? 0 : ggml_nelements(v_new));
     std::vector<int32_t> block_table_host(ggml_nelements(block_table));
     std::vector<int32_t> slots_host(ggml_nelements(write_slots));
     std::vector<int32_t> ctx_lens_host(ggml_nelements(ctx_lens));
@@ -12187,8 +12207,10 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     std::vector<float>   out_host(ggml_nelements(dst));
 
     ggml_backend_tensor_get(q,             q_host.data(),             0, ggml_nbytes(q));
-    ggml_backend_tensor_get(k_new,         k_host.data(),             0, ggml_nbytes(k_new));
-    ggml_backend_tensor_get(v_new,         v_host.data(),             0, ggml_nbytes(v_new));
+    if (!read_only) {
+        ggml_backend_tensor_get(k_new,     k_host.data(),             0, ggml_nbytes(k_new));
+        ggml_backend_tensor_get(v_new,     v_host.data(),             0, ggml_nbytes(v_new));
+    }
     ggml_backend_tensor_get(block_table,   block_table_host.data(),   0, ggml_nbytes(block_table));
     ggml_backend_tensor_get(write_slots,   slots_host.data(),         0, ggml_nbytes(write_slots));
     ggml_backend_tensor_get(ctx_lens,      ctx_lens_host.data(),      0, ggml_nbytes(ctx_lens));
@@ -12259,8 +12281,10 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
         }
     };
 
-    // Write to KV cache
-    for (int seq = 0; seq < n_seq; ++seq) {
+    // Write to KV cache -- skipped entirely when there is no new K/V. The attention phase below
+    // addresses the pool through the block table and ctx_lens and never consults k_data/v_data, so
+    // a read-only call attends over exactly what the main graph already stored.
+    for (int seq = 0; !read_only && seq < n_seq; ++seq) {
         const int seq_start  = batch_offsets_data[seq];
         const int num_tokens = batch_lens_data[seq];
 

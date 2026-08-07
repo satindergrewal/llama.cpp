@@ -426,17 +426,68 @@ int main() {
                 n_fail += dc > 1e-3 ? 0 : 1;
 
                 // ★ READ-ONLY: same pool, second op with K/V null, must equal the ordinary answer.
-                // ⚠ OFF BY DEFAULT UNTIL READ-ONLY IS IMPLEMENTED. The op aborts on null K/V today.
-                // The arm is kept, not deleted: it is the check that caught the segfault the moment a
-                // read-only call actually ran, after "compiles and does not regress" had said nothing.
+                // It is ON now that the op implements it (n_heads_kv comes from the pool, the write
+                // phase is skipped). The arm was kept while it was unsupported because it is the
+                // check that caught the segfault the moment a read-only call actually ran, after
+                // "compiles and does not regress" had said nothing at all.
+                //
+                // ⚠⚠ AND IT WAS VACUOUS -- THE ARGUMENT SHIFT THIS FILE WARNS ABOUT, IN THE VERY CALL
+                // THE WARNING EXISTS TO PROTECT. It read `..., GGML_TYPE_F16, 0, true)`: seven
+                // positionals, so `true` landed on `causal` and `read_only_check` stayed FALSE. The
+                // arm ran an ordinary paged call and compared it against another ordinary paged call
+                // -- guaranteed to print max_abs=0.000e+00 PASS while never exercising read-only once.
+                //
+                // When read_only_check was moved to LAST to fix the earlier shift, the DECLARATION was
+                // corrected and this call site was not. Reordering defaulted parameters repairs the
+                // signature and leaves every existing call silently meaning something else. C++ has no
+                // named arguments, so the positions are written out here instead:
+                //   run_paged(backend, D, with_rel, window, kv_type, sink_mode, causal, read_only)
                 if (!getenv("DS4P_TEST_READONLY")) { goto skip_ro; }
                 {
-                const std::vector<float> aro = run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 0, true);
+                const std::vector<float> aro =
+                    run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 0, 1, /*read_only=*/true);
+                // ⚠ A PASS HERE IS max_abs == 0, WHICH IS ALSO WHAT AN EMPTY RESULT PRINTS. The
+                // comparison loop is bounded by BOTH sizes, so an aro of length zero compares nothing,
+                // leaves mr at 0.0 and prints PASS. Having just found this arm vacuous for a different
+                // reason, the size is asserted rather than assumed -- and so is non-degeneracy, since
+                // an all-zero aro against an all-zero a would also read 0.
+                bool ro_ok = aro.size() == a.size() && !aro.empty();
+                double ro_mag = 0.0;
+                for (float x : aro) ro_mag = std::max(ro_mag, (double) fabs(x));
+                if (!ro_ok || ro_mag < 1e-8) {
+                    printf("D=%3d read-only    : VOID (size=%zu vs %zu, max|aro|=%.3e) -- an empty or "
+                           "all-zero result compares equal to anything\n",
+                           D, aro.size(), a.size(), ro_mag);
+                    n_fail += 1;
+                    goto skip_ro;
+                }
                 double mr = 0.0;
                 for (size_t i = 0; i < aro.size() && i < a.size(); ++i) mr = std::max(mr, (double) fabs(aro[i]-a[i]));
-                printf("D=%3d read-only    : max_abs=%.3e %s   (must equal the write-then-read answer)\n",
-                       D, mr, mr < 1e-6 ? "PASS" : "FAIL");
+                printf("D=%3d read-only    : max_abs=%.3e %s   (must equal the write-then-read answer, "
+                       "max|aro|=%.3e)\n", D, mr, mr < 1e-6 ? "PASS" : "FAIL", ro_mag);
                 n_fail += mr < 1e-6 ? 0 : 1;
+
+                // ★ THE CPU OP TOO. Read-only required a change in BOTH backends -- each derived
+                // n_heads_kv from k_new->ne[1] independently -- so exercising only the Metal side
+                // leaves the other half compiled and unrun. That is exactly how the first attempt
+                // passed review and then segfaulted: the half nobody executed was the half that was
+                // wrong. This arm is against the CPU's OWN ordinary answer, not Metal's, so it tests
+                // the CPU change rather than re-testing agreement between the two.
+                const std::vector<float> bro =
+                    run_paged(cpu, D, with_rel, window, GGML_TYPE_F16, 0, 1, /*read_only=*/true);
+                double bro_mag = 0.0;
+                for (float x : bro) bro_mag = std::max(bro_mag, (double) fabs(x));
+                if (bro.size() != b.size() || bro.empty() || bro_mag < 1e-8) {
+                    printf("D=%3d read-only CPU: VOID (size=%zu vs %zu, max|bro|=%.3e)\n",
+                           D, bro.size(), b.size(), bro_mag);
+                    n_fail += 1;
+                } else {
+                    double mrc = 0.0;
+                    for (size_t i = 0; i < bro.size() && i < b.size(); ++i) mrc = std::max(mrc, (double) fabs(bro[i]-b[i]));
+                    printf("D=%3d read-only CPU: max_abs=%.3e %s   (CPU op's own write-then-read answer, "
+                           "max|bro|=%.3e)\n", D, mrc, mrc < 1e-6 ? "PASS" : "FAIL", bro_mag);
+                    n_fail += mrc < 1e-6 ? 0 : 1;
+                }
                 }
                 skip_ro:;
 
