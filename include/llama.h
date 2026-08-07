@@ -1705,10 +1705,15 @@ extern "C" {
     LLAMA_API int32_t llama_paged_scheduler_take_terminated(struct llama_paged_scheduler * sched,
                                                             int32_t * out, int32_t max_out);
 
-    // n_accepted is OPTIONAL (nullable). NULL = today's semantics: exactly one accepted token per
-    // sequence, `tokens` indexed one-per-sequence. When provided, n_accepted[i] is how many of
-    // sequence i's SUBMITTED tokens were kept (speculative decoding submits N+1 and may keep fewer),
-    // and `tokens` is then laid out at the BATCH offsets rather than one-per-sequence.
+    // n_accepted is OPTIONAL (nullable), and NEGATIVE ENTRIES ARE A PER-ROW OPT-OUT.
+    //   NULL              legacy for every row
+    //   n_accepted[i] < 0 legacy for THIS row: advance by batch_lens[i], append exactly ONE token,
+    //                     `tokens` read at [i]. Required for prefill rows -- the FINAL prefill chunk
+    //                     submits many tokens but still contributes only one sampled token.
+    //   n_accepted[i] >=1 speculative row: how many of sequence i's SUBMITTED tokens were kept
+    //                     (speculation submits N+1 and may keep fewer). `tokens` for this row is read
+    //                     at the BATCH offsets, not one-per-sequence, because sequences can submit
+    //                     different counts.
     LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
                                                 struct llama_batch *           batch,
                                                 const llama_token *            tokens,

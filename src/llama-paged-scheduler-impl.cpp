@@ -927,8 +927,13 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
         // So the legacy branch stays BYTE-IDENTICAL and the ragged branch owns the loop. They are
         // written apart rather than unified, because the thing that makes them look unifiable is
         // exactly the thing that is false.
+        // ★ THE SENTINEL. A whole-array nullptr means legacy for every row; a NEGATIVE entry means
+        // legacy for THAT row. Needed because prefill_pending only marks MID-chunk rows -- the FINAL
+        // prefill chunk has prefill_pending == 0 and still requires advance=lens / append=ONE. With
+        // -np>1 a batch can mix a prefilling sequence with a decoding one, so the rule has to be
+        // per-row. Decided before it was exercised, so it is not invented while staring at a failure.
         const int32_t n_sub = curr_info.batch_lens[i];
-        if (n_accepted == nullptr) {
+        if (n_accepted == nullptr || n_accepted[i] < 0) {
             group->n_past    += n_sub;
             group->n_decoded += n_sub;
             group->logical_seq.push_back(new_tokens[i]);   // ONE, always -- as before
