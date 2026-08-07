@@ -12108,6 +12108,14 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     // op_params bytes [16,24)/[24,32) -- the banded-FA layout. rel_dist is LOGICAL
     // (q_pos - tok), so block scattering does not affect it.
     const ggml_tensor * rel = dst->src[10];
+    // ★ ATTENTION SINKS at src[11]. Without this the CPU op ignores them, and since this op IS the
+    // reference test-paged-vs-cpu compares against, a Metal sinks arm would diverge from a reference
+    // that does not implement the feature -- indistinguishable from Metal getting sinks wrong.
+    const ggml_tensor * sinks = dst->src[11];
+    if (sinks) {
+        GGML_ASSERT(sinks->type == GGML_TYPE_F32 && ggml_is_contiguous(sinks) &&
+                    "paged attention: sinks must be contiguous F32 (reference impl)");
+    }
     int64_t rel_extent        = 0;
     int64_t visibility_window = 0;
     memcpy(&rel_extent,        &dst->op_params[4], sizeof(rel_extent));
@@ -12376,6 +12384,21 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
                         qk_max = qk_max_new;
                     }
                 }
+                // ★ SINK. One extra logit per head, outside the key loop: it joins the softmax
+                // DENOMINATOR and contributes nothing to the numerator, which is what makes it a
+                // sink -- probability mass that leaves without selecting a value. Applied after the
+                // key loop so qk_max is final, matching the kernels' ordering.
+                if (sinks) {
+                    const float sk = ((const float *) sinks->data)[h_id];
+                    const float qk_max_new = fmaxf(qk_max, sk);
+                    const float exp_old    = expf(qk_max - qk_max_new);
+                    exp_sum = exp_sum * exp_old + expf(sk - qk_max_new);
+                    for (int d_id = 0; d_id < head_dim; ++d_id) {
+                        acc[d_id] = acc[d_id] * exp_old;
+                    }
+                    qk_max = qk_max_new;
+                }
+
                 // Write output
                 const size_t out_idx = (size_t) token_batch_idx * n_heads * head_dim + (size_t) h_id * head_dim;
                 for (int d_id = 0; d_id < head_dim; ++d_id) {

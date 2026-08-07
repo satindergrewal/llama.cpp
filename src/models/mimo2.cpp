@@ -1,5 +1,8 @@
 #include "models.h"
 
+#include "../llama-kv-cache.h"
+#include "../llama-kv-cache-paged.h"
+
 void llama_model_mimo2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -98,7 +101,10 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
     inpL = build_inp_embd(model.tok_embd);
 
     ggml_tensor * inp_pos = build_inp_pos();
-    auto * inp_attn = build_attn_inp_kv_iswa();
+    // ★ PAGED CONSUMER. build_attn_inp_kv_iswa() static_casts mctx to the ISWA context; on a paged
+    // memory that object does not exist and the graph constructor dies in the builder.
+    const auto * pg_ctx_top = mctx ? mctx->get_attn_paged() : nullptr;
+    auto * inp_attn = pg_ctx_top ? nullptr : build_attn_inp_kv_iswa();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     const float v_scale = hparams.f_attn_value_scale;
@@ -172,9 +178,20 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
 
             ggml_tensor * sinks = model.layers[il].attn_sinks;
 
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, NULL, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, sinks, nullptr, 1.0f/sqrtf(float(n_embd_head_k)), il);
+            // ⚠ THIS ARCH PASSES ATTENTION SINKS, and until sinks were delivered end to end the
+            // paged branch could not exist: wiring it would have dropped the sink from every layer,
+            // silently. sinks now rides to the kernel via src[11].
+            const float kq_scale_pg = 1.0f/sqrtf(float(n_embd_head_k));
+            const auto * pg_ctx = mctx ? mctx->get_attn_paged() : nullptr;
+            ggml_tensor * cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur, kq_scale_pg, il,
+                    hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0, nullptr, 0, sinks);
+            if (cur_pg != nullptr) {
+                cur = build_lora_mm(model.layers[il].wo, cur_pg, model.layers[il].wo_s);
+            } else {
+                cur = build_attn(inp_attn,
+                        model.layers[il].wo, NULL, model.layers[il].wo_s,
+                        Qcur, Kcur, Vcur, nullptr, sinks, nullptr, kq_scale_pg, il);
+            }
             cb(cur, "attn_out", il);
 
             if (v_scale) {

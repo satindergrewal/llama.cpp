@@ -32,8 +32,14 @@ static float val_r(int e, int h, int tok)  { return 0.50f * cosf(0.8f*e + 0.6f*h
 
 // Run the paged op once on `backend` and return the output, so the caller can run the same
 // thing twice and diff it.
+// ⚠ sink_mode GOES LAST. It was added as the 5th parameter, in front of the existing kv_type, and
+// the two existing calls that pass GGML_TYPE_Q8_0 / GGML_TYPE_F16 silently became sink_mode=8 and
+// sink_mode=1 with kv_type defaulted. Both compiled. The f16 incremental arms then failed at
+// max_abs=1.7e-01 and I spent a bisect chasing the library before finding it here. Adding a
+// defaulted parameter in the MIDDLE of a signature is a silent argument shift.
 static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel, int64_t window,
-                                    ggml_type kv_type = GGML_TYPE_F16) {
+                                    ggml_type kv_type = GGML_TYPE_F16,
+                                    int sink_mode = 0) {   // 0 none, 1 finite, 2 -inf control
     // ⚠ H/HKV ARE ENV-OVERRIDABLE so the harness can be REPLAYED at the server's real geometry.
     // The ARGDUMP showed the server running head_dim=256, n_heads=16, n_heads_kv=4 (GQA 4:1) with
     // n_blocks=1 -- while this file had GQA 2:1 hardcoded. Every "PASS" it has printed was at a GQA
@@ -71,11 +77,27 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
     ggml_tensor * blens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_tensor * rel_p = with_rel ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, H, N) : nullptr;
 
+    // ★ SINKS ARM. sink_mode 2 is the NEGATIVE CONTROL and is the one worth trusting: a sink of
+    // -inf contributes exp(-inf - M) = 0 to the denominator, so the result MUST equal the no-sinks
+    // answer bit for bit. That property holds without me having to trust any reference derivation --
+    // if the plumbing is wrong, -inf will not reproduce it; if only my sink MATH is wrong, -inf still
+    // passes while the finite arm diverges. Two failures, two signals.
+    ggml_tensor * sinks_p = sink_mode ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H) : nullptr;
+    if (sinks_p) { ggml_set_name(sinks_p, "sinks"); }
+
     ggml_tensor * out_p = ggml_paged_attn_banded(ctx, q_p, k_new, v_new, cache, cache,
-            btab, slots, clens, boffs, blens, rel_p, scale, BS, NB, NB, nullptr, with_rel ? E : 1, window);
+            btab, slots, clens, boffs, blens, rel_p, scale, BS, NB, NB, sinks_p, with_rel ? E : 1, window);
     ggml_set_name(out_p, "out_paged");
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    if (sinks_p) {
+        std::vector<float> sk(H);
+        for (int h = 0; h < H; ++h) {
+            sk[h] = sink_mode == 2 ? -INFINITY : (0.25f + 0.10f*h);
+        }
+        ggml_backend_tensor_set(sinks_p, sk.data(), 0, ggml_nbytes(sinks_p));
+    }
 
     std::vector<float> tmp((size_t) N*H*D);
     for (int t = 0; t < N; ++t) for (int h = 0; h < H; ++h) for (int d = 0; d < D; ++d)
@@ -340,6 +362,25 @@ int main() {
 
             const std::vector<float> a = run_paged(backend, D, with_rel, window);
             const std::vector<float> b = run_paged(cpu,     D, with_rel, window);
+
+            // ★ SINKS. Finite sink against the CPU op (which now implements them), plus the -inf
+            // control against the NO-SINKS answer on the same backend.
+            if (cse == 0) {
+                const std::vector<float> as = run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 1);
+                const std::vector<float> bs = run_paged(cpu,     D, with_rel, window, GGML_TYPE_F16, 1);
+                double m = 0.0;
+                for (size_t i = 0; i < as.size() && i < bs.size(); ++i) m = std::max(m, (double) fabs(as[i]-bs[i]));
+                printf("D=%3d sinks finite : max_abs=%.3e %s\n", D, m, m < 2e-3 ? "PASS" : "FAIL");
+                n_fail += m < 2e-3 ? 0 : 1;
+
+                const std::vector<float> ai = run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 2);
+                double c = 0.0;
+                for (size_t i = 0; i < ai.size() && i < a.size(); ++i) c = std::max(c, (double) fabs(ai[i]-a[i]));
+                printf("D=%3d sinks -inf   : max_abs=%.3e %s   (control: must equal no-sinks)\n",
+                       D, c, c < 1e-6 ? "PASS" : "FAIL");
+                n_fail += c < 1e-6 ? 0 : 1;
+            }
+
             GGML_ASSERT(a.size() == b.size());
 
             double max_abs = 0.0, sum_sq = 0.0, ref_sq = 0.0;
