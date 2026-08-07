@@ -4475,6 +4475,28 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
     }
     auto * inp_paged = cached_inp_paged;
 
+    // ★★ FUSED QKV PRODUCES NON-CONTIGUOUS VIEWS, AND THIS KERNEL ASSUMES A DENSE LAYOUT.
+    //
+    // build_qkv() takes two shapes. With separate wq/wk/wv it returns freshly-built contiguous
+    // tensors. With a FUSED layer.wqkv it returns ggml_view_3d slices of one packed tensor, whose
+    // strides are the fused tensor's -- so K and V are views, not dense [n_tokens, n_head_kv, D].
+    //
+    // The auto funnel has always forced contiguity for exactly this, and its comment names the
+    // families: "Architectures like (Falcon, GPT-2, etc.) produce KV as views into a fused QKV
+    // tensor" (build_attn_mha_paged, ~line 2783). This funnel never did. Every arch wired here that
+    // loads a fused wqkv has therefore been handing views to a kernel that reads them as dense.
+    //
+    // ⚠ AND IT HID BEHIND THE ARCHS THAT PASSED. ernie4_5, qwen3vl, nemotron and qwen3moe all CALL
+    // build_qkv, which is why the file list looked identical -- but their checkpoints carry separate
+    // projections, so they take the contiguous branch and were never affected. starcoder
+    // (GPTBigCode) is the first fused-wqkv model to reach this path, and it returned eight spaces:
+    // no crash, no warning, 384 consume events, every marker clean.
+    //
+    // Conditional, so the fourteen archs that were already correct gain no extra copy node.
+    if (q && !ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+    if (k && !ggml_is_contiguous(k)) { k = ggml_cont(ctx0, k); }
+    if (v && !ggml_is_contiguous(v)) { v = ggml_cont(ctx0, v); }
+
     ggml_tensor * rel_p = rel ? ggml_cont(ctx0, rel) : nullptr;
 
     ggml_tensor * cur_p = ggml_paged_attn_banded(ctx0,
