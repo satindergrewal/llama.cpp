@@ -64,7 +64,14 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
     const uint32_t n_waiting    = waiting.size();
     const uint32_t n_candidates = candidates.size();
 
-    LLAMA_LOG_INFO("%s: Scheduler status: running=%d, swapped=%d, waiting=%d, candidates=%d\n", __func__, n_running,
+    // ⚠ DEBUG, NOT INFO. This fires once per scheduler step INCLUDING every idle step, so an idle
+    // server emitted 15 MB/s of "running=0, swapped=0, waiting=0, candidates=0" at -lv 4 -- 898 MB
+    // in about a minute. Two costs, and the second is worse than the disk:
+    //   1. it fills the disk (a day idle would be ~1.3 TB)
+    //   2. it lands ONLY on the paged arm, so any paged-vs-static TIMING comparison is measuring
+    //      15 MB/s of logging as if it were paging cost. arms-must-differ-in-ONE-thing.
+    // Same family as the deadlock that logged itself 4.17M times into a bool.
+    LLAMA_LOG_DEBUG("%s: Scheduler status: running=%d, swapped=%d, waiting=%d, candidates=%d\n", __func__, n_running,
                    n_swapped, n_waiting, n_candidates);
 
     const bool deadlock = check_deadlock(n_candidates, n_swapped, n_waiting);
