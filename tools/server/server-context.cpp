@@ -3182,6 +3182,28 @@ private:
             return; // nothing admitted/decodable this tick
         }
 
+        // ★★ TARGET-SIDE STATE THE DRAFTER DEPENDS ON, and the audit's "bookkeeping" bucket hid its
+        // weight. dflash, eagle3 and MTP all condition on the TARGET's activations, so two calls the
+        // static path makes and this loop did not:
+        //
+        //   llama_set_embeddings(ctx_tgt, need_embd)   before decode -- without it the target never
+        //                                              extracts the post-norm embeddings the drafter
+        //                                              reads, and drafts are generated from nothing
+        //   common_speculative_process(spec, batch)    after decode -- updates the drafter's internal
+        //                                              state from what the target just computed
+        //
+        // ⚠ Both are absent-by-omission failures: drafting would still "work", produce tokens, and
+        // report a draft_n > 0 while proposing from stale or empty activations. Acceptance would
+        // crater and my own draft_n > 0 gate would pass it. This is exactly why the pre-registered
+        // criterion is acceptance PARITY with the static arm, not merely non-zero drafting.
+        if (spec) {
+            bool need_embd = false;
+            for (auto & s : slots) {
+                if (s.is_processing() && s.need_embd()) { need_embd = true; break; }
+            }
+            llama_set_embeddings(ctx_tgt, need_embd);
+        }
+
         if (llama_decode(ctx_tgt, pbatch) != 0) {
             // storm breaker: returning here leaves the scheduler un-updated, so the next
             // tick rebuilds the IDENTICAL failing batch -- one bad batch became an
@@ -3263,6 +3285,12 @@ private:
             }
         }
 
+        // ★ Feed the drafter what the target just computed. Without this its internal state never
+        // advances and drafts come from stale activations -- silently, with draft_n > 0.
+        if (spec && !common_speculative_process(spec.get(), pbatch)) {
+            SRV_WRN("%s", "paged: common_speculative_process failed; drafting disabled this step\n");
+        }
+
         for (int32_t i = 0; i < info->n_seq; ++i) {
             const int32_t request_id = pbatch.seq_id[info->batch_offsets[i]][0];
 
@@ -3328,12 +3356,32 @@ private:
                                                               spec_idxs, spec_draft_used);
                 GGML_ASSERT(!accepted.empty() && "verify returned no tokens");
                 n_accepted_v[i] = (int32_t) accepted.size();
+                // ⚠ accepted.size() - 1: the last entry is the target's own bonus token, not a
+                // draft acceptance. Passing the full size would inflate every drafter's internal
+                // acceptance statistics and, for adaptive drafters, change how much they draft next.
+                common_speculative_accept(spec.get(), slot->id, (uint16_t) (accepted.size() - 1));
+                // report what actually happened, or timings.draft_n stays 0 and every gate that
+                // reads it -- including mine -- calls a working feature inert
+                slot->n_draft_total    += (int32_t) spec_draft_used.size();
+                slot->n_draft_accepted += (int32_t) accepted.size() - 1;
             } else {
                 const llama_token id0 = common_sampler_sample(slot->smpl.get(), ctx_tgt, tok_idx);
                 common_sampler_accept(slot->smpl.get(), id0, true);
                 accepted.push_back(id0);
             }
             const llama_token id = accepted.back();
+
+            // ⚠ THIRD PIECE OF STATE THE STATIC PATH MAINTAINS AND THIS LOOP DID NOT. slot.sampled
+            // is the drafter's `id_last` -- the token it drafts FROM. It was read by my draft params
+            // and never written here, so common_speculative_draft() ran 22 times and generated ZERO
+            // drafts: #calls(b,g,a) = 1, 22, 0 with #gen drafts = 0.
+            //
+            // The other two were SLOT_STATE_GENERATING (my condition made the whole block dead code)
+            // and common_speculative_begin (never called, b = 0). Same class every time: the paged
+            // loop does not enter pre_decode/post_decode, so every piece of slot state those two
+            // maintain is silently absent here, and absence produces a WORKING SERVER that drafts
+            // nothing.
+            slot->sampled = id;
 
             // P1-5: the sampled token is now part of this sequence's KV, so it belongs in
             // the prompt-token mirror too -- otherwise the mirror would stop matching the
@@ -3344,6 +3392,12 @@ private:
             const int64_t t_now = ggml_time_us();
             slot->n_decoded += 1;
             if (slot->n_decoded == 1) {
+                // ★ Generation starts here. The drafter's statistics read #calls(b,g,a) = 0 0 0
+                // until this existed -- b is the BEGIN count, and I had not wired begin at all. The
+                // static path calls it in post_decode, a function this loop never enters.
+                if (spec && slot->can_speculate()) {
+                    common_speculative_begin(spec.get(), slot->id, slot->prompt.tokens.get_text_tokens());
+                }
                 slot->t_start_generation   = t_now;
                 slot->t_print_last         = t_now;
                 slot->n_decoded_last       = 0;
@@ -3419,12 +3473,61 @@ private:
             // token is a speculative row; anything else keeps the -1 sentinel and legacy semantics.
             if (is_spec) {
                 any_spec = true;
+                // report what actually happened, or timings.draft_n stays 0 and every gate that
+                // reads it -- including mine -- calls a working feature inert
+
                 for (size_t k = 0; k < accepted.size(); ++k) {
                     sampled_off[(size_t) info->batch_offsets[i] + k] = accepted[k];
                 }
             } else {
                 n_accepted_v[i] = -1;
                 sampled_off[(size_t) info->batch_offsets[i]] = id;
+            }
+        }
+
+        // ★★ DRAFT GENERATION -- the last piece. Runs AFTER the verify loop and BEFORE update(),
+        // because update() clears pending_draft and the scheduler reads it on the NEXT prepare_batch.
+        //
+        // ⚠ The staged draft and slot->spec_draft must stay the same object: the verify above reads
+        // slot->spec_draft to know what it is comparing against, and set_draft() copies it into the
+        // scheduler. Two copies drifting apart would verify against a draft that was never emitted.
+        if (spec) {
+            for (auto & s : slots) {
+                // ⚠ NOT `state != SLOT_STATE_GENERATING`. That was my first condition and it made
+                // this entire block DEAD CODE: the paged loop never SETS that state -- the only
+                // occurrence of it in the whole function was my own test. The static path sets it in
+                // post_decode, which this loop does not enter. n_decoded > 0 is the discriminator the
+                // paged loop actually maintains, and it is the same one set_draft() validates on.
+                if (!s.is_processing() || s.n_decoded == 0 || !s.can_speculate()) {
+                    continue;
+                }
+                const int32_t n_draft_max = s.get_n_draft_max();
+                if (n_draft_max <= 0) {
+                    s.spec_draft.clear();
+                    llama_paged_scheduler_set_draft(paged_sched, s.id, nullptr, 0);
+                    continue;
+                }
+                s.spec_prompt = s.prompt.tokens.get_text_tokens();
+                common_speculative_get_draft_params(spec.get(), s.id) = {
+                    /* .drafting = */ true,
+                    /* .n_max    = */ n_draft_max,
+                    /* .n_past   = */ (llama_pos) s.prompt.n_tokens(),
+                    /* .id_last  = */ s.sampled,
+                    /* .prompt   = */ &s.spec_prompt,
+                    /* .result   = */ &s.spec_draft,
+                };
+            }
+            common_speculative_draft(spec.get());
+            for (auto & s : slots) {
+                if (!s.is_processing() || s.spec_draft.empty()) {
+                    continue;
+                }
+                if (!llama_paged_scheduler_set_draft(paged_sched, s.id,
+                                                     s.spec_draft.data(), (int32_t) s.spec_draft.size())) {
+                    // refused (prefilling, or does not fit the budget) -- drop it so the verify
+                    // above cannot compare against a draft the scheduler never emitted
+                    s.spec_draft.clear();
+                }
             }
         }
 
