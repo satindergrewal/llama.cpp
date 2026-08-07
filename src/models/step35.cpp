@@ -1,5 +1,8 @@
 #include "models.h"
 
+#include "../llama-kv-cache.h"
+#include "../llama-kv-cache-paged.h"
+
 void llama_model_step35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
@@ -198,7 +201,10 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
 
     inpL = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos     = build_inp_pos();
-    auto        * inp_attn    = build_attn_inp_kv_iswa();
+    // ★ PAGED CONSUMER. build_attn_inp_kv_iswa() static_casts mctx to the ISWA context; on a
+    // paged memory that object does not exist and the graph constructor dies in the builder.
+    const auto * pg_ctx_top = mctx ? mctx->get_attn_paged() : nullptr;
+    auto        * inp_attn    = pg_ctx_top ? nullptr : build_attn_inp_kv_iswa();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
@@ -260,9 +266,16 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
             cb(Kcur, "Kcur_pos", il);
 
             const float kq_scale = 1.0f / sqrtf(float(n_embd_head_k));
-            ggml_tensor * attn_out = build_attn(inp_attn,
-                    nullptr, nullptr, nullptr,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            // ⚠ mctx, NOT inp_attn->mctx. This arch passes nullptr for wo -- the output projection
+            // is applied after a head-wise sigmoid gate below -- so the paged branch applies none
+            // either. Adding build_lora_mm here would project twice and produce plausible garbage.
+            const auto * pg_ctx = mctx ? mctx->get_attn_paged() : nullptr;
+            ggml_tensor * attn_out_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur, kq_scale, il,
+                    hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
+            ggml_tensor * attn_out = attn_out_pg ? attn_out_pg
+                    : build_attn(inp_attn,
+                            nullptr, nullptr, nullptr,
+                            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(attn_out, "attn_out", il);
             // head-wise attention gate: sigmoid(g_proj(x)) in torch
             if (model.layers[il].wqkv_gate) {
@@ -409,7 +422,10 @@ llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos  = build_inp_pos();
-    auto        * inp_attn = build_attn_inp_kv_iswa();
+    // ★ PAGED CONSUMER. build_attn_inp_kv_iswa() static_casts mctx to the ISWA context; on a
+    // paged memory that object does not exist and the graph constructor dies in the builder.
+    const auto * pg_ctx_top = mctx ? mctx->get_attn_paged() : nullptr;
+    auto        * inp_attn = pg_ctx_top ? nullptr : build_attn_inp_kv_iswa();
 
     ggml_tensor * h_norm = build_norm(h_input, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
@@ -465,9 +481,16 @@ llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(Kcur, "mtp_Kcur_pos", il);
 
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head_k));
-    ggml_tensor * attn_out = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    // ⚠ mctx, NOT inp_attn->mctx. This arch passes nullptr for wo -- the output projection
+    // is applied after a head-wise sigmoid gate below -- so the paged branch applies none
+    // either. Adding build_lora_mm here would project twice and produce plausible garbage.
+    const auto * pg_ctx = mctx ? mctx->get_attn_paged() : nullptr;
+    ggml_tensor * attn_out_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur, kq_scale, il,
+            hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
+    ggml_tensor * attn_out = attn_out_pg ? attn_out_pg
+            : build_attn(inp_attn,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(attn_out, "mtp_attn_out", il);
 
     // head-wise attention gate: sigmoid(g_proj(x))
