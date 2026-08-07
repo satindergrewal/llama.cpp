@@ -176,7 +176,29 @@ static path_result run_paged(const std::string & model_path) {
 
         bool   stop      = llama_vocab_is_eog(vocab, next) || (int) result.tokens.size() >= N_PREDICT;
         int8_t stop_flag = stop ? 1 : 0;
-        llama_paged_scheduler_update(sched, &batch, &next, &stop_flag, /*n_accepted =*/ nullptr);
+
+        // ★★ EXERCISE THE SENTINEL BRANCH OF n_accepted, WHICH OTHERWISE HAS ZERO EXECUTIONS.
+        //
+        // Step D added a ragged path to update(): a NEGATIVE n_accepted[i] means "legacy for this
+        // row" and a non-null array switches every row to BATCH-OFFSET token layout. Everything that
+        // has passed so far only proves the NULL path survived refactoring -- the new code compiled
+        // and never ran. That is precisely where this week's defects lived (the read-only CPU arm,
+        // the vacuous read-only test arm, the fused append).
+        //
+        // Alternating the two forms on successive decode steps means both are executed on every run
+        // of this test, and they must produce IDENTICAL results -- a sentinel row is BY DEFINITION
+        // today's behaviour, just reached through the other branch and the other token layout.
+        // If the two ever disagree, this test fails rather than B inheriting a broken contract.
+        const bool use_sentinel = (result.tokens.size() % 2) == 1;
+        if (use_sentinel) {
+            // batch-offset layout: sentinel rows read their ONE token at batch_offsets[i]
+            std::vector<llama_token> toks((size_t) info->batch_offsets[0] + (size_t) info->batch_lens[0], 0);
+            toks[info->batch_offsets[0]] = next;
+            const int32_t n_acc = -1;   // sentinel: legacy semantics for this row
+            llama_paged_scheduler_update(sched, &batch, toks.data(), &stop_flag, &n_acc);
+        } else {
+            llama_paged_scheduler_update(sched, &batch, &next, &stop_flag, /*n_accepted =*/ nullptr);
+        }
         if (stop) {
             break;
         }

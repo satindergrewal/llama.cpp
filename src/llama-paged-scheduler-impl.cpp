@@ -871,8 +871,18 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
         if (range_min == -1) {
             kv_cache_manager->set_seq_min_pos(group->request_id, batch.pos[token_offset]);
         }
-        int32_t last_token_in_batch_idx = token_offset + curr_info.batch_lens[i] - 1;
-        kv_cache_manager->set_seq_max_pos(group->request_id, batch.pos[last_token_in_batch_idx]);
+        // ⚠⚠ STEP E -- A FIFTH ONE-TOKEN ASSUMPTION, IN THE SAME FUNCTION AS D'S. This set the
+        // sequence's max position from the LAST SUBMITTED row. Speculation submits N+1 and may keep
+        // fewer, so the range must end at the last ACCEPTED position or the cache believes the
+        // sequence extends past where n_past says it does -- the same advance-vs-append fusion that
+        // corrupted logical_seq, wearing different clothes.
+        //
+        // Computed AFTER n_acc below would be cleaner; it is kept here because range_min must be set
+        // before either, so n_acc is hoisted instead.
+        const int32_t n_sub_e = curr_info.batch_lens[i];
+        const int32_t n_acc_e = (n_accepted == nullptr || n_accepted[i] < 0) ? n_sub_e : n_accepted[i];
+        const int32_t last_accepted_idx = token_offset + n_acc_e - 1;
+        kv_cache_manager->set_seq_max_pos(group->request_id, batch.pos[last_accepted_idx]);
 
         // ★ STEP D of paged speculation. With n_accepted == nullptr this is byte-identical to the
         // previous code: n_acc == 1, so n_past/n_decoded advance by batch_lens[i] (which IS 1 on the
@@ -932,11 +942,18 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
         // prefill chunk has prefill_pending == 0 and still requires advance=lens / append=ONE. With
         // -np>1 a batch can mix a prefilling sequence with a decoding one, so the rule has to be
         // per-row. Decided before it was exercised, so it is not invented while staring at a failure.
-        const int32_t n_sub = curr_info.batch_lens[i];
+        // ⚠ ONE LAYOUT PER CALL, NOT PER ROW. The wrapper sizes tokens_vec from the batch offsets
+        // whenever n_accepted is non-null, so a mixed array with the impl reading [i] for sentinel
+        // rows would have the two disagreeing about the SAME buffer. So the contract is:
+        //     n_accepted == NULL  -> one-per-sequence layout, read [i]
+        //     n_accepted != NULL  -> BATCH-OFFSET layout for EVERY row, sentinel rows included
+        // A sentinel row still contributes exactly ONE token; it just reads it at batch_offsets[i].
+        const int32_t n_sub = n_sub_e;
         if (n_accepted == nullptr || n_accepted[i] < 0) {
             group->n_past    += n_sub;
             group->n_decoded += n_sub;
-            group->logical_seq.push_back(new_tokens[i]);   // ONE, always -- as before
+            group->logical_seq.push_back(n_accepted == nullptr ? new_tokens[i]
+                                                               : new_tokens[token_offset]);  // ONE
         } else {
             const int32_t n_acc = n_accepted[i];
             GGML_ASSERT(n_acc >= 1 && n_acc <= n_sub &&
