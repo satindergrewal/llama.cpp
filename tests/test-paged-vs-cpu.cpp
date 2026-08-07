@@ -40,7 +40,14 @@ static float val_r(int e, int h, int tok)  { return 0.50f * cosf(0.8f*e + 0.6f*h
 static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel, int64_t window,
                                     ggml_type kv_type = GGML_TYPE_F16,
                                     int sink_mode = 0,     // 0 none, 1 finite, 2 -inf control
-                                    int causal = 1) {
+                                    int causal = 1,
+                                    // ⚠ LAST. THIRD TIME THIS SESSION. read_only_check was inserted
+                                    // between sink_mode and causal, so run_paged(..., 0, 0) -- meant
+                                    // as sink_mode=0, causal=0 -- silently became read_only=false with
+                                    // causal DEFAULTED TO 1, and the non-causal arm quietly tested
+                                    // causal attention. It compiled. It ran. It "passed" its CPU
+                                    // comparison, because both sides were causal.
+                                    bool read_only_check = false) {
     // ⚠ H/HKV ARE ENV-OVERRIDABLE so the harness can be REPLAYED at the server's real geometry.
     // The ARGDUMP showed the server running head_dim=256, n_heads=16, n_heads_kv=4 (GQA 4:1) with
     // n_blocks=1 -- while this file had GQA 2:1 hardcoded. Every "PASS" it has printed was at a GQA
@@ -90,6 +97,20 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
             btab, slots, clens, boffs, blens, rel_p, scale, BS, NB, NB, sinks_p, with_rel ? E : 1, window, causal);
     ggml_set_name(out_p, "out_paged");
 
+    // ★ READ-ONLY ARM. A SECOND op over the SAME cache with K and V null: it must skip the write and
+    // attend exactly what the first call stored, so its output has to equal out_p. Expanded into the
+    // graph after out_p so the write has happened; the two ops share the cache tensor, which is the
+    // whole point -- gemma4-assistant's NextN head attends KV the main graph wrote.
+    //
+    // ⚠ Without this arm, "read-only compiles and nothing regressed" would mean only that the write
+    // still happens when K/V are PRESENT. It would say nothing about the path actually taken.
+    ggml_tensor * out_ro = nullptr;
+    if (read_only_check) {
+        out_ro = ggml_paged_attn_banded(ctx, q_p, nullptr, nullptr, cache, cache,
+                btab, slots, clens, boffs, blens, rel_p, scale, BS, NB, NB, sinks_p, with_rel ? E : 1, window, causal);
+        ggml_set_name(out_ro, "out_paged_ro");
+    }
+
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
 
     if (sinks_p) {
@@ -138,10 +159,15 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out_p);
+    if (out_ro) { ggml_build_forward_expand(gf, out_ro); }
     ggml_backend_graph_compute(backend, gf);
 
     std::vector<float> out(ggml_nelements(out_p));
     ggml_backend_tensor_get(out_p, out.data(), 0, ggml_nbytes(out_p));
+    if (out_ro) {
+        // return the READ-ONLY result so the caller compares it against the ordinary one
+        ggml_backend_tensor_get(out_ro, out.data(), 0, ggml_nbytes(out_ro));
+    }
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -398,6 +424,21 @@ int main() {
                 printf("D=%3d non-causal differs from causal: max_abs=%.3e %s\n",
                        D, dc, dc > 1e-3 ? "PASS" : "FAIL (flag is a no-op)");
                 n_fail += dc > 1e-3 ? 0 : 1;
+
+                // ★ READ-ONLY: same pool, second op with K/V null, must equal the ordinary answer.
+                // ⚠ OFF BY DEFAULT UNTIL READ-ONLY IS IMPLEMENTED. The op aborts on null K/V today.
+                // The arm is kept, not deleted: it is the check that caught the segfault the moment a
+                // read-only call actually ran, after "compiles and does not regress" had said nothing.
+                if (!getenv("DS4P_TEST_READONLY")) { goto skip_ro; }
+                {
+                const std::vector<float> aro = run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 0, true);
+                double mr = 0.0;
+                for (size_t i = 0; i < aro.size() && i < a.size(); ++i) mr = std::max(mr, (double) fabs(aro[i]-a[i]));
+                printf("D=%3d read-only    : max_abs=%.3e %s   (must equal the write-then-read answer)\n",
+                       D, mr, mr < 1e-6 ? "PASS" : "FAIL");
+                n_fail += mr < 1e-6 ? 0 : 1;
+                }
+                skip_ro:;
 
                 const std::vector<float> ai = run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 2);
                 double c = 0.0;

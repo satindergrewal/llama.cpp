@@ -12139,6 +12139,8 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     }
 
     const ggml_tensor * q             = dst->src[0];
+    // ★ READ-ONLY: no new K/V means attend the pool without writing to it (gemma4-assistant's
+    // NextN head). The reference must skip the write for the same reason the Metal op does.
     const ggml_tensor * k_new         = dst->src[1];
     const ggml_tensor * v_new         = dst->src[2];
     const ggml_tensor * kv_cache      = dst->src[3];  // for reads

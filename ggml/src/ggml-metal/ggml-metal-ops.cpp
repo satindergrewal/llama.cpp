@@ -4971,6 +4971,25 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // the cache zeroed and every harness case reported nmse == 1.000 (all-zero output).
     // Separate dispatch, not a barrier inside one kernel: threadgroup ordering across a
     // grid is not guaranteed, so the write must complete as its own encoded pass.
+    //
+    // ★ READ-ONLY when there is no new K/V. gemma4-assistant's NextN head calls build_attn with K and
+    // V as nullptr: it writes nothing and attends over KV the MAIN graph already stored. The paged
+    // op's contract was fused write-then-read with no way to express that, which is why the arch
+    // could not be wired. Skipping the write is the whole difference -- the attention phase already
+    // addresses the pool through the block table and ctx_lens and never consults k_new.
+    // ⚠⚠ READ-ONLY IS NOT SUPPORTED YET, AND "SKIP THE WRITE" WAS NOT THE WHOLE FIX. Making the
+    // write conditional compiled, did not regress anything, and SEGFAULTED the moment a read-only
+    // call actually ran: k_new/v_new are dereferenced for SHAPES elsewhere -- ggml-cpu/ops.cpp reads
+    // n_heads_kv = k_new->ne[1], and this file derives geometry from them too. The gap is a contract,
+    // not a branch.
+    //
+    // Aborting until it is implemented and exercised. gemma4-assistant's NextN head needs this; it
+    // stays unwired rather than wired onto a path that crashes.
+    if (op->src[1] == nullptr || op->src[2] == nullptr) {
+        GGML_ABORT("%s: paged attention called with no new K/V (read-only). Not implemented: the "
+                   "write can be skipped, but K/V shapes are still read for geometry. "
+                   "gemma4-assistant's NextN head needs this path.\n", __func__);
+    }
     {
         auto wpipe = ggml_metal_library_get_pipeline_paged_attn_write(lib, op);
 
