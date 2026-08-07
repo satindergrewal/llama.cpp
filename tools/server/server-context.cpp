@@ -3203,7 +3203,8 @@ private:
                         }
                     }
                 }
-                llama_paged_scheduler_update(paged_sched, &pbatch, fail_sampled.data(), fail_stops.data());
+                llama_paged_scheduler_update(paged_sched, &pbatch, fail_sampled.data(), fail_stops.data(),
+                                                 /*n_accepted =*/ nullptr);
                 for (int32_t i = 0; i < fail_info->n_seq; ++i) {
                     llama_memory_seq_rm(llama_get_memory(ctx_tgt), pbatch.seq_id[fail_info->batch_offsets[i]][0], -1, -1);
                 }
@@ -3361,7 +3362,8 @@ private:
             stops.push_back(cont ? 0 : 1);
         }
 
-        llama_paged_scheduler_update(paged_sched, &pbatch, sampled.data(), stops.data());
+        llama_paged_scheduler_update(paged_sched, &pbatch, sampled.data(), stops.data(),
+                                     /*n_accepted =*/ nullptr);   // one token per seq -- speculation not wired here yet
 
         // clear finished sequences AFTER the scheduler's update: update() writes this
         // batch's positions back into the memory's per-seq bookkeeping, so clearing

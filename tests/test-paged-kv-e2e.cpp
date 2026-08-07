@@ -176,7 +176,7 @@ static path_result run_paged(const std::string & model_path) {
 
         bool   stop      = llama_vocab_is_eog(vocab, next) || (int) result.tokens.size() >= N_PREDICT;
         int8_t stop_flag = stop ? 1 : 0;
-        llama_paged_scheduler_update(sched, &batch, &next, &stop_flag);
+        llama_paged_scheduler_update(sched, &batch, &next, &stop_flag, /*n_accepted =*/ nullptr);
         if (stop) {
             break;
         }

@@ -23,7 +23,24 @@ class llama_paged_scheduler_impl {
     // P1-6: queue `group` as a COW fork of an existing request -- it inherits the parent's
     // prefix blocks by reference (fork_blocks) instead of prefilling them again.
     bool                   queue_forked_request(llama_sequence_group group, int32_t parent_request_id);
-    void update(const llama_batch & batch, const std::vector<llama_token> & new_tokens, const int8_t * stop_flags);
+    // ★ STEP D of paged speculation (FINDINGS-paged-no-speculation.md).
+    //
+    // `n_accepted` is OPTIONAL and nullable. When null, every sequence accepts exactly ONE token --
+    // today's behaviour, byte-identical, which is what makes this step a pure refactor and keeps the
+    // two out-of-server callers (tests/test-paged-kv-e2e.cpp, examples/paged/paged.cpp) compiling
+    // unchanged.
+    //
+    // When present, n_accepted[i] is how many of sequence i's SUBMITTED tokens were kept. Speculation
+    // submits N+1 and may keep fewer.
+    //
+    // ⚠ THE SAFETY CONDITION, and every positional reader of logical_seq depends on it: logical_seq
+    // extends by the ACCEPTED count and n_past advances by the ACCEPTED count -- the SAME number,
+    // every step. Rejected tokens are never appended, so the prefix-match loops (impl.cpp:199, :272)
+    // and the prefill read (:797) stay correct. If those two ever advance by different amounts, every
+    // fork and prefix path silently corrupts. impl.cpp:190 already warns that n_past and
+    // logical_seq.size() are not interchangeable.
+    void update(const llama_batch & batch, const std::vector<llama_token> & new_tokens, const int8_t * stop_flags,
+                const int32_t * n_accepted = nullptr);
     void set_on_finish(llama_paged_on_finish_cb cb, void * user_data);
     llama_sequence_group *         get_group_from_id(int32_t request_id) const;
     const llama_paged_batch_info * get_curr_batch_info() const;

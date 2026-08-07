@@ -830,7 +830,8 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
 // new_tokens contain 1 token per sequence in the batch
 void llama_paged_scheduler_impl::update(const llama_batch &              batch,
                                         const std::vector<llama_token> & new_tokens,
-                                        const int8_t *                   stop_flags) {
+                                        const int8_t *                   stop_flags,
+                                        const int32_t *                  n_accepted) {
     GGML_ASSERT((int32_t) new_tokens.size() >= curr_info.n_seq && "new_tokens size does not match with batch size.");
     GGML_ASSERT(stop_flags != nullptr && "stop_flags can't be null");
 
@@ -873,9 +874,52 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
         int32_t last_token_in_batch_idx = token_offset + curr_info.batch_lens[i] - 1;
         kv_cache_manager->set_seq_max_pos(group->request_id, batch.pos[last_token_in_batch_idx]);
 
-        group->n_past += curr_info.batch_lens[i];
-        group->n_decoded += curr_info.batch_lens[i];
-        group->logical_seq.push_back(new_tokens[i]);
+        // ★ STEP D of paged speculation. With n_accepted == nullptr this is byte-identical to the
+        // previous code: n_acc == 1, so n_past/n_decoded advance by batch_lens[i] (which IS 1 on the
+        // decode path) and exactly one token is appended.
+        //
+        // With speculation, a sequence SUBMITS batch_lens[i] tokens (draft + 1) and may KEEP fewer.
+        // Both counters must then advance by the ACCEPTED count, not the submitted one -- that is the
+        // entire rollback story. Rejected tokens leave KV behind at positions beyond the new n_past,
+        // and the next step simply OVERWRITES them, because DS4P_SLOT_COVER proved the write slot is
+        // a pure function of position (slots[t] == btab[pos/bs]*bs + pos%bs, 0 mismatches over ~50k
+        // tokens). Nothing is freed and nothing is reclaimed.
+        //
+        // ⚠ n_past AND logical_seq MUST ADVANCE BY THE SAME NUMBER. Every positional reader depends
+        // on it: the prefix-match loops at :199 and :272, the prefill read at :797, the fork
+        // inheritance in llama-kv-cache-paged.cpp:388,414. Line :190 already warns that n_past and
+        // logical_seq.size() are not interchangeable -- this is the invariant that keeps them
+        // reconcilable.
+        // ⚠ TWO LAYOUTS FOR new_tokens, AND THEY MUST NOT BE CONFUSED. My first draft of this wrote
+        // new_tokens[i * n_sub + k], which assumes every sequence submits the SAME count. It does not
+        // -- batch_lens is per-sequence -- so that would have read the wrong sequence's tokens the
+        // moment two sequences drafted different amounts. Caught before building, but it is exactly
+        // the silent-corruption shape this lane keeps paying for, so the contract is spelled out:
+        //
+        //   n_accepted == nullptr   new_tokens has ONE entry per sequence, indexed [i]   (today)
+        //   n_accepted != nullptr   new_tokens is laid out at the BATCH offsets, so
+        //                           sequence i's tokens are [batch_offsets[i] .. +n_acc)
+        //
+        // The second form is unambiguous for ragged submits because batch_offsets already carries
+        // the per-sequence base the rest of this function uses.
+        // ⚠⚠ THE DEFAULT IS n_sub, NOT 1. My first version defaulted to 1, believing "one token per
+        // sequence" was today's decode behaviour. It is not: this path also handles the FINAL PREFILL
+        // CHUNK, where batch_lens[i] is the chunk size -- hundreds of tokens. Today's behaviour is
+        // n_past += batch_lens[i], and defaulting to 1 advanced it by one per chunk instead.
+        //
+        // The assert below caught it on the first run, on four known-good architectures. Without it
+        // the failure would have been a slow, plausible-looking context corruption at long prompts --
+        // the ~50k defect's exact signature.
+        const int32_t n_sub = curr_info.batch_lens[i];
+        const int32_t n_acc = n_accepted ? n_accepted[i] : n_sub;
+        GGML_ASSERT(n_acc >= 1 && n_acc <= n_sub &&
+                    "accepted count must be between 1 and the number of tokens submitted");
+
+        group->n_past    += n_acc;
+        group->n_decoded += n_acc;
+        for (int32_t k = 0; k < n_acc; ++k) {
+            group->logical_seq.push_back(n_accepted ? new_tokens[token_offset + k] : new_tokens[i]);
+        }
 
         // Default stop flags are n_seq_max
         if (stop_flags[i] || group->n_past >= n_seq_max_ctx) {

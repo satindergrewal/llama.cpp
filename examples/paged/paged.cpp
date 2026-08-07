@@ -320,7 +320,8 @@ int main(int argc, char ** argv) {
             }
         }
 
-        llama_paged_scheduler_update(scheduler, &batch, sampled_tokens.data(), stop_flags.data());
+        llama_paged_scheduler_update(scheduler, &batch, sampled_tokens.data(), stop_flags.data(),
+                                 /*n_accepted =*/ nullptr);
 
         // chunked prefill: the first update() may be a mid-prompt chunk, so "one loop
         // iteration passed" no longer implies the parent prefilled -- gate the fork on an

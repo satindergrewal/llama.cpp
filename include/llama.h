@@ -1705,10 +1705,15 @@ extern "C" {
     LLAMA_API int32_t llama_paged_scheduler_take_terminated(struct llama_paged_scheduler * sched,
                                                             int32_t * out, int32_t max_out);
 
+    // n_accepted is OPTIONAL (nullable). NULL = today's semantics: exactly one accepted token per
+    // sequence, `tokens` indexed one-per-sequence. When provided, n_accepted[i] is how many of
+    // sequence i's SUBMITTED tokens were kept (speculative decoding submits N+1 and may keep fewer),
+    // and `tokens` is then laid out at the BATCH offsets rather than one-per-sequence.
     LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
                                                 struct llama_batch *           batch,
                                                 const llama_token *            tokens,
-                                                const int8_t *                 stop_flags);
+                                                const int8_t *                 stop_flags,
+                                                const int32_t *                n_accepted);
 
     // Introspection.
     LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler * sched,

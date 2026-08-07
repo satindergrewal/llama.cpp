@@ -182,15 +182,27 @@ LLAMA_API bool llama_paged_scheduler_fork_request(struct llama_paged_scheduler *
 LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
                                             struct llama_batch *           batch,
                                             const llama_token *            tokens,
-                                            const int8_t *                 stop_flags) {
+                                            const int8_t *                 stop_flags,
+                                            const int32_t *                n_accepted) {
     if (!sched || !batch || !tokens || !stop_flags) {
         return;
     }
 
     const auto * info = sched->impl.get_curr_batch_info();
     GGML_ASSERT(info != nullptr && "no batch info was set.");
-    std::vector<llama_token> tokens_vec(tokens, tokens + info->n_seq);
-    sched->impl.update(*batch, tokens_vec, stop_flags);
+
+    // ★ STEP D of paged speculation. n_accepted is OPTIONAL: null keeps today's exact behaviour --
+    // one accepted token per sequence, `tokens` indexed [i] -- so the two out-of-server callers
+    // (tests/test-paged-kv-e2e.cpp, examples/paged/paged.cpp) compile and behave unchanged.
+    //
+    // When present, `tokens` is laid out at the BATCH offsets rather than one-per-sequence, because
+    // sequences can submit different counts and a [i * n_sub] layout would read the wrong sequence's
+    // tokens the moment two drafts differ in length.
+    const size_t n_tok = n_accepted
+        ? (size_t) info->batch_offsets[info->n_seq - 1] + (size_t) info->batch_lens[info->n_seq - 1]
+        : (size_t) info->n_seq;
+    std::vector<llama_token> tokens_vec(tokens, tokens + n_tok);
+    sched->impl.update(*batch, tokens_vec, stop_flags, n_accepted);
 }
 
 LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,
