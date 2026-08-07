@@ -3510,6 +3510,12 @@ ggml_tensor * llm_graph_context::build_attn(
         ds4p_live_blocks(paged_mctx, cparams.block_size, max_blocks), sinks);
     cb(cur, "kqv_out", il);
 
+    // ★ Twin of the marker in build_attn_paged_or_null -- see the note there. This is the funnel the
+    // eleven build_attn_inp_kv_auto() architectures take, and it emits NO static-path warning in
+    // either arm, so a gate that infers "paged is live" from a warning count reads zero here and
+    // concludes the arch is unwired. It is wired; it is simply on the other funnel.
+    LLAMA_LOG_DEBUG("%s: DS4P-CONSUME auto layer %d\n", __func__, il);
+
     // Reshape to [attn_out_width, n_tokens] (just a view).
     //
     // NOT hparams.n_embd. That assumes n_head*head_dim == n_embd, which holds for
@@ -4482,6 +4488,18 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
             sinks, rel_extent, visibility_window, causal ? 1 : 0);
 
     ggml_tensor * cur = ggml_reshape_2d(ctx0, cur_p, cur_p->ne[0]*cur_p->ne[1], cur_p->ne[2]);
+
+    // ★ CONSUMER-SIDE PRESENCE MARKER. Every other paged signal in this fork is either produced
+    // upstream of the graph (DS4P-CHECKOUT: the block pool served a request) or fires on the FAILURE
+    // side (the static-path warnings above). Neither can assert that a graph actually CONSUMED the
+    // paged context -- and "correct producer, no consumer" is not hypothetical here, it is audit
+    // finding 5: the paged context was built correctly, no graph read it, and "Ornith now runs paged"
+    // had to be retracted. Nothing in the build could have caught that, because proving presence from
+    // the absence of a warning is not proof at all.
+    //
+    // So this asserts presence positively, per layer, and its twin sits in the auto-path funnel below
+    // so the marker is arch-independent across both paged consumers.
+    LLAMA_LOG_DEBUG("%s: DS4P-CONSUME banded layer %d\n", __func__, il);
 
     // The op fuses the KV write, so this output MUST be expanded into the graph or the scheduler
     // never computes it -- the exact failure DSpark hit on the deepseek4 capture hook today.
