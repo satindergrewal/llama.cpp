@@ -1159,9 +1159,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        // ⚠ TEMPORARY INSTRUMENTATION (ds4ports): -1 here means "no KV slot for the batch" and the
+        // message alone cannot distinguish a positional gap from a capacity problem from a bad
+        // seq_id. Print what was actually submitted.
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
-            LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
+            LOG_WRN("%s: llama_decode returned %d | n_tokens=%d n_ctx_dft=%u n_ubatch=%u\n",
+                    __func__, ret, batch.n_tokens,
+                    llama_n_ctx(ctx_dft), llama_n_ubatch(ctx_dft));
+            for (int32_t z = 0; z < batch.n_tokens && z < 4; ++z) {
+                LOG_WRN("%s:   row %d: tok=%d pos=%d seq=%d logits=%d\n", __func__, z,
+                        batch.token[z], batch.pos[z], batch.seq_id[z][0], (int) batch.logits[z]);
+            }
             return;
         }
 
