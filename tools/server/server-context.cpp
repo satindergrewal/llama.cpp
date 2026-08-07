@@ -1477,6 +1477,27 @@ private:
 
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
+
+            // ★★ SAY SO WHEN THE DRAFT WILL NEVER BE CONSULTED.
+            //
+            // update_slots() returns early into update_slots_paged(), which does not call
+            // pre_decode(), post_decode() or handle_last_sampled_token() -- where all drafting
+            // lives. Under --kv-paged the draft is loaded, registered, advertised, and NEVER
+            // INVOKED: statistics read #calls(b,g,a) = 0 0 0.
+            //
+            // Measured on Qwen3.5-4B + its DFlash draft: draft_n 27 -> 0 between the static and
+            // paged arms, with IDENTICAL OUTPUT. Nothing but a draft-activity counter can detect
+            // it, so a user benchmarking an MTP/dflash/eagle3/dspark model under --kv-paged is
+            // measuring a non-speculating server and has no way to know.
+            //
+            // Correct output, zero speedup, no signal. That is the "or are slow" half of the bar
+            // failing silently, which is the half that gets shipped.
+            if (params_base.kv_paged) {
+                SRV_WRN("%s", "⚠ SPECULATIVE DECODING IS NOT IMPLEMENTED IN THE PAGED DECODE LOOP. "
+                              "A draft model is loaded but will NEVER be consulted while --kv-paged "
+                              "is set: expect zero draft tokens and no speedup. Output stays "
+                              "correct. Drop --kv-paged to use speculative decoding.\n");
+            }
         } else {
             spec_init.reset();
             ctx_dft   = nullptr;
@@ -2015,6 +2036,35 @@ private:
         // 4d: paged serving registers the request with the engine; prefill scheduling,
         // chunking and KV allocation all happen inside the scheduler from here on
         if (paged_sched) {
+            // ★★ REFUSE MULTIMODAL PROMPTS RATHER THAN SILENTLY ANSWERING FROM TEXT ALONE.
+            //
+            // get_text_tokens() below drops every LLAMA_TOKEN_NULL -- which is exactly the media
+            // placeholder emplaced per media token (server-common.cpp:370). So a multimodal prompt
+            // arrives at the scheduler with EVERY IMAGE POSITION REMOVED, and the model answers from
+            // the surrounding text. Measured on HunyuanOCR + mmproj against a PNG of the word PARIS:
+            //     static  PARIS          correct
+            //     paged   BUTTERFISH     288 DS4P-CONSUME events, zero fallbacks, no warning
+            // A plausible English word, as confident as the right one. In a document workload nobody
+            // would notice.
+            //
+            // Carrying media through the scheduler is real work. Refusing is not, and it is strictly
+            // better than today: WRONG-AND-LOUD BEATS WRONG-AND-QUIET. check_slot_no_media already
+            // establishes this pattern for slot save/restore -- the codebase knew this prompt class
+            // needs special handling and said so 300 lines from where it was being discarded.
+            //
+            // ⚠ The message text is deliberately stable and distinctive: tools/ds4-gates gates match
+            // designed refusals on MESSAGE TEXT rather than on enumerated causes, because that is
+            // what has repeatedly caught guards nobody knew existed.
+            if (slot.task->tokens.has_media()) {
+                send_error(slot.task->id,
+                    "kv_paged does not support image/audio prompts yet: the paged request path "
+                    "carries text tokens only, so media chunks would be silently dropped and the "
+                    "answer would come from the surrounding text. Serve multimodal requests without "
+                    "--kv-paged.",
+                    ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+
             const llama_tokens toks = slot.task->tokens.get_text_tokens();
 
             // P1-5 WARM ADMIT. get_available_slot() has already run prompt_load(), so if
