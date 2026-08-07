@@ -242,7 +242,18 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             // layers -- the paged kernel already implements windowed attention, which is why SWA
             // needed only bring-up, not a new kernel.
             // NOTE: this arch passes `wo` INTO build_attn, so the paged branch applies it itself.
-            const auto * pg_ctx = inp_attn->mctx ? inp_attn->mctx->get_attn_paged() : nullptr;
+            // ⚠⚠ mctx, NOT inp_attn->mctx. This line read inp_attn->mctx -- the ATTENTION CHILD
+            // context -- which is the exact anti-pattern every other wired arch carries a warning
+            // against. starcoder.cpp states it: "the attention child context does not override
+            // get_attn_paged() and answers nullptr. That gave Qwen3.6 a live pool 110 layers never
+            // read: correct output, zero paging."
+            //
+            // Measured on gemma-4-E2B-it Q4_K_M: static " Paris.", paged " a." -- and only layers
+            // 0..14 of 35 ever reached the paged consumer while the other twenty logged NOTHING,
+            // neither a consume marker nor a fallback warning. gemma4-26B-A4B passes on the same
+            // binary, which is how this survived: the defect is CHECKPOINT-shaped, like the fused-QKV
+            // one found the same day.
+            const auto * pg_ctx = mctx ? mctx->get_attn_paged() : nullptr;
             // ★ Print the pointer the consumer ACTUALLY queries. The exit-A marker prints
             // llm_graph_context::mctx, which is a DIFFERENT variable -- comparing that against
             // DS4P-SET made three readings look contradictory when the instrument was simply

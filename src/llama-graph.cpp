@@ -4302,10 +4302,29 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
     // logged "layer N fails the paged capability contract" -- which told me 90 layers were refused
     // on gemma and nothing about which condition. A refusal that does not say why is a marker that
     // cannot be read for the case you need it for.
+    // ⚠⚠ THE THROTTLE WAS PROCESS-GLOBAL, WHICH MADE THIS MARKER LIE BY OMISSION.
+    //
+    // It was `static const char * last`, compared per reason STRING, so each reason printed exactly
+    // ONCE for the lifetime of the process. llama-server does ~9 graph builds at startup before the
+    // first request, so any refusal occurring during startup PERMANENTLY SILENCED the same refusal at
+    // request time -- and a gate that slices the log at the request marker (which it must, or it
+    // counts startup passes as inference) would then read ZERO for a refusal firing on every request.
+    //
+    // Same class as the startup-pass contamination fixed earlier the same day, from the opposite
+    // direction: that one COUNTED work that had not happened; this one HID work that had.
+    //
+    // Now keyed on (reason, layer) and re-armed whenever a graph build starts over at layer 0, so it
+    // is per-build rather than per-process, without emitting a line per layer per token.
+    static const char * last_why = nullptr;
+    static int          last_il  = -1;
+    if (il == 0 && last_il != 0) {
+        last_why = nullptr;                       // new graph build -- re-arm
+    }
+    last_il = il;
     const auto reject = [&](const char * why) {
-        static const char * last = nullptr;
-        if (why != last) { last = why;
-            LLAMA_LOG_INFO("%s: paged layer refused: %s\n", __func__, why);
+        if (why != last_why) {
+            last_why = why;
+            LLAMA_LOG_INFO("%s: paged layer refused: layer %d: %s\n", __func__, il, why);
         }
         return false;
     };
