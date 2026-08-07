@@ -3507,11 +3507,57 @@ private:
                     llama_paged_scheduler_set_draft(paged_sched, s.id, nullptr, 0);
                     continue;
                 }
+                // ★★ THE ctx_dft STATE MANAGEMENT THE AUDIT CLASSIFIED AND I THEN NEVER PORTED.
+                //
+                // Without these two the draft context's KV is never established, and its decode
+                // fails with -1 -- 4 tokens at positions 13..16 against 4096 free, because nothing
+                // occupies 0..12. Self-perpetuating: each attempt lands one position later against
+                // the same gap, so 22/22 fail identically.
+                //
+                // update_pos records where the TARGET sequence currently sits; update_dft snapshots
+                // the DRAFT context's sequence state so the drafter can rewind to it between
+                // attempts. Which of the two mechanisms applies is decided by what each context
+                // supports (ctx_dft_seq_rm_type), exactly as the static path decides it.
+                //
+                // ⚠ I wrote "the ctx_dft bucket applies ~unchanged" in the audit and then read my own
+                // sentence as meaning it was HANDLED. It is a statement about difficulty.
+                // Applies-unchanged still has to be applied.
+                // ⚠ THE DRAFT BUFFER MUST BE EMPTY BEFORE ARMING. speculative.cpp:2625 asserts
+                // GGML_ASSERT(!dp.drafting || dp.result->empty()) -- and the static path satisfies it
+                // structurally, by only arming in the `else` of `if (!slot.spec_draft.empty())`: a
+                // leftover partial draft is REUSED, never re-armed over.
+                //
+                // The paged path consumes the whole draft every step (the verify reads it, update()
+                // clears the scheduler's copy), so there is nothing to reuse and the correct move is
+                // to clear it. Leaving it and re-arming aborted the server on the first step where a
+                // draft had actually been produced -- which is the assert doing precisely its job.
+                s.spec_draft.clear();
+
+                s.spec_ckpt.update_pos(
+                        s.prompt.n_tokens(),
+                        llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), s.id),
+                        llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), s.id));
+
+                if (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                    s.spec_ckpt.update_dft(ctx_dft, s.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
+
                 s.spec_prompt = s.prompt.tokens.get_text_tokens();
                 common_speculative_get_draft_params(spec.get(), s.id) = {
                     /* .drafting = */ true,
                     /* .n_max    = */ n_draft_max,
-                    /* .n_past   = */ (llama_pos) s.prompt.n_tokens(),
+                    // ⚠⚠ MINUS ONE, AND IT WAS THE WHOLE BUG. The static path arms the draft BEFORE
+                    // pushing the sampled token into the prompt mirror -- get_n_draft_max's own
+                    // comment says so: "slot.prompt is not yet expanded with the `id` token sampled
+                    // above". This loop pushes FIRST and arms after, so n_tokens() is already +1.
+                    //
+                    // Measured, same probe at the same decode site in both arms:
+                    //     static  FIRST-DRAFT-DECODE pos0=12
+                    //     paged   FIRST-DRAFT-DECODE pos0=13
+                    // One position. The draft cache then rejects the write (nothing occupies the gap)
+                    // and every subsequent attempt lands one further along the same gap -- 22/22
+                    // identical failures from a single off-by-one.
+                    /* .n_past   = */ (llama_pos) s.prompt.n_tokens() - 1,
                     /* .id_last  = */ s.sampled,
                     /* .prompt   = */ &s.spec_prompt,
                     /* .result   = */ &s.spec_draft,
