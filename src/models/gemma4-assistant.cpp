@@ -121,7 +121,17 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     ggml_tensor * cur = ggml_mul_mat(ctx0, model.nextn_proj_pre, xh);
     cb(cur, "pre_proj", -1);
 
-    auto *        inp_attn    = build_attn_inp_kv_iswa();
+    // ★ PAGED CONSUMER. Same shape as every other wired arch, with one difference that is the whole
+    // reason this file was unwired until now: the attention call below passes K and V as nullptr.
+    // The NextN head writes nothing -- it attends KV the MAIN graph already stored -- and the paged
+    // op's contract was fused write-then-read with no way to express that. It now is: geometry comes
+    // from the pool rather than from k_new, and the write phase is skipped (cce5d6959).
+    //
+    // ⚠ build_attn_inp_kv_iswa() static_casts mctx; on a paged memory that is the wrong type, so the
+    // static input must NOT be built when a paged context exists. Taken from mctx, never from
+    // inp_attn->mctx, which is the derived-and-wrong-type pointer.
+    const auto *  pg_ctx_top  = mctx ? mctx->get_attn_paged() : nullptr;
+    auto *        inp_attn    = pg_ctx_top ? nullptr : build_attn_inp_kv_iswa();
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -150,8 +160,17 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
                              freq_base_l, freq_scale_l, ext_factor, attn_factor, beta_fast, beta_slow);
         cb(Qcur, "Qcur_pos", il);
 
-        cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
-                Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
+        // K and V stay nullptr on BOTH branches -- that is this arch's attention, not an omission.
+        const auto *  pg_ctx = mctx ? mctx->get_attn_paged() : nullptr;
+        ggml_tensor * cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, nullptr, nullptr,
+                hparams.f_attention_scale, il, is_swa ? (int64_t) hparams.n_swa : 0);
+        if (cur_pg != nullptr) {
+            // wo is applied inside build_attn on this arch, so the paged branch applies it here.
+            cur = build_lora_mm(model.layers[il].wo, cur_pg, nullptr);
+        } else {
+            cur = build_attn(inp_attn, model.layers[il].wo, nullptr, nullptr,
+                    Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
+        }
 
         if (il == n_layer_nextn - 1 && inp_out_ids) {
             cur  = ggml_get_rows(ctx0, cur,  inp_out_ids);
