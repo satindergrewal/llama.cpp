@@ -5212,7 +5212,8 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 if (v == 1 || v == DS4P_CHAMP_VEC_NWG) { vec_nwg = v; }
             }
             const int vec_nsg = vec_nwg == 1 ? 4 : 1;
-            auto vp = ggml_metal_library_get_pipeline_paged_champ_vec(lib, op, vec_nsg, vec_nwg);
+            const bool has_sinks_d = op->src[11] != nullptr;
+            auto vp = ggml_metal_library_get_pipeline_paged_champ_vec(lib, op, vec_nsg, vec_nwg, has_sinks_d);
             // ⚠ st is the ELEMENT stride and exists ONLY for ns10/ns20, which the f16 branch uses
             // for simdgroup_load. The quantised branch addresses through nb11/nb21 in BYTES and never
             // reads it. sh/sb were removed with the byte-stride round trip below.
@@ -5288,7 +5289,8 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache), 2);
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache), 3);
             ggml_metal_encoder_set_buffer  (enc, bid_mask_d,                         4);
-            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        5);
+            ggml_metal_encoder_set_buffer  (enc, has_sinks_d ? ggml_metal_get_buffer_id(op->src[11])
+                                                             : ggml_metal_get_buffer_id(q),  5);
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        6);
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(btab),     7);
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(clens),    8);
@@ -5334,7 +5336,8 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
                 const int v = atoi(e);
                 if (v == 4 || v == 8) { champ_nsg = v; }   // dispatcher only instantiates 4 and 8
             }
-            auto cp = ggml_metal_library_get_pipeline_paged_attn_champ(lib, op, champ_nsg);
+            const bool has_sinks_c = op->src[11] != nullptr;
+            auto cp = ggml_metal_library_get_pipeline_paged_attn_champ(lib, op, champ_nsg, has_sinks_c);
             // element stride, for ns10/ns20 on the f16 branch only -- see the decode path note
             const uint64_t st = kv_cache->nb[1] / sizeof(ggml_fp16_t);   // stride_token, elements
 
@@ -5456,7 +5459,11 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache), 2);  // k
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache), 3);  // v
             ggml_metal_encoder_set_buffer  (enc, bid_mask,                          4);  // mask
-            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        5);  // sinks (unused)
+            // ★ SINKS. src[11] when the arch supplies them (mimo2 does); q as a harmless dummy
+            // otherwise, because a buffer must be bound either way. The kernel only reads this slot
+            // when FC_flash_attn_ext_has_sinks is set, and that constant is set from the same test.
+            ggml_metal_encoder_set_buffer  (enc, has_sinks_c ? ggml_metal_get_buffer_id(op->src[11])
+                                                             : ggml_metal_get_buffer_id(q),  5);
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),        6);  // pad (unused)
             ggml_metal_encoder_set_buffer  (enc, bid_blk,                           7);  // blk: skip flags
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(btab),     8);  // ptab

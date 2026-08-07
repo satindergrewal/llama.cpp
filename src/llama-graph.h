@@ -1207,7 +1207,8 @@ struct llm_graph_context {
             int           il,
             int64_t       visibility_window = 0,
             ggml_tensor * rel               = nullptr,
-            int64_t       rel_extent        = 0) const;
+            int64_t       rel_extent        = 0,
+            ggml_tensor * sinks             = nullptr) const;
 
     ggml_tensor * build_attn_mha_paged(
              ggml_tensor * q,               // [n_embd_head, n_head, n_tokens]
@@ -1223,7 +1224,8 @@ struct llm_graph_context {
                    float   kq_scale,
                      int   block_size,
                      int   max_blocks,
-                     int   max_blocks_live) const;
+                     int   max_blocks_live,
+             ggml_tensor * sinks) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

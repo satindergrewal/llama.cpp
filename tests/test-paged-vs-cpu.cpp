@@ -72,7 +72,7 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
     ggml_tensor * rel_p = with_rel ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, H, N) : nullptr;
 
     ggml_tensor * out_p = ggml_paged_attn_banded(ctx, q_p, k_new, v_new, cache, cache,
-            btab, slots, clens, boffs, blens, rel_p, scale, BS, NB, NB, with_rel ? E : 1, window);
+            btab, slots, clens, boffs, blens, rel_p, scale, BS, NB, NB, nullptr, with_rel ? E : 1, window);
     ggml_set_name(out_p, "out_paged");
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -182,7 +182,7 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
         p.rel   = with_rel ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, H, p.n) : nullptr;
         p.out   = ggml_paged_attn_banded(ctx, p.q, p.k, p.v, cache, cache,
                       btab, p.slots, p.clens, p.boffs, p.blens, p.rel,
-                      scale, BS, NB, NB, with_rel ? E : 1, window);
+                      scale, BS, NB, NB, nullptr, with_rel ? E : 1, window);
     }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);

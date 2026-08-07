@@ -2776,7 +2776,8 @@ ggml_tensor * llm_graph_context::build_attn_mha_paged(
                float   kq_scale,
                  int   block_size,
                  int   max_blocks,
-                 int   max_blocks_live) const {
+                 int   max_blocks_live,
+         ggml_tensor * sinks) const {
 
     // Paged attention kernel (write) assumes dense layout [n_tokens. n_heads_kv, head_dim].
     // Architectures like (Falcon, GPT-2, etc.) produce KV as views into a fused QKV tensor
@@ -2789,7 +2790,7 @@ ggml_tensor * llm_graph_context::build_attn_mha_paged(
     ggml_tensor * cur = ggml_paged_attn(ctx0,
                                         q, k_cur, v_cur, k_cache, v_cache,
                                         block_table, write_slots, context_lens, batch_offsets, batch_lens,
-                                        kq_scale, block_size, max_blocks, max_blocks_live);
+                                        kq_scale, block_size, max_blocks, max_blocks_live, sinks);
     return cur;
 }
 
@@ -3483,7 +3484,10 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
         ggml_tensor * /*kq_b*/,
-        ggml_tensor * /*sinks*/,
+        // ★ sinks was ACCEPTED AND DISCARDED here. The parameter existed, commented out, so every
+        // caller passing sinks had them silently dropped -- and mimo2 is exactly such a caller. The
+        // Metal champion kernels carry live sink handling; only the delivery was missing.
+        ggml_tensor * sinks,
         ggml_tensor * /*v_mla*/,
             float     kq_scale,
             int       il) const {
@@ -3503,7 +3507,7 @@ ggml_tensor * llm_graph_context::build_attn(
         inp->paged_batch_offsets,
         inp->paged_batch_lens,
         kq_scale, cparams.block_size, max_blocks,
-        ds4p_live_blocks(paged_mctx, cparams.block_size, max_blocks));
+        ds4p_live_blocks(paged_mctx, cparams.block_size, max_blocks), sinks);
     cb(cur, "kqv_out", il);
 
     // Reshape to [attn_out_width, n_tokens] (just a view).
@@ -4403,7 +4407,8 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
         int           il,
         int64_t       visibility_window,
         ggml_tensor * rel,
-        int64_t       rel_extent) const {
+        int64_t       rel_extent,
+        ggml_tensor * sinks) const {
     if (paged_ctx == nullptr) {
         // ⚠ THIS EXIT WAS SILENT, and that silence cost hours on Hy3 2026-08-06. The layer-contract
         // exit below warns; this one did not, so "paged pool is live but no layer ever paged" and
@@ -4473,7 +4478,7 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
             kq_scale, (int) cparams.block_size, (int) inp_paged->paged_block_table->ne[0],
             ds4p_live_blocks(paged_ctx, (int) cparams.block_size,
                              (int) inp_paged->paged_block_table->ne[0]),
-            rel_extent, visibility_window);
+            sinks, rel_extent, visibility_window);
 
     ggml_tensor * cur = ggml_reshape_2d(ctx0, cur_p, cur_p->ne[0]*cur_p->ne[1], cur_p->ne[2]);
 

@@ -1324,7 +1324,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_mask
 // long KV -- an optimisation, not a requirement, and correctness comes first.
 // ⚠ The vec threadgroup is 2-D (32, nsg, 1), NOT (32*nsg, 1, 1) like the prefill port.
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_vec(
-        ggml_metal_library_t lib, const ggml_tensor * op, int nsg, int nwg) {
+        ggml_metal_library_t lib, const ggml_tensor * op, int nsg, int nwg, bool has_sinks) {
     char base[256];
     char name[256];
 
@@ -1333,13 +1333,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_vec(
     const int32_t ns10 = (int32_t) (kvc->nb[1] / sizeof(ggml_fp16_t));   // stride_token, elements
 
     snprintf(base, 256, "kernel_paged_champ_vec_dk%d_dv%d", head_dim, head_dim);
-    snprintf(name, 256, "%s_ns%d_nsg%d_nwg%d", base, ns10, nsg, nwg);
+    snprintf(name, 256, "%s_ns%d_nsg%d_nwg%d_sk%d", base, ns10, nsg, nwg, has_sinks ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
         ggml_metal_cv_set_bool (cv, true,  FC_FLASH_ATTN_EXT_VEC + 0);   // has_mask: causality
-        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT_VEC + 1);
+        ggml_metal_cv_set_bool (cv, has_sinks, FC_FLASH_ATTN_EXT_VEC + 1);   // has_sinks
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT_VEC + 2);
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT_VEC + 3);
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT_VEC + 4);   // kvpad: block walk handles the tail
@@ -1369,7 +1369,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_vec(
 // ns10/ns20 are function constants that bake the K/V row pitch into the compiled kernel -- two
 // different strides sharing one cached compilation would silently use the first caller's pitch.
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_champ(
-        ggml_metal_library_t lib, const ggml_tensor * op, int nsg) {
+        ggml_metal_library_t lib, const ggml_tensor * op, int nsg, bool has_sinks) {
     char base[256];
     char name[256];
 
@@ -1386,7 +1386,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_champ
     } else {
         snprintf(base, 256, "kernel_paged_attn_champ_dk%d_dv%d", head_dim, head_dim);
     }
-    snprintf(name, 256, "%s_nsg%d_ns%d", base, nsg, ns10);   // base already carries the KV type
+    snprintf(name, 256, "%s_nsg%d_ns%d_sk%d", base, nsg, ns10, has_sinks ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1395,7 +1395,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_champ
         // walk and the per-row bound, and a partial tail block is handled by the loop bound,
         // not by a pad buffer. bc_mask off for the same reason.
         ggml_metal_cv_set_bool (cv, true,  FC_FLASH_ATTN_EXT + 0);   // has_mask: causality
-        ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 1);
+        ggml_metal_cv_set_bool (cv, has_sinks, FC_FLASH_ATTN_EXT + 1);   // has_sinks
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 2);
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 3);
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 4);

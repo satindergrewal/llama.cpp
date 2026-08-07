@@ -8239,10 +8239,17 @@ struct ggml_tensor * ggml_paged_attn(
     float                 scale,
     int                   block_size,
     int                   max_blocks,
-    int                   max_blocks_live) {
+    int                   max_blocks_live,
+    struct ggml_tensor  * sinks) {
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, q->type, ggml_n_dims(q), q->ne);
     result->op = GGML_OP_PAGED_ATTN;
+    // ★ ATTENTION SINKS at src[11] -- the slot GGML_MAX_SRC=12 was raised for. The Metal champion
+    // kernels already carry LIVE sink handling (FC_flash_attn_ext_has_sinks and its vec equivalent);
+    // what was missing was any way to GET the tensor to them. mimo2 passes sinks to build_attn and
+    // could not be paged at all without this -- wiring it would have dropped the sink from every
+    // layer, silently.
+    result->src[11] = sinks;
     result->src[0] = q;
     result->src[1] = k_new;
     result->src[2] = v_new;
@@ -8288,12 +8295,13 @@ struct ggml_tensor * ggml_paged_attn_banded(
     int                   block_size,
     int                   max_blocks,
     int                   max_blocks_live,
+    struct ggml_tensor  * sinks,
     int64_t               rel_extent,
     int64_t               visibility_window) {
 
     struct ggml_tensor * result = ggml_paged_attn(ctx, q, k_new, v_new, k_cache, v_cache,
             block_table, write_slots, context_lens, batch_offsets, batch_lens,
-            scale, block_size, max_blocks, max_blocks_live);
+            scale, block_size, max_blocks, max_blocks_live, sinks);
 
     if (rel_logits) {
         GGML_ASSERT(rel_logits->type == GGML_TYPE_F32 ||
