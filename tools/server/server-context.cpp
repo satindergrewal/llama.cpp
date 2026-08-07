@@ -3485,8 +3485,25 @@ private:
             }
         }
 
-        // ★★ DRAFT GENERATION -- the last piece. Runs AFTER the verify loop and BEFORE update(),
-        // because update() clears pending_draft and the scheduler reads it on the NEXT prepare_batch.
+        // ⚠ ONE LAYOUT PER CALL. Non-null n_accepted means EVERY row reads at the batch offsets,
+        // sentinel rows included -- the contract set with step D. So when any row speculated, the
+        // whole call switches buffers.
+        if (any_spec) {
+            llama_paged_scheduler_update(paged_sched, &pbatch, sampled_off.data(), stops.data(),
+                                         n_accepted_v.data());
+        } else {
+            llama_paged_scheduler_update(paged_sched, &pbatch, sampled.data(), stops.data(),
+                                         /*n_accepted =*/ nullptr);
+        }
+
+        // ★★ DRAFT GENERATION -- and it MUST run AFTER update(), not before.
+        //
+        // ⚠ I had it before, with a comment confidently explaining why. update() CLEARS
+        // pending_draft -- I wrote that clearing myself, in four places, and then staged the draft
+        // immediately upstream of it. Every draft was wiped the moment it was staged: 22 drafts
+        // generated, 22 discarded, #acc drafts = 0, and the scheduler never emitted a multi-row batch.
+        //
+        // The comment I wrote was the exact inverse of the code I wrote.
         //
         // ⚠ The staged draft and slot->spec_draft must stay the same object: the verify above reads
         // slot->spec_draft to know what it is comparing against, and set_draft() copies it into the
@@ -3533,6 +3550,21 @@ private:
                 // draft had actually been produced -- which is the assert doing precisely its job.
                 s.spec_draft.clear();
 
+                // ★★ REWIND THE DRAFT CONTEXT TO WHERE WE ARE ABOUT TO WRITE.
+                //
+                // A successful draft decode writes n_past..n_past+k into ctx_dft. When the target
+                // then accepts only ONE of those tokens, n_past advances by 1 while the draft
+                // context still holds the REJECTED positions -- and the next block cannot be written
+                // over them. Measured exactly that shape: pos 12 succeeded (writing 12..15), then
+                // 13, 14 and 15 all failed, then 16 succeeded, then 17, 18, 19 failed.
+                //
+                // One success followed by three failures, repeating, on a 4-token block. dflash's
+                // accept() ignores its arguments and does not rewind, so the caller must.
+                if (ctx_dft) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), s.id,
+                                        (llama_pos) s.prompt.n_tokens() - 1, -1);
+                }
+
                 s.spec_ckpt.update_pos(
                         s.prompt.n_tokens(),
                         llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), s.id),
@@ -3577,16 +3609,6 @@ private:
             }
         }
 
-        // ⚠ ONE LAYOUT PER CALL. Non-null n_accepted means EVERY row reads at the batch offsets,
-        // sentinel rows included -- the contract set with step D. So when any row speculated, the
-        // whole call switches buffers.
-        if (any_spec) {
-            llama_paged_scheduler_update(paged_sched, &pbatch, sampled_off.data(), stops.data(),
-                                         n_accepted_v.data());
-        } else {
-            llama_paged_scheduler_update(paged_sched, &pbatch, sampled.data(), stops.data(),
-                                         /*n_accepted =*/ nullptr);
-        }
 
         // clear finished sequences AFTER the scheduler's update: update() writes this
         // batch's positions back into the memory's per-seq bookkeeping, so clearing
