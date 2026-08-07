@@ -205,6 +205,16 @@ LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched
     sched->impl.update(*batch, tokens_vec, stop_flags, n_accepted);
 }
 
+LLAMA_API bool llama_paged_scheduler_set_draft(struct llama_paged_scheduler * sched,
+                                              int32_t                        request_id,
+                                              const llama_token *            draft,
+                                              int32_t                        n_draft) {
+    if (!sched) {
+        return false;
+    }
+    return sched->impl.set_draft(request_id, draft, n_draft);
+}
+
 LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,
                                                    llama_paged_on_finish_cb       cb,
                                                    void *                         user_data) {

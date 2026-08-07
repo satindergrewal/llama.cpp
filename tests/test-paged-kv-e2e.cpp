@@ -144,6 +144,7 @@ static path_result run_paged(const std::string & model_path) {
     path_result result;
     result.n_vocab                      = n_vocab;
     bool        captured_prefill_logits = false;
+    bool        did_draft_probe         = false;
     llama_batch batch                   = {};
 
     while ((int) result.tokens.size() < N_PREDICT) {
@@ -201,6 +202,71 @@ static path_result run_paged(const std::string & model_path) {
         }
         if (stop) {
             break;
+        }
+
+        // ★★ EXERCISE THE DRAFT PATH ITSELF -- set_draft + multi-row emission + logits mask +
+        // block arithmetic + the accepted count. Without this every one of those is COMPILED AND
+        // NEVER RUN, which is the exact state that produced this week's three worst defects.
+        //
+        // The check is self-verifying and needs no real draft model. Stage the token the target is
+        // ABOUT to produce anyway (a perfect 1-token draft), then:
+        //   - prepare_batch must emit 2 rows instead of 1
+        //   - logits must be sampleable at BOTH indices (C's mask)
+        //   - accepting both must advance n_past by exactly 2 (A's blocks, D's counter, E's max_pos)
+        // and the generated text must be IDENTICAL to the non-drafting run, because greedy
+        // speculative decoding is lossless. compare_results() at the end is what enforces that.
+        if (!did_draft_probe && result.tokens.size() >= 2) {
+            did_draft_probe = true;
+
+            // draft one token: whatever greedy would pick next is unknown here, so use the token we
+            // just sampled. A WRONG draft is fine and is in fact the more interesting case -- it
+            // exercises the reject path, and acceptance is decided below by comparing logits.
+            const llama_token draft_tok = next;
+            EXPECT_TRUE(llama_paged_scheduler_set_draft(sched, /*request_id =*/ 0, &draft_tok, 1));
+
+            EXPECT_TRUE(llama_paged_scheduler_prepare_batch(sched, &batch));
+            const llama_paged_batch_info * dinfo = llama_paged_scheduler_get_batch_info(sched);
+            EXPECT_TRUE(dinfo != nullptr && dinfo->n_seq == 1);
+            // B: two rows, not one
+            EXPECT_TRUE(dinfo->batch_lens[0] == 2);
+
+            EXPECT_TRUE(llama_decode(ctx, batch) == 0);
+            llama_synchronize(ctx);
+
+            // C: logits requested on BOTH rows -- get_logits_ith throws by name if not
+            const int32_t base = dinfo->batch_offsets[0];
+            const float * row0 = llama_get_logits_ith(ctx, base + 0);
+            const float * row1 = llama_get_logits_ith(ctx, base + 1);
+            EXPECT_TRUE(row0 != nullptr && row1 != nullptr);
+
+            // greedy verify: row0 predicts the token that follows `next`. Accept the draft only if
+            // it matches, exactly as a real verify step would.
+            const int32_t argmax0 = (int32_t) (std::max_element(row0, row0 + n_vocab) - row0);
+            const int32_t n_acc_d = (argmax0 == draft_tok) ? 2 : 1;
+
+            llama_paged_seq_state st_before{};
+            EXPECT_TRUE(llama_paged_scheduler_get_seq_state(sched, 0, &st_before));
+
+            std::vector<llama_token> dtoks((size_t) base + 2, 0);
+            dtoks[base + 0] = argmax0;
+            if (n_acc_d == 2) {
+                dtoks[base + 1] = (int32_t) (std::max_element(row1, row1 + n_vocab) - row1);
+            }
+            int8_t dstop = 0;
+            llama_paged_scheduler_update(sched, &batch, dtoks.data(), &dstop, &n_acc_d);
+
+            // D + E: n_past advanced by the ACCEPTED count, not the submitted one
+            llama_paged_seq_state st_after{};
+            EXPECT_TRUE(llama_paged_scheduler_get_seq_state(sched, 0, &st_after));
+            EXPECT_TRUE((int32_t) (st_after.n_past - st_before.n_past) == n_acc_d);
+
+            for (int32_t k = 0; k < n_acc_d; ++k) {
+                result.tokens.push_back(dtoks[base + k]);
+                common_sampler_accept(smpl, dtoks[base + k], true);
+            }
+            if ((int) result.tokens.size() >= N_PREDICT) {
+                break;
+            }
         }
     }
 

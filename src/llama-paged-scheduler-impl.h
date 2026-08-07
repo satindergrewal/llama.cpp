@@ -41,6 +41,12 @@ class llama_paged_scheduler_impl {
     // logical_seq.size() are not interchangeable.
     void update(const llama_batch & batch, const std::vector<llama_token> & new_tokens, const int8_t * stop_flags,
                 const int32_t * n_accepted = nullptr);
+    // ★ SPECULATIVE DECODING INPUT CHANNEL. step() builds decode rows from logical_seq.back() --
+    // state the scheduler already owns -- so drafted tokens have no way in without this.
+    // Returns false (and stages nothing) if the request is unknown, still prefilling, or the draft
+    // does not fit the batch budget.
+    bool set_draft(int32_t request_id, const llama_token * draft, int32_t n_draft);
+
     void set_on_finish(llama_paged_on_finish_cb cb, void * user_data);
     llama_sequence_group *         get_group_from_id(int32_t request_id) const;
     const llama_paged_batch_info * get_curr_batch_info() const;

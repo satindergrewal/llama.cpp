@@ -1731,6 +1731,20 @@ extern "C" {
         const struct llama_paged_scheduler * sched);
 
     // Optional finish callback.
+    // Stage drafted tokens for a request. The NEXT llama_paged_scheduler_prepare_batch() emits
+    // 1 + n_draft rows for it (the last accepted token, then the draft) instead of a single row, with
+    // logits on all of them so every drafted position can be verified.
+    //
+    // Cleared by llama_paged_scheduler_update(), and also on preemption, swap-out and finish -- a
+    // draft staged against one cache state must never survive into another.
+    //
+    // Returns false and stages nothing if the request is unknown, is still prefilling, or the draft
+    // plus its verify row exceeds n_batch. n_draft <= 0 clears any staged draft and returns true.
+    LLAMA_API bool llama_paged_scheduler_set_draft(struct llama_paged_scheduler * sched,
+                                                  int32_t                        request_id,
+                                                  const llama_token *            draft,
+                                                  int32_t                        n_draft);
+
     LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,
                                                        llama_paged_on_finish_cb       cb,
                                                        void *                         user_data);

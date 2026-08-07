@@ -323,6 +323,7 @@ void llama_paged_scheduler_impl::set_swapped(llama_sequence_group_ptr group_ptr)
     GGML_ASSERT(group_ptr && group_ptr->status != llama_sequence_group_status::SWAPPED &&
                 "Request is already swapped.");
     group_ptr->status = llama_sequence_group_status::SWAPPED;
+    group_ptr->pending_draft.clear();   // ⚠ parked now, resumed against a different cache state
     insert_sorted_by_arrival_time(std::move(group_ptr), swapped);
 }
 
@@ -342,6 +343,7 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
         return;
     }
     group.torn_down = true;
+    group.pending_draft.clear();   // ⚠ teardown runs from TWO places; leave nothing behind
     // We prioritize user CB, otherwise we log by default
     if (on_finish_cb) {
         // TODO perhaps just have the callback take sequence_group and user_data
@@ -422,6 +424,8 @@ void llama_paged_scheduler_impl::swap_out_or_recompute(llama_sequence_group_ptr 
     group_ptr->n_past    = 0;
     group_ptr->n_decoded = 0;
     group_ptr->n_prompt  = (uint32_t) group_ptr->logical_seq.size();
+    group_ptr->pending_draft.clear();   // ⚠ a draft staged against the OLD cache state must not
+                                        // survive a replay from n_past=0
 
     LLAMA_LOG_DEBUG("%s: (recomputation) request_id=%d was sent for recomputation.\n", __func__, rid);
     set_waiting(std::move(group_ptr));
@@ -457,14 +461,24 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
 
         // Dynamically allocate more blocks to decode the request
         uint32_t current_capacity  = group->block_table.size() * block_size;
-        uint32_t required_capacity = group->n_past + 1;
+        // ★ STEP A. A decoding group needs room for its whole row set, not one token: the last
+        // accepted token plus every drafted one. Rejected drafts leave KV behind at positions past
+        // the new n_past, which the next step simply overwrites -- DS4P_SLOT_COVER proved the write
+        // slot is a pure function of position -- so nothing is freed, but the blocks must EXIST or
+        // the write walks off the end of the block table.
+        const uint32_t n_rows_wanted = 1 + (uint32_t) group->pending_draft.size();
+        uint32_t required_capacity = group->n_past + n_rows_wanted;
         LLAMA_LOG_DEBUG(
             "%s: (running) request_id=%d: current_capacity (tokens)=%d toks, required capacity (tokens) = %d toks\n",
             __func__, group->request_id, current_capacity, required_capacity);
         if (required_capacity >= current_capacity) {
             LLAMA_LOG_DEBUG("%s: (running_pending) request_id=%d: requires a new block to decode.\n", __func__,
                             group->request_id);
-            bool success = kv_cache_manager->allocate(1, *group);  // decode phase
+            // blocks needed to cover n_past .. n_past + n_rows_wanted - 1
+            const uint32_t have   = (uint32_t) group->block_table.size() * block_size;
+            const uint32_t needed = required_capacity > have
+                                  ? (required_capacity - have + block_size - 1) / block_size : 1;
+            bool success = kv_cache_manager->allocate(needed, *group);  // decode phase
             if (!success) {
                 if (running.size() > 1) {
                     const bool curr_is_back = (std::next(it) == running.end());
@@ -732,7 +746,17 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
             GGML_ASSERT(group && "candidate request is nullptr.");
             const int32_t reserve_after = batch_size - 1 - i;  // 1 token each for the rest
             if (group->n_decoded > 0) {
-                chunk_tokens[i] = 1;
+                // ★ STEP B. A decoding group normally contributes ONE row. With a staged draft it
+                // contributes 1 + n_draft: the last accepted token, then each drafted token, so the
+                // target can verify all of them in a single forward pass.
+                //
+                // ⚠ Clamped to the remaining budget rather than assumed to fit. set_draft() already
+                // rejects a draft larger than n_batch, but that check cannot see how much of the
+                // budget the OTHER candidates in this step have taken. Silently over-committing here
+                // would starve a sibling sequence, and the chunker's own assert would then fire on a
+                // candidate that did nothing wrong.
+                const int32_t want = 1 + (int32_t) group->pending_draft.size();
+                chunk_tokens[i] = std::min(want, std::max(1, budget - reserve_after));
             } else {
                 const int32_t remaining_prompt = (int32_t) group->n_prompt - (int32_t) group->n_past;
                 GGML_ASSERT(remaining_prompt > 0 && "prefill candidate with no prompt remainder");
@@ -794,15 +818,28 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         for (int token_idx = 0; token_idx < new_tokens; ++token_idx) {
             int32_t batch_start_id = token_offset + token_idx;
 
-            batch.token[batch_start_id] = is_prefill ? group->logical_seq[n_prefill_done + token_idx]
-                                                     : group->logical_seq.back();
+            // ★ STEP B. Decode row 0 is the last accepted token (today's behaviour). Rows 1..n are the
+            // staged draft, in order. With no draft, new_tokens == 1 and this is byte-identical.
+            batch.token[batch_start_id] =
+                is_prefill ? group->logical_seq[n_prefill_done + token_idx]
+                           : (token_idx == 0 ? group->logical_seq.back()
+                                             : group->pending_draft[token_idx - 1]);
             batch.pos[batch_start_id]   = group->n_past + token_idx;  // n_past starts at 0
 
             batch.n_seq_id[batch_start_id]  = 1;
             batch.seq_id[batch_start_id][0] = group->request_id;
 
-            // only the last token, and never for a mid-prompt chunk
-            batch.logits[batch_start_id] = !mid_prefill && (token_idx == (new_tokens - 1));
+            // ★ STEP C. Prefill still emits logits only on its last row. A DECODE row set needs logits
+            // on EVERY row: row 0 predicts the first drafted token, row k verifies draft[k-1] and
+            // predicts the next. Without them the accept-prefix cannot be computed at all.
+            //
+            // Verified before writing this: output_resolve_row (llama-context.cpp:957) maps a BATCH
+            // TOKEN INDEX to an output row via output_ids, so the caller samples at
+            // batch_offsets[i] + k with no row math of its own -- and it THROWS BY NAME if a row's
+            // logits were never requested, so getting this mask wrong is loud rather than silent.
+            batch.logits[batch_start_id] =
+                is_prefill ? (!mid_prefill && (token_idx == (new_tokens - 1)))
+                           : true;
 
             int32_t token_pos                     = group->n_past + token_idx;
             curr_info.write_slots[batch_start_id] = calculate_global_slot_index(token_pos, group->block_table);
@@ -965,6 +1002,11 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
             }
         }
 
+        // ★ The staged draft has now been consumed (accepted or rejected). Clearing it here is the
+        // NORMAL path; the other three transitions out of decoding clear it too (recompute, swap,
+        // finish), because a draft that survives any of them is replayed as accepted context.
+        group->pending_draft.clear();
+
         // Default stop flags are n_seq_max
         if (stop_flags[i] || group->n_past >= n_seq_max_ctx) {
             group->status = llama_sequence_group_status::FINISHED;
@@ -977,6 +1019,39 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
             finish(*group);
         }
     }
+}
+
+bool llama_paged_scheduler_impl::set_draft(int32_t request_id, const llama_token * draft, int32_t n_draft) {
+    llama_sequence_group * group = get_group_from_id(request_id);
+    if (group == nullptr) {
+        LLAMA_LOG_ERROR("%s: request_id=%d does not exist.\n", __func__, request_id);
+        return false;
+    }
+    if (n_draft <= 0 || draft == nullptr) {
+        group->pending_draft.clear();          // explicit "no draft this step"
+        return true;
+    }
+
+    // ⚠ REFUSE ON A PREFILLING GROUP. There is no last-accepted token to draft from until the
+    // prompt has been consumed, and staging one would emit rows against a position range the
+    // prefill cursor still owns.
+    if (group->n_decoded == 0) {
+        LLAMA_LOG_ERROR("%s: request_id=%d is still prefilling (n_decoded=0); nothing to draft from.\n",
+                        __func__, request_id);
+        return false;
+    }
+
+    // ⚠ CAP AGAINST THE BATCH BUDGET. paged asserts n_batch == n_ubatch (llama-model.cpp:2624), so an
+    // oversized draft surfaces later as a startup-abort-shaped failure far from its cause. The +1 is
+    // the last accepted token, which shares the row block with the draft.
+    if (n_draft + 1 > n_batch) {
+        LLAMA_LOG_ERROR("%s: request_id=%d draft of %d tokens (+1 verify row) exceeds n_batch=%d.\n",
+                        __func__, request_id, n_draft, n_batch);
+        return false;
+    }
+
+    group->pending_draft.assign(draft, draft + n_draft);
+    return true;
 }
 
 void llama_paged_scheduler_impl::set_on_finish(llama_paged_on_finish_cb cb, void * user_data) {
