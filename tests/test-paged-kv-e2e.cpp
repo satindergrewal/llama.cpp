@@ -145,6 +145,7 @@ static path_result run_paged(const std::string & model_path) {
     result.n_vocab                      = n_vocab;
     bool        captured_prefill_logits = false;
     bool        did_draft_probe         = false;
+    bool        did_accept_probe        = false;
     llama_batch batch                   = {};
 
     while ((int) result.tokens.size() < N_PREDICT) {
@@ -176,7 +177,14 @@ static path_result run_paged(const std::string & model_path) {
         result.tokens.push_back(next);
 
         bool   stop      = llama_vocab_is_eog(vocab, next) || (int) result.tokens.size() >= N_PREDICT;
-        int8_t stop_flag = stop ? 1 : 0;
+
+        // ⚠ HOLD THE GROUP ALIVE FOR THE MULTI-ACCEPT PROBE. A stop_flag of 1 marks the group
+        // FINISHED and finish() removes it from id_to_group, so set_draft() then returns false and
+        // the probe cannot run at all -- which is exactly what happened on the first placement. The
+        // probe needs a live group with a complete token stream, and this is the only instant where
+        // both are true.
+        const bool run_accept_probe = stop && did_draft_probe && !did_accept_probe;
+        int8_t stop_flag = (stop && !run_accept_probe) ? 1 : 0;
 
         // ★★ EXERCISE THE SENTINEL BRANCH OF n_accepted, WHICH OTHERWISE HAS ZERO EXECUTIONS.
         //
@@ -201,6 +209,59 @@ static path_result run_paged(const std::string & model_path) {
             llama_paged_scheduler_update(sched, &batch, &next, &stop_flag, /*n_accepted =*/ nullptr);
         }
         if (stop) {
+            // ⚠ FIRES HERE, AT THE STOP BOUNDARY, and the placement is the whole point. Gating it
+            // inside the reject probe on "tokens complete" made it VACUOUS -- the reject probe runs
+            // once, early, when the stream is short, so the gate skipped the multi-accept path on
+            // every run and the test still printed PASSED. Third vacuity of the same shape today.
+            // Here the stream is complete, the loop is ending, and the probe's unrecorded tokens
+            // cannot shorten it.
+            if (run_accept_probe) {
+                did_accept_probe = true;
+            // ★★ THE MULTI-ACCEPT PROBE. Everything above exercises the REJECT shape (n_acc = 1).
+                // The multi-token append loop, the second batch-offset read (new_tokens[offset+1]) and
+                // E's multi-accept last_accepted_idx have ZERO EXECUTIONS without this.
+                //
+                // Acceptance cannot be forced through prediction -- it would require knowing the next
+                // token before decoding it. So this probe accepts BOTH rows unconditionally and checks
+                // the SCHEDULER STATE rather than the text, then stops. Its tokens are deliberately NOT
+                // pushed into result.tokens, so the losslessness comparison is unaffected by a pair that
+                // was never verified against logits.
+                    {
+                    const llama_token d2 = result.tokens.back();
+                    EXPECT_TRUE(llama_paged_scheduler_set_draft(sched, 0, &d2, 1));
+                    EXPECT_TRUE(llama_paged_scheduler_prepare_batch(sched, &batch));
+                    const llama_paged_batch_info * i2 = llama_paged_scheduler_get_batch_info(sched);
+                    EXPECT_TRUE(i2 != nullptr && i2->batch_lens[0] == 2);
+                    EXPECT_TRUE(llama_decode(ctx, batch) == 0);
+                    llama_synchronize(ctx);
+
+                    llama_paged_seq_state s0{};
+                    EXPECT_TRUE(llama_paged_scheduler_get_seq_state(sched, 0, &s0));
+
+                    const int32_t b2 = i2->batch_offsets[0];
+                    std::vector<llama_token> t2((size_t) b2 + 2, 0);
+                    const float * r0 = llama_get_logits_ith(ctx, b2 + 0);
+                    const float * r1 = llama_get_logits_ith(ctx, b2 + 1);
+                    EXPECT_TRUE(r0 != nullptr && r1 != nullptr);
+                    t2[b2 + 0] = (int32_t) (std::max_element(r0, r0 + n_vocab) - r0);
+                    t2[b2 + 1] = (int32_t) (std::max_element(r1, r1 + n_vocab) - r1);
+
+                    const int32_t n_acc2 = 2;   // force the ACCEPT shape
+                    int8_t        st2    = 0;
+                    llama_paged_scheduler_update(sched, &batch, t2.data(), &st2, &n_acc2);
+
+                    llama_paged_seq_state s1{};
+                    EXPECT_TRUE(llama_paged_scheduler_get_seq_state(sched, 0, &s1));
+                    printf("test-paged-kv-e2e: multi-accept probe n_past %u -> %u, logical %u -> %u (want +2, +2)\n",
+                           s0.n_past, s1.n_past, s0.n_logical, s1.n_logical);
+                    EXPECT_TRUE((int32_t) (s1.n_past - s0.n_past) == 2);
+                    // ⚠ AND THE APPEND, SEPARATELY. n_past advances by n_acc whatever the append loop
+                    // does, so checking it alone passed a mutation that capped the loop at ONE token.
+                    // Advance-count and append-count are different quantities; assert both.
+                    EXPECT_TRUE((int32_t) (s1.n_logical - s0.n_logical) == 2);
+                }
+
+            }
             break;
         }
 
@@ -260,13 +321,18 @@ static path_result run_paged(const std::string & model_path) {
             EXPECT_TRUE(llama_paged_scheduler_get_seq_state(sched, 0, &st_after));
             EXPECT_TRUE((int32_t) (st_after.n_past - st_before.n_past) == n_acc_d);
 
+            // ⚠ THE RUN MUST TESTIFY WHICH BRANCH IT TOOK. Staging `next` as the draft means
+            // acceptance requires the model to immediately repeat itself, so in practice this probe
+            // always takes the REJECT branch (n_acc = 1 of 2). Inferring that from "the test passed"
+            // is exactly the mistake this file keeps paying for -- print it.
+            printf("test-paged-kv-e2e: draft probe took the %s branch (n_acc=%d of 2)\n",
+                   n_acc_d == 2 ? "ACCEPT" : "REJECT", n_acc_d);
+
             for (int32_t k = 0; k < n_acc_d; ++k) {
                 result.tokens.push_back(dtoks[base + k]);
                 common_sampler_accept(smpl, dtoks[base + k], true);
             }
-            if ((int) result.tokens.size() >= N_PREDICT) {
-                break;
-            }
+
         }
     }
 

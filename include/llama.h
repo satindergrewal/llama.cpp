@@ -1657,6 +1657,11 @@ extern "C" {
         int32_t n_past;
         int64_t t_arrival_us;
         int64_t t_first_token_us;
+        // ⚠ INTROSPECTION, and it exists because a test that could not see this PASSED A MUTATION.
+        // n_past and logical_seq.size() advance by the same count in correct code but are DIFFERENT
+        // QUANTITIES -- fusing them corrupted logical_seq on every multi-chunk prefill once already.
+        // Without exposing the length, no test can tell "advanced by 2" from "appended 2".
+        int32_t n_logical;
     };
 
     typedef void (*llama_paged_on_finish_cb)(int32_t             request_id,

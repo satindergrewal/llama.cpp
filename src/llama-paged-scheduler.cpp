@@ -240,6 +240,7 @@ LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler 
     out_state->n_past           = group->n_past;
     out_state->t_arrival_us     = group->t_arrival_time;
     out_state->t_first_token_us = group->t_first_token_us;
+    out_state->n_logical        = (int32_t) group->logical_seq.size();
     return true;
 }
 
