@@ -2328,6 +2328,28 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    // ★★ THE DRAFT CONTEXT MUST NOT INHERIT --kv-paged.
+    //
+    // cparams comes from common_context_params_to_llama(params), which copies kv_paged verbatim
+    // (common.cpp:1923). So with --kv-paged on the target, the DRAFT built its own paged pool -- sized
+    // with the TARGET's block count -- and aborted:
+    //
+    //   llama-kv-cache-paged.cpp:314: GGML_ASSERT(buf_gpu && "Failed to allocate GPU KV cache buffer")
+    //
+    // Observed on gemma4-assistant + gemma-4-E2B-it: the target's pool initialises at n_gpu_blocks=384
+    // and succeeds, then a SECOND init at the same count aborts. Not capacity -- the fitter reported
+    // 107 GiB free and "VRAM would have allowed 165736 blocks" against a ~220 MB request.
+    //
+    // Paging exists for continuous batching and long-context block reuse across many sequences. A
+    // speculative draft head has neither: it is small, it serves exactly one sequence, and its KV is
+    // rebuilt constantly. Inheriting kv_paged buys it nothing and costs it a pool it cannot allocate.
+    //
+    // ⚠ THIS DOES NOT MAKE SPECULATIVE DECODING WORK UNDER --kv-paged. The paged decode loop still
+    // never invokes the draft (update_slots_paged() calls none of pre_decode / post_decode /
+    // handle_last_sampled_token). This removes the ABORT so the pair can serve at all; the drafting
+    // gap is separate and larger. Two independent defects -- this closes only the first.
+    cparams.kv_paged = false;
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
