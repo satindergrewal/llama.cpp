@@ -421,6 +421,23 @@ int main() {
 
             // ★ SINKS. Finite sink against the CPU op (which now implements them), plus the -inf
             // control against the NO-SINKS answer on the same backend.
+            // ★★ DOES THE CAUSAL FLAG DO ANYTHING ON THIS PATH? Runs in EVERY geometry, unguarded.
+            // causal=1 and causal=0 must produce DIFFERENT numbers; if they are identical the
+            // kernel is ignoring op_params[8], which means (a) any multi-row masking result from
+            // this file is vacuous here and (b) dflash's non-causal attention is being silently
+            // causal-masked. This check IS its own control: identical output is the failure.
+            if (cse == 0) {
+                const std::vector<float> c1 = run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 0, 1);
+                const std::vector<float> c0 = run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 0, 0);
+                double dc = 0.0;
+                for (size_t i = 0; i < c1.size() && i < c0.size(); ++i) dc = std::max(dc, (double) fabs(c1[i]-c0[i]));
+                const bool live = dc > 1e-3;
+                printf("causal-flag  D=%3d bs=%d: causal1 vs causal0 max_abs=%.3e %s\n",
+                       D, getenv("DS4P_TEST_BS") ? atoi(getenv("DS4P_TEST_BS")) : 16, dc,
+                       live ? "LIVE" : "IGNORED <-- flag does nothing");
+                n_fail += live ? 0 : 1;
+            }
+
             // ★ The scalar kernel does not implement sinks and ABORTS rather than silently
             // dropping them. That abort fires before every later arm, so at block_size 16 -- THE
             // SIZE THE SERVER ACTUALLY RUNS -- this file has never once executed past this point.
