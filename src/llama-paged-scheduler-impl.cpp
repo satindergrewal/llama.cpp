@@ -833,13 +833,48 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         // every single-token decode step. Note this loop runs only for real scheduled requests, so it
         // cannot report progress for llama-server's ~21 startup graph builds -- the trap that made an
         // earlier gate score 630 "fallbacks" for work that had not happened yet.
+        // ⚠⚠ A PERCENTAGE RATE-LIMIT ALONE IS NOT ENOUGH, AND THE FAILURE IS AT THE TARGET REGIME.
+        // Shipped with 5% buckets only. MEASURED the same night on a 116,212-token prompt: a bucket is
+        // 5,810 tokens, and at that depth's throughput the line went **~3 minutes between prints**. I
+        // could not tell running from hung and went back to `ps` and CPU-time deltas -- which is the
+        // exact ambiguity this line exists to remove. The bigger the prompt, the longer the silence; a
+        // 1M prompt would print at 50,000-token intervals.
+        // ⇒ PERCENTAGE BOUNDS THE STORM, TIME BOUNDS THE SILENCE. Both are needed; I built one.
+        //
+        // ⚠ AND THE TIMER IS PER-REQUEST, NOT A FUNCTION STATIC. A shared "last printed at" would let
+        // one busy sequence SUPPRESS every other sequence's progress at -np > 1 -- a guard for A
+        // disabling B, the shape this fork has hit three times in one file. Keyed by request_id.
+        static std::unordered_map<int32_t, int64_t> pp_last_us;
+        static std::unordered_map<int32_t, int64_t> pp_start_us;
         if (is_prefill && group->n_prompt > (uint32_t) new_tokens) {
             const int32_t done_after  = n_prefill_done + new_tokens;
             const int     bucket_pre  = (int) ((int64_t) n_prefill_done * 20 / (int64_t) group->n_prompt);
             const int     bucket_post = (int) ((int64_t) done_after     * 20 / (int64_t) group->n_prompt);
+            const int64_t now_us      = ggml_time_us();
+            // ⚠ ENV-TUNABLE SO THE BRANCH CAN BE TESTED AT ALL. On a fast prefill a 20 s floor NEVER
+            // fires, so the first verification of this fix exercised the bucket path only and proved
+            // nothing about the silence path -- a fix whose branch has never been observed to run is
+            // the same as no fix. DS4P_PP_FLOOR_S=0 makes it print per chunk, which is how the branch
+            // is shown reachable. Default 20 s; not a tuning knob, a testability hook.
+            static const int64_t floor_us = []{
+                const char * e = getenv("DS4P_PP_FLOOR_S");
+                return (int64_t) ((e ? atof(e) : 20.0) * 1e6);
+            }();
+            if (n_prefill_done == 0) {
+                pp_start_us[group->request_id] = now_us;
+                pp_last_us [group->request_id] = now_us;
+            }
+            const int64_t last_us  = pp_last_us.count(group->request_id) ? pp_last_us[group->request_id] : now_us;
+            const int64_t start_us = pp_start_us.count(group->request_id) ? pp_start_us[group->request_id] : now_us;
+            const bool    stale    = (now_us - last_us) >= floor_us;
             // ⚠ rid IS LOAD-BEARING AT -np > 1. Two concurrent prefills interleave into one sawtooth
             // (0.35 -> 0.10 -> 0.40) that reads exactly like the stall this line exists to rule out.
-            if (bucket_post != bucket_pre || !mid_prefill) {
+            // ⚠ ELAPSED + tok/s, because the static path reports both through the server's own
+            // print_timing. Without them BOTH arms are watchable and only ONE is timeable, which is
+            // how a parity question turns into a stopwatch-and-log-mtime exercise.
+            if (bucket_post != bucket_pre || !mid_prefill || stale) {
+                pp_last_us[group->request_id] = now_us;
+                const double el = (double) (now_us - start_us) / 1e6;
                 // ⚠⚠ WARN, NOT INFO, AND THAT IS THE WHOLE POINT OF THE LINE.
                 // Written at LLAMA_LOG_INFO first. MEASURED: 20 correct lines at `-lv 5`, and
                 // **ZERO at the server's default verbosity 3** -- libllama INFO does not reach a
@@ -848,9 +883,20 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
                 // knows to pass `-lv 5`, is the same defect one level up: correct producer, no reader.
                 // The static path's equivalent is the server's own SLT_INF, which IS visible by
                 // default; WARN is what buys parity of visibility from inside libllama.
-                LLAMA_LOG_WARN("%s: paged: rid=%d prompt processing, n_tokens = %d / %u, progress = %.2f\n",
+                LLAMA_LOG_WARN("%s: paged: rid=%d prompt processing, n_tokens = %6d / %u, "
+                               "progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
                                __func__, group->request_id, done_after, group->n_prompt,
-                               (double) done_after / (double) group->n_prompt);
+                               (double) done_after / (double) group->n_prompt,
+                               el, el > 0.0 ? (double) done_after / el : 0.0);
+            }
+            // ⚠ RELEASE THE PER-REQUEST STATE ON THE LAST CHUNK. Two unordered_maps keyed by
+            // request_id, in a long-lived process, with entries added per request and never removed,
+            // is a leak -- small per entry and unbounded over a server's lifetime. This lane already
+            // has one finding titled "paged KV cache leaks every context and buffer it allocates";
+            // adding a second leak while fixing an observability gap would be a poor trade.
+            if (!mid_prefill) {
+                pp_last_us.erase(group->request_id);
+                pp_start_us.erase(group->request_id);
             }
         }
 
