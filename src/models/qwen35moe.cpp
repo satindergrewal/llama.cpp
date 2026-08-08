@@ -347,10 +347,32 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-    cb(cur, "attn_pregate", il);
+    // ★ GENERIC PAGED CONSUMER -- MISSING UNTIL 2026-08-09, WHICH IS WHY THIS ARCH NEVER RAN PAGED.
+    // `paged_ctx` was threaded the whole way down (built at :201, accepted at :291) and then simply
+    // never read: the parameter was declared, the header included to declare its type, and the line
+    // that consumes it was never written. Everything upstream looked correct, and it was.
+    //
+    // MEASURED before the fix, arch_serve_gate on Ornith-35B Q4_K_M with DS4P_PAGED_HYBRID=1:
+    //   pool checkouts = 6      the block manager allocated and handed out blocks
+    //   DS4P-CONSUME   = 0      no graph read a single one of them
+    // Under --kv-paged this arch ran STATIC with a paged pool sitting beside it, unread. Output was
+    // identical to the static arm because it WAS the static arm, twice.
+    //
+    // ⚠ That covers Ornith-35B, Ornith-397B and Qwen3.6-35B-HauhauCS -- every large qwen35moe model
+    // here. `qwen35` (Ornith-9B) has had the line since the port and consumes 344 events on the same
+    // gate, so the two sibling files disagreed silently for as long as both existed.
+    //
+    // Same class as audit finding 5 and the recurrent-input defect: correct producer, no consumer.
+    // The call is identical to qwen35.cpp's -- same full-causal geometry, no mask args, no rel bias.
+    cur = build_attn_paged_or_null(paged_ctx, Qcur, Kcur, Vcur, kq_scale, il);
+    if (cur != nullptr) {
+        cb(cur, "attn_pregate_paged", il);
+    } else {
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        cb(cur, "attn_pregate", il);
+    }
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
     cb(gate_sigmoid, "gate_sigmoid", il);
