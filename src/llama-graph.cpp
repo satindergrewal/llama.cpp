@@ -1378,9 +1378,44 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
+        // ★ DS4P_RSPRE. With n_rs == 1 and one sequence the value written here is 0 in every batch, so
+        // "the stale INDEX was wrong" cannot be the mechanism -- a frozen 0 and a fresh 0 are the same
+        // number. The version that survives is that the serving graph's s_copy tensor was never written
+        // AT ALL and held whatever the allocator left there. This prints the PRE-WRITE contents:
+        //   non-zero on triggering geometries -> uninitialised bytes, and the WHEN sentence writes itself
+        //   zero everywhere                   -> that story is wrong too, and the fix works for a reason
+        //                                        I have not identified, which matters before it ships
+        if (getenv("DS4P_RSPRE")) {
+            char pre[96] = {0};
+            int  off = 0;
+            for (int64_t i = 0; i < n_rs && i < 6 && off + 12 < (int) sizeof(pre); ++i) {
+                off += snprintf(pre + off, sizeof(pre) - off, " %d", data[i]);
+            }
+            LLAMA_LOG_WARN("DS4P-RSPRE ntok=%u n_rs=%lld pre=%s\n",
+                           ubatch ? ubatch->n_tokens : 0u, (long long) n_rs, pre);
+        }
+
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
+        }
+
+        // ★ DS4P_RSPOISON. THE INDUCTION TEST. Overwrites s_copy with a chosen value AFTER the normal
+        // write, on a CLEAN geometry, to turn "derived from observation" into "induced on demand".
+        //   0x3A53A800 = 978561024, the exact value observed leaking in from the compute buffer
+        //   0xDEADBEEF = any other non-row index -- separates "this value" from "any garbage"
+        //   0          = ⚠ THE ARM THAT CARRIES THE CLAIM. Writing 0 over 0 must be a no-op. If it
+        //                corrupts, the fix works through a side effect of set_input running rather than
+        //                through s_copy, and the whole derived mechanism is a coincidence.
+        // Applied from the FIRST batch, so the induced damage must look DIFFERENT from the natural
+        // defect: request 1 should corrupt (the natural one has request 1 clean only because the buffer
+        // is zero on fresh allocation), first divergence at position == ubatch.
+        // Registered before the run in tools/ds4-gates/FINDINGS-paged-cross-request.md.
+        if (const char * pv = getenv("DS4P_RSPOISON")) {
+            const int32_t v = (int32_t) strtol(pv, nullptr, 0);
+            for (int64_t i = 0; i < n_rs; ++i) {
+                data[i] = v;
+            }
         }
     }
     // ⚠ OUTSIDE the `if (s_copy)` guard on purpose. Guarded, this fired once at graph build and zero
