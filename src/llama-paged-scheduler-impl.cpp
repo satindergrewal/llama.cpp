@@ -816,6 +816,62 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         const int32_t new_tokens     = chunk_tokens[seq_id];
         const bool    mid_prefill    = is_prefill && (n_prefill_done + new_tokens < (int32_t) group->n_prompt);
 
+        // ★★ KV CONTENT CHECKSUM at a FIXED lifecycle point: the LAST prefill chunk.
+        //
+        // Every measurement in this investigation has been BOOKKEEPING -- slot coverage, block
+        // accounting, freelist order, mirror sizes, prompt_n. All of them agree between a passing
+        // request 1 and a corrupted request 2. None of them looked at the bytes in the cache.
+        //
+        // debug_seq_kv_checksum reads back THROUGH the group's block table, i.e. resolves each token
+        // the way the kernel does -- so a mismatch means the values attention would actually see
+        // differ, not merely that some buffer differs.
+        //
+        // ⚠ The stage predicate is the SCHEDULER'S OWN (is_prefill && !mid_prefill), not a hand-rolled
+        // "have we finished prefill" of mine. A private predicate could disagree with the scheduler's
+        // and the disagreement would surface as a checksum mismatch I would then debug as a defect.
+        if (getenv("DS4P_KVSUM") && is_prefill && !mid_prefill && kv_cache_manager != nullptr) {
+            static int32_t kvsum_seq = 0;
+            // ★ BISECT ON N. The checksum takes n_tokens, so sweeping it locates WHERE the two
+            // runs start to diverge -- the first positional handle this defect has offered.
+            //
+            // The coarse default bracketed the earliest damage to (512, 1024] on a triggering prompt
+            // and to (7168, np] on a clean one. Pinning it further needs points INSIDE that bracket,
+            // so the list is settable: DS4P_KVSUM_NS="600,700,800,900,1000". np is always appended.
+            ++kvsum_seq;
+            const int32_t np = (int32_t) group->n_prompt;
+            std::vector<int32_t> Ns;
+            if (const char * s = getenv("DS4P_KVSUM_NS")) {
+                for (const char * p = s; *p; ) {
+                    const int v = atoi(p);
+                    if (v > 0) { Ns.push_back(v); }
+                    while (*p && *p != ',') { ++p; }
+                    if (*p == ',') { ++p; }
+                }
+            }
+            if (Ns.empty()) {
+                Ns = { 256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 7168 };
+            }
+            Ns.push_back(np);
+            // ⚠ ALL LAYERS, NOT ONE. This printed sv[3] alone, so every positional claim it produced was
+            // a claim about LAYER 3. A layer outside the sample could diverge earlier and invert the
+            // causal story -- chunk 2 would be READING corrupt K/V rather than being the first thing to
+            // break. DS4P_KVSUM_LAYERS raises the sample; the line now carries every layer it read.
+            const int32_t nlmax = getenv("DS4P_KVSUM_LAYERS") ? atoi(getenv("DS4P_KVSUM_LAYERS")) : 8;
+            std::vector<double> sv((size_t) std::max(1, nlmax), 0.0);
+            for (size_t i = 0; i < Ns.size(); ++i) {
+                const int32_t n = Ns[i] > np ? np : Ns[i];
+                std::fill(sv.begin(), sv.end(), 0.0);
+                const int32_t nl = kv_cache_manager->debug_seq_kv_checksum(*group, n, sv.data(), nlmax);
+                std::string acc;
+                for (int32_t l = 0; l < nl; ++l) {
+                    char b[64];
+                    snprintf(b, sizeof(b), " L%d=%.10g", l, sv[l]);
+                    acc += b;
+                }
+                LLAMA_LOG_WARN("DS4P-KVSUM req#%d N=%d layers=%d%s\n", kvsum_seq, n, nl, acc.c_str());
+            }
+        }
+
         if (is_prefill) {
             GGML_ASSERT(group->logical_seq.size() >= (size_t) (n_prefill_done + new_tokens) && "logical_seq too small for prefill");
         } else {
@@ -873,6 +929,25 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         curr_info.batch_lens[seq_id]      = new_tokens;
         curr_info.prefill_pending[seq_id] = mid_prefill ? 1 : 0;
         curr_info.seq_ids[seq_id]         = group->request_id;
+
+        // ★ CHUNK LEDGER. The damage lands on the FIRST token of the SECOND prefill chunk, at position
+        // == ubatch exactly (measured at ub=512 -> 512 and ub=400 -> 400, with a clean control at 432
+        // showing nothing in that range). So the quantities that decide where that token is written are
+        // the ones to compare between a request that answers correctly and the poisoned one after it:
+        // n_past entering the chunk, the resolved write slot of its first and last token, the group's
+        // own block-table length, and the STRIDE the consumer will index with.
+        //
+        // ⚠ Both requests are logged, not just the failing one -- request 1 is the only baseline that
+        // says what these values SHOULD be, and an error-only probe cannot produce it.
+        if (getenv("DS4P_CHUNKLOG")) {
+            LLAMA_LOG_WARN("DS4P-CHUNK rid=%d prefill=%d mid=%d n_past=%u new=%d "
+                           "slot_first=%d slot_last=%d bt_len=%d stride=%d\n",
+                           group->request_id, is_prefill ? 1 : 0, mid_prefill ? 1 : 0,
+                           group->n_past, new_tokens,
+                           curr_info.write_slots[token_offset],
+                           curr_info.write_slots[token_offset + new_tokens - 1],
+                           curr_block_table_size, max_blocks);
+        }
         token_offset += new_tokens;
     }
 }

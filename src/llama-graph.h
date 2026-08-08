@@ -816,6 +816,17 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        // ⚠ DS4P_NO_GRAPH_REUSE: kill switch for the paged cross-request defect investigation.
+        // The corruption appears on the FIRST cache-READING batch after a batch with an oversized
+        // final prefill chunk, with byte-identical scheduler bookkeeping on both sides. A stale graph
+        // input surviving a shape change is the remaining shape that fits. Turning reuse off entirely
+        // is the one-factor test: corruption gone => the defect lives in reuse; corruption unchanged
+        // => reuse is exonerated and the investigation moves on. Default is unchanged behaviour.
+        static const bool ds4p_no_reuse = getenv("DS4P_NO_GRAPH_REUSE") != nullptr;
+        if (ds4p_no_reuse) {
+            return false;
+        }
+
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
