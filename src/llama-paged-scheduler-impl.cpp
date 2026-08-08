@@ -816,6 +816,44 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         const int32_t new_tokens     = chunk_tokens[seq_id];
         const bool    mid_prefill    = is_prefill && (n_prefill_done + new_tokens < (int32_t) group->n_prompt);
 
+        // ★ PREFILL PROGRESS. The static path prints `prompt processing, n_tokens = N, progress = ...`
+        // every chunk; the paged path printed ONE allocation line and then nothing until the request
+        // completed. On a 17-minute 225k prefill a working run and a hung one are the same picture, and
+        // this lane has already killed TWO healthy 40-minute runs over exactly that ambiguity.
+        //
+        // ⚠ RATE-LIMITED TO 5% CROSSINGS, not per chunk. At -ub 128 a 1M prompt is ~8,000 chunks, and
+        // this lane has one 15 MB/s log-storm on file (`Scheduler status` at INFO, 898 MB/min) that
+        // landed on the PAGED arm only -- which would have shown paging losing on speed for a reason
+        // that was not paging. Stateless bucket compare, so no per-group field to keep in sync.
+        //
+        // ⚠ The final chunk always prints, so a run always ends on 1.00 rather than on whatever bucket
+        // it happened to cross last. A progress line that stops at 0.95 reads as a stall.
+        //
+        // ⚠ Skipped entirely when the prompt fits in one chunk: nothing to watch, and it would fire on
+        // every single-token decode step. Note this loop runs only for real scheduled requests, so it
+        // cannot report progress for llama-server's ~21 startup graph builds -- the trap that made an
+        // earlier gate score 630 "fallbacks" for work that had not happened yet.
+        if (is_prefill && group->n_prompt > (uint32_t) new_tokens) {
+            const int32_t done_after  = n_prefill_done + new_tokens;
+            const int     bucket_pre  = (int) ((int64_t) n_prefill_done * 20 / (int64_t) group->n_prompt);
+            const int     bucket_post = (int) ((int64_t) done_after     * 20 / (int64_t) group->n_prompt);
+            // ⚠ rid IS LOAD-BEARING AT -np > 1. Two concurrent prefills interleave into one sawtooth
+            // (0.35 -> 0.10 -> 0.40) that reads exactly like the stall this line exists to rule out.
+            if (bucket_post != bucket_pre || !mid_prefill) {
+                // ⚠⚠ WARN, NOT INFO, AND THAT IS THE WHOLE POINT OF THE LINE.
+                // Written at LLAMA_LOG_INFO first. MEASURED: 20 correct lines at `-lv 5`, and
+                // **ZERO at the server's default verbosity 3** -- libllama INFO does not reach a
+                // normal user's console. An instrument whose entire purpose is that someone watching
+                // a 17-minute prefill can tell running from hung, visible only to whoever already
+                // knows to pass `-lv 5`, is the same defect one level up: correct producer, no reader.
+                // The static path's equivalent is the server's own SLT_INF, which IS visible by
+                // default; WARN is what buys parity of visibility from inside libllama.
+                LLAMA_LOG_WARN("%s: paged: rid=%d prompt processing, n_tokens = %d / %u, progress = %.2f\n",
+                               __func__, group->request_id, done_after, group->n_prompt,
+                               (double) done_after / (double) group->n_prompt);
+            }
+        }
+
         // ★★ KV CONTENT CHECKSUM at a FIXED lifecycle point: the LAST prefill chunk.
         //
         // Every measurement in this investigation has been BOOKKEEPING -- slot coverage, block
