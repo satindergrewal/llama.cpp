@@ -1406,6 +1406,13 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
                     "budget. CLAMPING to n_ctx=%u (--paged-pool-clamp).\n",
                     __func__, params.n_ctx, n_gpu_blocks, n_gpu_blocks_vram, fit_ctx);
             n_gpu_blocks = n_gpu_blocks_vram;
+            // ⚠ CLAMP THE CONTEXT, NOT ONLY THE POOL. `fit_ctx` used to be computed purely to print,
+            // so the message said "CLAMPING to n_ctx=480768" while the server went on to advertise
+            // n_ctx=524288 backed by a pool sized for 480768 -- a request between the two numbers is
+            // accepted and has nowhere to live. Measured 2026-08-09 the first time the flag was
+            // reachable from the command line: the branch had never run, because arg.cpp registered
+            // no parser entry for --paged-pool-clamp while the error message advertised it.
+            params.n_ctx = (int32_t) fit_ctx;
         } else {
             LOG_ERR("%s: requested n_ctx=%d x %u seq needs %u KV blocks (%.1f GiB), but the "
                     "memory budget allows %u (%.1f GiB).\n"

@@ -1691,6 +1691,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_PAGED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
+        {"--paged-pool-clamp"},
+        "shrink n_ctx to the largest context the paged KV pool can fit, instead of refusing to start "
+        "(default: disabled -- an unfittable request is an error, not a silent downgrade)",
+        [](common_params & params) {
+            params.paged_pool_clamp = true;
+        }
+    ).set_env("LLAMA_ARG_PAGED_POOL_CLAMP").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
         {"-ncpub", "--n-cpu-blocks"}, "N",
         "number of physical CPU blocks for paged KV cache (default: 1)",
         [](common_params & params, int value) {
