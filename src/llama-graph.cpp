@@ -33,6 +33,7 @@ uint64_t ds4p_paged_consumer_count() { return g_ds4p_paged_consumers.load(std::m
 #include <cstdlib>
 #include <cassert>
 #include <cmath>
+#include <typeinfo>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -1334,14 +1335,27 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     // input is shared by many architectures, so changing its CREATION is the riskier edit;
     // skipping the set for a tensor nothing consumed is both correct and narrow -- there is
     // genuinely nothing to write. Guarded on the allocator's own signal, not on an arch or a flag.
-    if (inp_attn->self_k_idxs == nullptr || inp_attn->self_k_idxs->buffer == nullptr) {
+    //
+    // ⚠⚠ THIS GUARD USED TO `return`, AND THE RETURN TOOK THE RECURRENT INPUT WITH IT.
+    // The condition is about the ATTENTION inputs being unconsumed. The recurrent block further down
+    // (`inp_rs->s_copy`) has nothing to do with attention, and skipping it means `s_copy` is written
+    // once at graph construction -- on the 2-token warmup batch -- and never refreshed for any real
+    // batch under paging. Measured: `set_inputs` runs 31 times for 31 serving batches, this function is
+    // in the list every time, and the recurrent write executed exactly ONCE.
+    //
+    // On a hybrid arch that is 24 of 32 layers carrying state through indices nobody updates. Same class
+    // as the prompt-mirror defect and finding 5 in this repo: A GUARD WRITTEN FOR A SILENTLY DISABLES B.
+    //
+    // Fixed by skipping only the attention writes. The `skip_attn` path is the original intent.
+    const bool skip_attn = (inp_attn->self_k_idxs == nullptr || inp_attn->self_k_idxs->buffer == nullptr);
+    if (skip_attn) {
         static bool said = false;
         if (!said) { said = true;
             LLAMA_LOG_INFO("%s: static attn inputs unconsumed (all attention layers took the paged "
-                           "path) -- skipping their set_input\n", __func__);
+                           "path) -- skipping their set_input, but NOT the recurrent input\n", __func__);
         }
-        return;
     }
+    if (!skip_attn) {
 
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
@@ -1354,6 +1368,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     if (inp_attn->self_v_rot) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+    }
+
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1620,6 +1636,26 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    // ★ DS4P_INPLOG. The recurrent input's set_input fires ONCE at graph build and never during paged
+    // serving, while qwen35 constructs it and this loop has no filter. Two explanations, different files:
+    //   (a) the paged graph does not CARRY that input  -> the list here is short
+    //   (b) this call site is never REACHED per batch  -> this line does not print per batch
+    // A line count on set_input cannot separate them. Counting the calls and the list length can.
+    if (getenv("DS4P_INPLOG")) {
+        static uint64_t n_calls = 0;
+        ++n_calls;
+        // ⚠ NAME the inputs, do not just count them. The count already showed the recurrent input is
+        // absent during paged serving (5 inputs per batch, none of them the hybrid memory input). Which
+        // classes ARE in that list is what says whether anything sets the recurrent half at all.
+        std::string names;
+        for (const auto & input : inputs) {
+            names += " ";
+            names += typeid(*input).name();
+        }
+        LLAMA_LOG_WARN("DS4P-INP call=%llu n_inputs=%zu ntok=%u types=%s\n",
+                       (unsigned long long) n_calls, inputs.size(),
+                       ubatch ? ubatch->n_tokens : 0u, names.c_str());
+    }
     for (auto & input : inputs) {
         input->set_input(ubatch);
     }
