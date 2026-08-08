@@ -1948,8 +1948,22 @@ private:
         // Cleared at LAUNCH rather than at teardown: launch always runs for a new request; the paged
         // release block does not (a probe there fired zero times). See
         // tools/ds4-gates/FINDINGS-paged-cross-request.md.
+        //
+        // ⚠ `slot.prompt.clear()` clears the MIRROR ONLY. It leaves the CONTEXT's memory module holding
+        // the previous request's last position, and that ledger is what `llama-batch.cpp` validates a new
+        // batch against. Measured consequence, three ordinary requests on a clean prompt:
+        //
+        //   long, short, long ->  init: inconsistent sequence positions, X = 7949, Y = 0
+        //                         decode: failed to initialize batch -> HTTP 500 "paged decode failed"
+        //   one more long     ->  GGML_ASSERT(remaining_prompt > 0) in the chunker: the group believes
+        //                         its whole prompt is already prefilled, so the candidate has nothing to
+        //                         do and the scheduler aborts the process.
+        //
+        // `prompt_clear()` does `mem.seq_rm(id, -1, -1)` FIRST and then clears the mirror, which is both
+        // halves. This is the two-ledgers class again: the paged manager's bookkeeping and the context's
+        // memory module are separate, and only one of them was being maintained.
         if (params_base.kv_paged) {
-            slot.prompt.clear();
+            slot.prompt_clear();
         }
 
         // process per-request lora adapters
