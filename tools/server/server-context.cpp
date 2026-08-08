@@ -1856,10 +1856,22 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                const size_t mirror_before_save = ret->prompt.tokens.size();
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                const bool loaded = ret->prompt_load(*prompt_cache, task.tokens);
+                if (!loaded) {
                     ret->prompt_clear();
+                }
+                // ★ PROBE the cross-request carrier. cache_prompt is NOT in this gate, so every
+                // completion save/loads regardless of what the client asked for. On the paged path
+                // the blocks were freed at finish, so a restored prefix describes KV that no longer
+                // exists. Printing both sides before touching anything.
+                if (getenv("DS4P_MIRROR_PROBE")) {
+                    SRV_WRN("DS4P-CACHE slot=%d mirror_before_save=%zu loaded=%d "
+                            "mirror_after_load=%zu task_n=%zu cache_prompt=%d\n",
+                            ret->id, mirror_before_save, (int) loaded, ret->prompt.tokens.size(),
+                            task.tokens.size(), (int) task.params.cache_prompt);
                 }
 
                 prompt_cache->update();
@@ -1917,6 +1929,29 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // ★★ THE MIRROR MUST NOT OUTLIVE THE POOL IT DESCRIBES.
+        //
+        // On the paged path the scheduler frees a request's blocks at finish, but NOTHING clears
+        // slot.prompt.tokens -- there is no writer at all on the paged teardown path. The defect is
+        // an OMISSION, not a bad line, which is why four nominated suspects each fitted and each was
+        // refuted. Enumerating every mirror writer and tracing which ones fire found it in one run:
+        //
+        //   MIRRW-pmax_trim  size=7443 -> 7442   end of request 1
+        //   MIRRW-wayin_trim size=7426 -> 512    start of request 2   <- previous prompt, still there
+        //   (no clear, no release, no cache load fires between them)
+        //
+        // The next request's first batch then sees have=7426 > ctx_len=512, takes
+        // `keep_first(ctx_len)`, ends with want==have==512 and appends NOTHING -- so positions 0-511
+        // are never written to a pool that was freed, and the model attends over unpopulated KV.
+        // Result: request 1 correct, every later request byte-identical garbage, at 8k/50k/225k/512k.
+        //
+        // Cleared at LAUNCH rather than at teardown: launch always runs for a new request; the paged
+        // release block does not (a probe there fired zero times). See
+        // tools/ds4-gates/FINDINGS-paged-cross-request.md.
+        if (params_base.kv_paged) {
+            slot.prompt.clear();
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -3053,6 +3088,34 @@ private:
             } catch (const std::exception & e) {
                 SLT_ERR(*slot, "got exception: %s\n", e.what());
                 send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                // ★★ THE MIRROR MUST NOT OUTLIVE THE POOL IT DESCRIBES.
+                //
+                // The paged scheduler calls free_blocks() when a request finishes, but
+                // slot.prompt.tokens survived. The NEXT request's first batch then found
+                // have=7426 (the previous prompt) against ctx_len=512, took the
+                // `have > ctx_len -> keep_first(ctx_len)` branch, and ended with want==have==512 --
+                // so it appended NOTHING and believed it already held the first ubatch.
+                // The pool had been freed, so positions 0-511 were never written and the model
+                // attended over unpopulated KV.
+                //
+                // MEASURED, every term:
+                //   req 1 first batch: have=0     ctx_len=512 want=512  -> appends 512, correct
+                //   req 2 first batch: have=7426  ctx_len=512 want=512  -> TRIMS, appends nothing
+                //   req 1 FOUND · req 2+ byte-identical garbage, at 8k / 50k / 225k / 512k
+                //
+                // This is the cross-request defect recorded in FINDINGS-paged-cross-request.md
+                // ("first-request-correct, all-later-requests-wrong"). Every paged bookkeeping
+                // invariant passes because each ledger is internally consistent; the mirror and the
+                // pool simply describe different worlds after the first request.
+                //
+                // ⚠ Clearing unconditionally on the paged path: prefix reuse across requests needs
+                // the pool to survive, and it does not. Anything cheaper is a cache hit against
+                // freed blocks.
+                if (getenv("DS4P_MIRROR_PROBE")) {
+                    SRV_WRN("MIRRW-release slot=%d size=%zu\n",
+                            slot->id, slot->prompt.tokens.size());
+                }
+                slot->prompt.tokens.clear();
                 slot->release();
             }
         }
@@ -3280,11 +3343,27 @@ private:
             if (ms == nullptr || ms->task == nullptr) { continue; }
 
             const int32_t ctx_len   = info->context_lens ? info->context_lens[i] : 0;
+            // ★ MIRROR PROBE. slot.prompt.tokens is the SERVER's mirror of what the paged POOL
+            // holds. The comment at :3126 records that --kv-paged leaves it EMPTY, so every request
+            // after the first rebuilds against a mirror that does not match the pool -- the
+            // two-ledger shape. This prints both sides per request so the divergence is measured
+            // rather than inferred from a code comment.
+            if (getenv("DS4P_MIRROR_PROBE")) {
+                SRV_WRN("DS4P-MIRROR rid=%d task_n=%d mirror_size=%zu n_past=%u\n",
+                        ms->id, (int) ms->task->n_tokens(), ms->prompt.tokens.size(),
+                        (unsigned) ms->prompt.n_tokens());
+            }
             const int32_t n_prompt  = (int32_t) ms->task->n_tokens();
             const int32_t want      = std::min(ctx_len, n_prompt);   // prompt portion only
             const int32_t have      = (int32_t) ms->prompt.tokens.size();
 
+            if (getenv("DS4P_MIRROR_PROBE")) {
+                SRV_WRN("DS4P-WAYIN rid=%d have=%d ctx_len=%d want=%d n_prompt=%d %s\n",
+                        ms->id, have, ctx_len, want, n_prompt,
+                        have > ctx_len ? "-> keep_first(ctx_len) TRIMS" : "");
+            }
             if (have > ctx_len) {
+                if (getenv("DS4P_MIRROR_PROBE")) SRV_WRN("MIRRW-wayin_trim size=%zu -> %d\n", ms->prompt.tokens.size(), ctx_len);
                 ms->prompt.tokens.keep_first((size_t) ctx_len);      // replay rewound us
             } else if (want > have) {
                 llama_tokens add;
@@ -3483,7 +3562,16 @@ private:
                     // them. Trim, do not loosen the guard.
                     const llama_pos pmax =
                         llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                    // ⚠ MEASURE pmax, DO NOT DERIVE IT. The mirror ends a paged request at 7426 and
+                    // starts the next at 512, which implies pmax=511 by keep_first arithmetic --
+                    // an inference, and deriving a value from an outcome is how the headroom
+                    // hypothesis went wrong earlier today.
+                    if (getenv("DS4P_MIRROR_PROBE")) {
+                        SRV_WRN("DS4P-TRIM rid=%d pmax=%d mirror_before=%zu -> keep_first(%d)\n",
+                                slot->id, (int) pmax, slot->prompt.tokens.size(), (int) (pmax + 1));
+                    }
                     if (pmax >= 0 && (llama_pos) slot->prompt.tokens.size() > pmax + 1) {
+                        if (getenv("DS4P_MIRROR_PROBE")) SRV_WRN("MIRRW-pmax_trim size=%zu -> %d\n", slot->prompt.tokens.size(), (int)(pmax+1));
                         slot->prompt.tokens.keep_first((size_t) (pmax + 1));
                     }
                     if (slot->prompt_save(*prompt_cache)) {
