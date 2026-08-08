@@ -497,6 +497,21 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
 
             cur = ggml_reshape_2d(ctx0, cur_p, cur_p->ne[0]*cur_p->ne[1], cur_p->ne[2]);
             ggml_build_forward_expand(gf, cur);
+            // ★ THE PRESENCE MARKER, MISSING UNTIL 2026-08-09 -- AND ITS ABSENCE READS AS A DEFECT.
+            // This file is the ONLY one that reaches paged attention by calling ggml_paged_attn_banded
+            // directly, rather than through build_attn_paged_or_null (banded funnel) or
+            // build_attn_inp_kv_auto. Both of those emit DS4P-CONSUME; this third route emitted
+            // nothing, so `arch_serve_gate` would have reported `DS4P-CONSUME banded=0 auto=0` and
+            // VOIDed Inkling with "no graph consumed the paged context".
+            //
+            // ⚠⚠ THAT IS THE EXACT READING THAT MEANT A REAL DEFECT ON qwen35moe THE SAME DAY -- pool
+            // allocated, zero consume, every layer static. Here the identical output would be FALSE:
+            // this path pages correctly. A marker that does not cover every funnel turns a working
+            // architecture and a broken one into the same log line, and finding 5 exists because
+            // proving presence from an absence is not proof.
+            LLAMA_LOG_DEBUG("%s: DS4P-CONSUME banded layer %d\n", __func__, il);
+            ds4p_note_paged_consumer();
+
             cb(cur, "kqv_out_paged", il);
 
             auto * v_rot_p = is_swa ? inp_attn->self_v_rot_swa : inp_attn->self_v_rot;
