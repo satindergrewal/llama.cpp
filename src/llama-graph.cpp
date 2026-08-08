@@ -341,6 +341,30 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// ★ DS4P_RSLOG helper. s_copy says which cell each sequence's recurrent state is taken FROM, so it IS
+// the chunk-to-chunk handoff -- and the paged corruption lands on the first token of chunk 2, exactly
+// where that handoff happens. A between-request seq_rm can never test this.
+//
+// ⚠ Called from EVERY set_input that writes s_copy. The first version of this probe went into
+// llm_graph_input_rs::set_input only and fired ZERO times on a hybrid model: that class is not the one
+// this model uses. Silence from an instrument in the wrong place reads exactly like a clean result.
+static void ds4p_rslog(const char * who, const int32_t * data, int64_t n_rs, uint32_t head, uint32_t ntok) {
+    if (!getenv("DS4P_RSLOG")) {
+        return;
+    }
+    char acc[96] = {0};
+    int  off = 0;
+    if (!data) {
+        snprintf(acc, sizeof(acc), " <null>");
+        n_rs = 0;
+    }
+    for (int64_t i = 0; i < n_rs && i < 6 && off + 12 < (int) sizeof(acc); ++i) {
+        off += snprintf(acc + off, sizeof(acc) - off, " %d", data[i]);
+    }
+    LLAMA_LOG_WARN("DS4P-RS who=%s ntok=%u n_rs=%lld head=%u s_copy=%s\n",
+                   who, ntok, (long long) n_rs, head, acc);
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -354,6 +378,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
         }
+
+        ds4p_rslog("rs", data, n_rs, mctx->get_head(), ubatch ? ubatch->n_tokens : 0u);
     }
 }
 
@@ -1341,6 +1367,14 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+    // ⚠ OUTSIDE the `if (s_copy)` guard on purpose. Guarded, this fired once at graph build and zero
+    // times across 32 serving batches -- which reads identically as "the tensor is absent" and "the
+    // input is never re-set". Those are different bugs in different files. Reporting s_copy=<null> is
+    // what separates them.
+    ds4p_rslog("hybrid", inp_rs->s_copy ? (const int32_t *) inp_rs->s_copy->data : nullptr,
+               inp_rs->s_copy ? n_rs : 0, mctx->get_recr()->get_head(),
+               ubatch ? ubatch->n_tokens : 0u);
+
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1384,6 +1418,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
+        ds4p_rslog("hybrid_k", data, n_rs, mctx->get_recr()->get_head(), ubatch ? ubatch->n_tokens : 0u);
     }
 }
 
@@ -1458,6 +1493,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
+        ds4p_rslog("hybrid_iswa", data, n_rs, mctx->get_recr()->get_head(), ubatch ? ubatch->n_tokens : 0u);
     }
 }
 
