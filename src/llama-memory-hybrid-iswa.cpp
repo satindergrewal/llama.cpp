@@ -153,6 +153,14 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
         auto ctx = std::make_unique<llama_memory_hybrid_iswa_context>(
                 this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
 
+        // ⚠ DS4P-SET, EMITTED HERE TOO. `build_attn_paged_or_null`'s static-path warning tells the
+        // reader to "compare against DS4P-SET" -- and on 2026-08-10 that value existed in NO log:
+        // 110 and 210 mentions across two logs, every one inside the warning's own text. The first
+        // fix instrumented ONE of the FOUR set sites, so on any arch routed through a different
+        // funnel the annotation would STILL point at nothing. **Correct producer, no consumer,
+        // inside the fix for correct-producer-no-consumer.** All four now emit it.
+        LLAMA_LOG_DEBUG("%s: DS4P-SET attn paged ctx=%p on hybrid_iswa ctx=%p\n", __func__,
+                        (const void *) paged_ctx.get(), (const void *) ctx.get());
         if (paged_ctx) {
             ctx->set_attn_paged_ctx(std::move(paged_ctx));
         }
