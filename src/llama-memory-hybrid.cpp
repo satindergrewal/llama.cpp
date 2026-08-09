@@ -192,21 +192,33 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         auto ctx = std::make_unique<llama_memory_hybrid_context>(
                 this, std::move(heads_attn), std::move(ubatches));
 
+        // ⚠⚠ EMIT THE VALUE THE FALLBACK WARNING TELLS YOU TO COMPARE AGAINST.
+        // `build_attn_paged_or_null`'s static-path warning says, verbatim:
+        //     "compare against DS4P-SET: same pointer = the wrapper set it and the consumer
+        //      still sees null; different = the graph holds a stale context"
+        // Measured 2026-08-10 across two logs: **110 and 210 mentions of DS4P-SET, and ZERO
+        // independent set-value lines.** Every occurrence was inside the warning's own text.
+        // **The instruction pointed at a number no log has ever printed** -- an annotation
+        // referring to itself, which is worse than none, because a reader spends time hunting
+        // for the counterpart. (measured by Grok, verified here before the fix)
+        //
+        // DEBUG level: costs nothing at the -lv 4 the gates run, and appears at the -lv 5
+        // anyone reaches for when they are actually debugging this.
+        //
+        // ⚠⚠⚠ AND THIS LINE USED TO SIT INSIDE `if (paged_ctx)`, WHICH IS THE SAME CLASS THE FIX
+        // WAS FOR -- THIRD TIME IN THIS LINEAGE. A marker that prints ONLY ON SUCCESS cannot answer
+        // the question it was added to answer. With it inside the guard, a NULL paged_ctx produces
+        // SILENCE, and silence here is indistinguishable from:
+        //     (a) mem_attn_paged was null / has_paged_batch_info() was false -- nothing to set, or
+        //     (b) this funnel was never entered at all.
+        // Those are different defects with different fixes, and the reader following the warning's
+        // instruction gets the same evidence for both: nothing. The other three set sites print
+        // unconditionally, so the funnel with the guard was ALSO the only one that disagreed with
+        // its siblings. **Instrument both arms** -- print the null, because `ctx=0x0` is a positive
+        // statement and an absent line is not.
+        LLAMA_LOG_DEBUG("%s: DS4P-SET attn paged ctx=%p on hybrid ctx=%p\n",
+                        __func__, (const void *) paged_ctx.get(), (const void *) ctx.get());
         if (paged_ctx) {
-            // ⚠⚠ EMIT THE VALUE THE FALLBACK WARNING TELLS YOU TO COMPARE AGAINST.
-            // `build_attn_paged_or_null`'s static-path warning says, verbatim:
-            //     "compare against DS4P-SET: same pointer = the wrapper set it and the consumer
-            //      still sees null; different = the graph holds a stale context"
-            // Measured 2026-08-10 across two logs: **110 and 210 mentions of DS4P-SET, and ZERO
-            // independent set-value lines.** Every occurrence was inside the warning's own text.
-            // **The instruction pointed at a number no log has ever printed** -- an annotation
-            // referring to itself, which is worse than none, because a reader spends time hunting
-            // for the counterpart. (measured by Grok, verified here before the fix)
-            //
-            // DEBUG level: costs nothing at the -lv 4 the gates run, and appears at the -lv 5
-            // anyone reaches for when they are actually debugging this.
-            LLAMA_LOG_DEBUG("%s: DS4P-SET attn paged ctx=%p on hybrid ctx=%p\n",
-                            __func__, (const void *) paged_ctx.get(), (const void *) ctx.get());
             ctx->set_attn_paged_ctx(std::move(paged_ctx));
         }
 
