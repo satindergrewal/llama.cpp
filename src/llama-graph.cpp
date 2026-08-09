@@ -4456,28 +4456,29 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
         return false;
     }
 
-    // ⚠⚠ SLIDING-WINDOW LAYERS ARE NOT REPRESENTABLE ON THIS PATH, AND NOTHING USED TO SAY SO.
-    // MEASURED 2026-08-09: `grep -rn "visibility_window|swa_window|n_swa"` across every paged/banded
-    // call site returns ZERO hits. `ggml_paged_attn_banded` has no window parameter. Every arch
-    // verified through this funnel is FULL-CAUSAL -- qwen35.cpp states it: "Ornith's attention layers
-    // are full-causal: visibility_window 0, no rel bias."
+    // ⚠⚠ A BLANKET `is_swa` REJECTION LIVED HERE FOR ONE COMMIT (cbb4c8d93) AND WAS WRONG.
     //
-    // ⇒ Before this check, a windowed layer reaching here would have been ACCEPTED and then attended
-    //   over the WHOLE context, because the kernel cannot express the window it was supposed to honour.
-    //   The output is plausible text and silently wrong -- and it PASSES a needle gate, since a needle
-    //   is easier to find with more visibility, not harder. **A capability contract that does not
-    //   mention a capability does not check it.**
+    // Its stated reason was: "the paged kernel has no window parameter and would attend over the
+    // full context", justified by a grep that "returns ZERO hits" for visibility_window / n_swa
+    // across the paged call sites. **Both halves are false, and the code refutes them:**
     //
-    // ⚠ This is what makes the 21 interleaved-SWA architectures (gemma2/3/4, cohere2, phi3, llama4,
-    //   exaone4, plamo3, step35, ...) a KERNEL FEATURE rather than a wiring job: their global layers
-    //   are eligible and their windowed layers are not, so the correct behaviour is a PER-LAYER
-    //   fallback -- which is exactly what this rejection produces. Wiring them without it would have
-    //   shipped silent corruption on every SWA layer.
-    if (hparams.is_swa(il)) {
-        return reject("layer uses a SLIDING WINDOW; the paged kernel has no window parameter and "
-                      "would attend over the full context (silently wrong, and a needle gate cannot "
-                      "see it) -- falling back to the static path for this layer");
-    }
+    //     ggml/include/ggml.h:2459   visibility_window > 0 selects the analytic band: a cell is
+    //                                visible iff 0 <= rel_dist < visibility_window
+    //     ggml-metal.metal:3317      const int lo = args.visibility_window > 0 ? ...
+    //     src/models/gemma4.cpp:268  build_attn_paged_or_null(..., il,
+    //                                    hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
+    //
+    // The window is a shipped kernel feature and gemma4 was already passing it, per layer. The
+    // rejection sat INSIDE build_attn_paged_or_null, upstream of the point where that argument
+    // reaches the op, so it switched gemma4's SWA layers back to the static path the moment it
+    // landed. Output stayed correct -- it falls back -- which is precisely why nothing caught it:
+    // **a correctness gate cannot see a working feature being silently disabled.** Guard for A
+    // disables B, and the grep that "proved" the absence was the absence-is-not-evidence class.
+    //
+    // ⇒ The real hazard is narrower and is checked at the call site, where the window is in scope:
+    //   a WINDOWED layer paged with visibility_window == 0 attends over the whole context and is
+    //   silently wrong. `paged_layer_supported()` cannot see that argument, so it must not pretend
+    //   to judge it -- see the guard in build_attn_paged_or_null().
 
     ggml_tensor * kv = pctx->get_k(il);
     if (kv == nullptr) {
@@ -4605,6 +4606,49 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
                            "(compare against DS4P-SET: same pointer = the wrapper set it and the "
                            "consumer still sees null; different = the graph holds a stale context)\n",
                            __func__, il, (const void *) mctx);
+        }
+        return nullptr;
+    }
+
+    // ⚠⚠ THE ONE SLIDING-WINDOW HAZARD, CHECKED WHERE THE WINDOW IS ACTUALLY VISIBLE.
+    //
+    // A windowed layer paged with visibility_window == 0 gets the full-causal band: it attends over
+    // the WHOLE context instead of its window. The output is plausible text and silently wrong, and
+    // **a needle gate cannot catch it** -- a needle is easier to find with more visibility, not
+    // harder. So the failure mode is real; it is the blanket `is_swa` reject in
+    // paged_layer_supported() that was wrong, because that function cannot see this argument and
+    // therefore rejected the layers gemma4 was already paging CORRECTLY with a window.
+    //
+    // ⇒ Reject only the actual defect: windowed layer, no window passed. gemma4 (and anything wired
+    //   the same way) passes hparams.n_swa here and is unaffected. An arch wired without it gets a
+    //   loud fallback instead of silent corruption -- which is the protection the 21-arch ISWA
+    //   wiring job needs, without disabling the archs that already did it right.
+    // ⚠⚠ AND THE WINDOW IS NOT ONE SHAPE. `visibility_window` implements a ROLLING window and only
+    // that. Checked against the static mask rather than assumed -- the two boundary conventions
+    // agree exactly, which is why passing n_swa is correct for STANDARD and nothing else:
+    //
+    //   llama-hparams.h:399  STANDARD   masked iff p1 - p0 >= n_swa      -> visible iff rel < n_swa
+    //   ggml-metal.metal:3317 band      lo = q_pos - window + 1          -> visible iff rel < window
+    //
+    //   llama-hparams.h:405  CHUNKED    masked iff p0 < (p1/n_swa)*n_swa -- a BLOCK-ALIGNED chunk
+    //                                   that jumps at chunk boundaries, not a rolling window.
+    //   llama-hparams.h:413  SYMMETRIC  masked iff |p1-p0| > n_swa/2 -- includes FUTURE positions,
+    //                                   so it is not even causal.
+    //
+    // ⇒ Wiring a CHUNKED arch (llama4 is one) with the gemma4 pattern would pass this guard with a
+    //   window > 0 and then attend over a rolling band it was never supposed to have. That is the
+    //   same silent-corruption class this guard exists to stop, one architecture over -- so the
+    //   check is on the TYPE as well as the presence of the argument.
+    if (hparams.is_swa(il) && (visibility_window <= 0 || hparams.swa_type != LLAMA_SWA_TYPE_STANDARD)) {
+        static int last_swa_il = -2;
+        if (il != last_swa_il) {
+            last_swa_il = il;
+            LLAMA_LOG_WARN("%s: layer %d is a SLIDING-WINDOW layer that the paged band cannot serve "
+                           "as configured (visibility_window=%lld, swa_type=%d; the band implements "
+                           "a ROLLING window, i.e. swa_type=%d, only) -- attending over the full "
+                           "context here would be silently wrong, so this layer takes the static "
+                           "path\n", __func__, il, (long long) visibility_window,
+                           (int) hparams.swa_type, (int) LLAMA_SWA_TYPE_STANDARD);
         }
         return nullptr;
     }

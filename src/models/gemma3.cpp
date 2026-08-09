@@ -1,4 +1,6 @@
 #include "models.h"
+#include "../llama-kv-cache-paged.h"
+#include "../llama-kv-cache-iswa.h"
 
 void llama_model_gemma3::load_arch_hparams(llama_model_loader & ml) {
     const bool found_swa = ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
@@ -100,9 +102,28 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
     // using inp_attn_type = std::conditional_t<iswa, llm_graph_input_attn_kv_iswa, llm_graph_input_attn_kv>;
     llm_graph_input_i * inp_attn = nullptr;
 
+    // ★ THE PAGED CONTEXT FOR THE ISWA BRANCH, captured while the input's type is still known.
+    //
+    // ⚠ The ISWA branch was the documented "21 architectures excluded from paging by construction"
+    // gap: build_attn_inp_kv_iswa() contains no reference to paging, so the funnel cannot route to a
+    // paged input the way build_attn_inp_kv_auto() does. That is true and it is NOT the whole story
+    // -- gemma4 has been paging its ISWA layers for some time by reaching PAST the funnel, through
+    // the context the input already holds. Reading the funnel's body and concluding "unwired" was
+    // absence-is-not-evidence; the accessor was right there on the input object.
+    //
+    // Nothing below the graph needed building: llama_kv_cache_iswa owns the pool
+    // (mem_attn_paged), constructs it under DS4P_PAGED_SWA, and exposes get_attn_paged() on its
+    // context. The graph reading it was the only missing piece.
+    const llama_kv_cache_paged_context * pg_ctx = nullptr;
+
     if constexpr (iswa) {
-        inp_attn = build_attn_inp_kv_iswa();
+        auto * inp_iswa = build_attn_inp_kv_iswa();
+        pg_ctx   = inp_iswa->mctx ? inp_iswa->mctx->get_attn_paged() : nullptr;
+        inp_attn = inp_iswa;
     } else {
+        // The auto funnel routes on cparams.kv_paged and returns a paged INPUT, so this branch is
+        // already paged end to end and must not also take the banded path -- that would be two
+        // consumers for one layer.
         inp_attn = build_attn_inp_kv_auto();
     }
 
@@ -153,9 +174,33 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
             // ref: https://github.com/google/gemma_pytorch/blob/014acb7ac4563a5f77c76d7ff98f31b568c16508/gemma/model.py#L315
             Qcur = ggml_scale(ctx0, Qcur, hparams.f_attention_scale);
 
-            cur = build_attn(inp_attn,
-                    model.layers[il].wo, NULL, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
+            // ⚠ PER-LAYER, NOT PER-MODEL. Interleaved SWA means the layers do not share attention
+            // shape: the global layers are full-causal, the windowed ones need the analytic band.
+            // Passing n_swa on a windowed layer is what makes the paged kernel honour the window
+            // (ggml.h: "a cell is visible iff 0 <= rel_dist < visibility_window"); passing 0 there
+            // would attend over the whole context and be silently wrong, which is why
+            // build_attn_paged_or_null now refuses that combination out loud.
+            //
+            // ⚠ The pool is sized to the MAJORITY head geometry, so layers outside it are EXPECTED
+            // to fall back per layer. On this arch a fallback count of ZERO in the paged arm is the
+            // suspicious reading, not a clean one -- it would mean windowed layers are being paged
+            // against a pool that is not their shape, which is the gemma4 headdim accident again.
+            ggml_tensor * cur_pg = nullptr;
+            if constexpr (iswa) {
+                cur_pg = build_attn_paged_or_null(pg_ctx, Qcur, Kcur, Vcur, 1.0f, il,
+                        hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0);
+            }
+            if (cur_pg != nullptr) {
+                // The banded funnel returns the attention core only -- no output projection. The
+                // static build_attn() applies wo/wo_s itself, so the paged branch must do it here
+                // or the residual receives an unprojected tensor.
+                cur = build_lora_mm(model.layers[il].wo, cur_pg, model.layers[il].wo_s);
+                cb(cur, "attn_out_paged", il);
+            } else {
+                cur = build_attn(inp_attn,
+                        model.layers[il].wo, NULL, model.layers[il].wo_s,
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
+            }
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
