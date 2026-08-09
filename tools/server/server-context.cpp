@@ -1572,7 +1572,30 @@ private:
             // without it -- the 2026-08-03 crash witness); own the engine here.
             // Independent of the prompt-cache setting.
             paged_sched = llama_paged_scheduler_init(ctx_tgt);
-            GGML_ASSERT(paged_sched && "failed to init the paged scheduler");
+            // ⚠⚠ A DESIGNED REFUSAL, NOT AN ASSERT. `--kv-paged` is a USER-PASSED FLAG, and on any
+            // architecture whose memory is not paged-capable this line used to fire GGML_ASSERT and
+            // ABORT THE SERVER with a native backtrace. Witnessed 2026-08-10 on DeepSeek-V4-Flash:
+            // `llama_kv_cache_dsv4` is a composite memory with four sub-caches and is not a paged
+            // type, so the scheduler correctly returned null -- and the process died.
+            //
+            // The scheduler has ALREADY logged the specific reason (which memory type it found, and
+            // what would be needed) immediately above. An assert on top of a good diagnostic
+            // replaces it with a stack trace: the useful line scrolls past and the user reports a
+            // crash instead of an unsupported combination.
+            //
+            // ⚠ AND THE ALTERNATIVE -- warn and continue unpaged -- IS WORSE, which is why this
+            // refuses instead. This lane spent 2026-08-09 proving that a paged flag which silently
+            // degrades to the static path is indistinguishable from working: 4.5 hours of
+            // "parity" measurements were static-vs-static. **A flag that does nothing is a worse
+            // outcome than a flag that refuses.**
+            if (!paged_sched) {
+                SRV_ERR("%s", "--kv-paged was requested but this model's memory does not support "
+                              "paging (see the error above for the specific type). Refusing to "
+                              "start: continuing without paging would silently ignore the flag and "
+                              "report static numbers as paged. Remove --kv-paged to run this model "
+                              "on the static path.\n");
+                return false;
+            }
             // ⚠ NO on_finish REGISTRATION HERE, DELIBERATELY. I wired one and it was WRONG.
             // on_finish fires for every FINISHED request, normal completions included, and
             // request_id IS the slot id -- which the server REUSES. So the old group for slot 0 can
