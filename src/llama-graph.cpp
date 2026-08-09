@@ -4545,11 +4545,50 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
         const char * e = getenv("DS4P_METAL_CHAMP");
         return e != nullptr && atoi(e) != 0;
     }();
+    // ⚠⚠⚠ n_seq_max IS PART OF THE CHAMPION'S CONTRACT AND WAS MISSING FROM THIS TEST.
+    // MEASURED 2026-08-10, first clean run of the multi-slot x long-context cell: 35B, block 64,
+    // head_dim 256, `-np 2`, two concurrent 40k prompts. The layer was ADMITTED here, the graph was
+    // built on the champion path, and the kernel then hit its own `n_seq != 1` refusal, which is
+    // FATAL by design (see ggml-metal-ops.cpp:5258). The server ABORTED at the first decode:
+    //
+    //     ggml_metal_op_paged_attn: CHAMP-PAGED REFUSED (n_seq!=1) D=256 bs=64 n_seq=2 n_tokens=2
+    //     ...stack: ggml_abort <- ggml_metal_op_paged_attn <- graph_compute <- llama_decode
+    //
+    // ⇒ The abort is CORRECT: a layer admitted under the relaxation cannot legally run on the
+    //   scalar kernel, so falling back would dispatch out of budget and return plausible garbage.
+    //   **The defect is HERE -- the admission test was narrower than the kernel's real precondition,
+    //   so the contract said YES to a configuration the kernel refuses.** Gate shape excluding the
+    //   defect, in the gate itself.
+    //
+    // ⇒ CONSERVATIVE ON PURPOSE: `n_seq_max`, not the ubatch's live `n_seq`. The safety property is
+    //   "admitted-by-champion means served-by-champion or stop", so admission must assume the worst
+    //   the server can present. A server started with `-np 2` may co-batch at any moment; admitting
+    //   on a momentarily-single-sequence ubatch would re-arm exactly this abort later, at a random
+    //   point in a long run rather than at the first decode.
+    //
+    // ⇒ EFFECT of the rejection: at `-np > 1` with bs=64/D=256 the staged-tile bound below is no
+    //   longer relaxed, so the layer refuses the paged path and takes the STATIC path. Correct
+    //   output, no crash, no acceleration -- which is the right trade against aborting a server.
+    //   ⚠ It also means **the champion cannot serve multi-slot at all**, so every parity number in
+    //   this lane is single-slot BY CONSTRUCTION and not merely unmeasured.
     const bool champ_geometry = champ_on && cparams.block_size == 64 &&
+                                cparams.n_seq_max == 1 &&
                                 (head_dim == 64 || head_dim == 96 || head_dim == 128 ||
                                  head_dim == 192 || head_dim == 256);
 
     if (!champ_geometry && (int64_t) cparams.block_size * head_dim > 8192) {
+        // ⚠ NAME THE CONDITION THAT ACTUALLY FIRED. This message used to blame the staged-tile
+        // budget unconditionally, so a `-np 2` server refusing at bs=64/D=256 -- a geometry the
+        // champion serves perfectly at `-np 1` -- would send the reader after head_dim and block
+        // size, neither of which is the problem. A refusal that misnames its own cause costs more
+        // than no refusal, because it is confidently wrong.
+        if (champ_on && cparams.block_size == 64 && cparams.n_seq_max != 1) {
+            return reject("the champion paged kernel requires n_seq_max == 1 and this context has "
+                          "n_seq_max > 1, so the staged-tile relaxation does not apply and this "
+                          "geometry cannot be served (bs=64 x head_dim > 8192). Run with -np 1 to "
+                          "use the champion, or use --kv-block-size 16 to stay inside the scalar "
+                          "kernel's budget at the cost of the champion's speed");
+        }
         return reject("block_size x head_dim exceeds the staged-tile budget "
                       "(need block_size*head_dim <= 8192; e.g. head_dim 512 needs block_size <= 16)");
     }
