@@ -4456,6 +4456,29 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
         return false;
     }
 
+    // ⚠⚠ SLIDING-WINDOW LAYERS ARE NOT REPRESENTABLE ON THIS PATH, AND NOTHING USED TO SAY SO.
+    // MEASURED 2026-08-09: `grep -rn "visibility_window|swa_window|n_swa"` across every paged/banded
+    // call site returns ZERO hits. `ggml_paged_attn_banded` has no window parameter. Every arch
+    // verified through this funnel is FULL-CAUSAL -- qwen35.cpp states it: "Ornith's attention layers
+    // are full-causal: visibility_window 0, no rel bias."
+    //
+    // ⇒ Before this check, a windowed layer reaching here would have been ACCEPTED and then attended
+    //   over the WHOLE context, because the kernel cannot express the window it was supposed to honour.
+    //   The output is plausible text and silently wrong -- and it PASSES a needle gate, since a needle
+    //   is easier to find with more visibility, not harder. **A capability contract that does not
+    //   mention a capability does not check it.**
+    //
+    // ⚠ This is what makes the 21 interleaved-SWA architectures (gemma2/3/4, cohere2, phi3, llama4,
+    //   exaone4, plamo3, step35, ...) a KERNEL FEATURE rather than a wiring job: their global layers
+    //   are eligible and their windowed layers are not, so the correct behaviour is a PER-LAYER
+    //   fallback -- which is exactly what this rejection produces. Wiring them without it would have
+    //   shipped silent corruption on every SWA layer.
+    if (hparams.is_swa(il)) {
+        return reject("layer uses a SLIDING WINDOW; the paged kernel has no window parameter and "
+                      "would attend over the full context (silently wrong, and a needle gate cannot "
+                      "see it) -- falling back to the static path for this layer");
+    }
+
     ggml_tensor * kv = pctx->get_k(il);
     if (kv == nullptr) {
         return reject("no paged KV tensor for this layer (filtered out, or pool smaller than n_layer)");
