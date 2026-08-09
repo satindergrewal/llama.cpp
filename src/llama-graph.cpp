@@ -4560,7 +4560,15 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
     // Goes through the exported wrapper so the graph predicate and the startup refusal cannot
     // disagree about what is supported -- one list, one env read.
     if (!llama_kv_paged_supports_cache_type(kv->type)) {
-        return reject("paged KV cache type not supported by the kernel (f16/bf16/f32, or q8_0 with LLAMA_BANDED_QUANT_KV)");
+        // ⚠ THE MESSAGE NAMED A FLAG THAT NO LONGER EXISTS. LLAMA_BANDED_QUANT_KV was removed when q8_0
+        // passed its end-to-end gate -- the predicate above already returns allow_quant=true. The STRING
+        // was not updated, so the error told the reader to set an env var that does nothing, and reading
+        // it cost me a wrong report on 2026-08-09: I concluded paged quantised KV was unsupported and
+        // said so, when the code has supported q8_0 since the flag was deleted.
+        // ⇒ This file's own header warns that "two lists of the same fact drift the instant one moves".
+        //   The drift here was not between two lists -- it was between the PREDICATE and its own ERROR
+        //   MESSAGE, which is the copy a user actually sees.
+        return reject("paged KV cache type not supported by the kernel (supported: f16, bf16, f32, q8_0)");
     }
 
     return true;
