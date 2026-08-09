@@ -2261,13 +2261,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
         static std::atomic<bool>     ds4p_nc_warned{false};
         const uint64_t n_dec = ds4p_nc_decodes.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n_dec >= 8 && ds4p_paged_consumer_count() == 0 && !ds4p_nc_warned.exchange(true)) {
+            // ⚠⚠ THIS MESSAGE NAMED ONE "known cause", AND ITS ADVICE IS ACTIVELY WRONG IN A CASE IT
+            // DID NOT MENTION. It said: enable the champion with --kv-block-size 64. On 2026-08-10
+            // the multi-slot x long-context cell showed that is EXACTLY the configuration that
+            // cannot serve n_seq > 1 -- at -np 2 the champion refuses every layer, and before
+            // a4e8aeb08 it ABORTED THE PROCESS. **Following this alarm's advice at -np 2 moved you
+            // from "paging does nothing" to "the server dies".**
+            //
+            // A guard that names ONE known cause reads as if that is the ONLY cause. Enumerate them,
+            // and make each remedy say which other one it excludes.
             LLAMA_LOG_WARN("%s: --kv-paged is ON and a paged pool was allocated, but after %llu "
                            "decodes ZERO layers have consumed it -- every layer fell back to the "
                            "static attention path. Paging is doing NOTHING here and the pool is "
-                           "wasted memory. Known cause: the scalar paged kernel does not implement "
-                           "attention sinks, so sink models degrade unless the champion kernel serves "
-                           "them (DS4P_METAL_CHAMP=1 with --kv-block-size 64).\n",
-                           __func__, (unsigned long long) n_dec);
+                           "wasted memory. Known causes, in the order worth checking:\n"
+                           "  1) n_seq_max > 1 (it is %u here) with the CHAMPION geometry: the "
+                           "champion paged kernel is SINGLE-SEQUENCE ONLY, so at -np > 1 every layer "
+                           "at --kv-block-size 64 is refused. Use -np 1 to keep the champion, or "
+                           "--kv-block-size 16 with the champion OFF to page multi-slot on the "
+                           "scalar kernel.\n"
+                           "  2) attention sinks: the SCALAR paged kernel does not implement them, so "
+                           "sink models degrade unless the champion serves them "
+                           "(DS4P_METAL_CHAMP=1 with --kv-block-size 64) -- mutually exclusive with "
+                           "cause 1, so a sink model at -np > 1 cannot page at all today.\n"
+                           "  3) block_size x head_dim > 8192 on the scalar kernel: lower "
+                           "--kv-block-size.\n"
+                           "The per-layer 'paged layer refused:' lines name the exact clause that "
+                           "fired -- read those before acting on this list.\n",
+                           __func__, (unsigned long long) n_dec, (unsigned) cparams.n_seq_max);
         }
     }
 
