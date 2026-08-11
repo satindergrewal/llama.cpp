@@ -5229,9 +5229,17 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         // Both were reasons the work was not done, and neither survived being checked. What DID need
         // fixing first was the dequant branches' addressing -- they used the non-paged formula and
         // were unreachable only behind this refusal.
+        // ⚠ ktype: every champion instantiation is half4 + dequantize_f16_t4 (the template block
+        // in ggml-metal.metal) -- the "5 q8_0 instantiations" the comment above claims were NEVER
+        // ADDED, and the vec pipeline builder bakes ns10 = nb[1]/sizeof(f16). A non-f16 pool
+        // reaching the champion would dequantise raw bytes as halfs at a wrong stride: plausible
+        // garbage, silently. The capability contract refuses this upstream as of 2026-08-11
+        // (audit hole #3, llama-graph.cpp champ_geometry); this entry names it if any new caller
+        // ever reaches here without that gate.
         const char * why  = bs_pa_lpk != 64 ? "bs!=64"
                           : n_seq_c   != 1  ? "n_seq!=1"
                           : !hd_ok          ? "head_dim"
+                          : kv_cache->type != GGML_TYPE_F16 ? "ktype!=f16"
                                             : nullptr;
         if (why) {
             static const char * last_why = nullptr;

@@ -4571,8 +4571,20 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
     //   output, no crash, no acceleration -- which is the right trade against aborting a server.
     //   ⚠ It also means **the champion cannot serve multi-slot at all**, so every parity number in
     //   this lane is single-slot BY CONSTRUCTION and not merely unmeasured.
+    // ⚠⚠⚠ POOL TYPE IS PART OF THE CHAMPION'S CONTRACT AND WAS MISSING FROM THIS TEST -- the THIRD
+    // instance of admission-narrower-than-kernel, and the first found by READING (the contract-vs-
+    // kernel audit, 2026-08-11) instead of by an abort. Every champion instantiation in
+    // ggml-metal.metal is `half4 + dequantize_f16_t4` -- f16 ONLY. The ops.cpp comment that removed
+    // the quantised-KV refusal claimed "5 q8_0 instantiations, one per head dim"; **they were never
+    // added**, so a q8_0/bf16/f32 pool admitted under the champion relaxation resolves the f16
+    // pipeline and dequantises raw bytes as halfs -- plausible garbage, silently, the exact class
+    // the removed refusal existed to stop (and the pipeline builder bakes ns10 = nb[1]/sizeof(f16),
+    // wrong for any other type). Until non-f16 instantiations actually exist, the champion serves
+    // f16 pools only; everything else keeps the scalar path's staged-tile bound and its genuine
+    // multi-type dequant.
     const bool champ_geometry = champ_on && cparams.block_size == 64 &&
                                 cparams.n_seq_max == 1 &&
+                                kv->type == GGML_TYPE_F16 &&
                                 (head_dim == 64 || head_dim == 96 || head_dim == 128 ||
                                  head_dim == 192 || head_dim == 256);
 
@@ -4714,8 +4726,14 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
             return e != nullptr && atoi(e) != 0;
         }();
         const int64_t hd = hparams.n_embd_head_v(il);
+        const ggml_tensor * kv_sink_check = paged_ctx->get_k(il);
+        // pool type f16 is part of the champion contract (audit hole #3, see champ_geometry) --
+        // without it, sinks + q8_0 pool + champion geometry would pass here, get refused by the
+        // kernel on type, fall to the scalar path, and hit the scalar sinks abort this guard exists
+        // to prevent.
         const bool champ_serves = champ_on_sinks && cparams.block_size == 64 &&
                                   cparams.n_seq_max == 1 &&
+                                  kv_sink_check != nullptr && kv_sink_check->type == GGML_TYPE_F16 &&
                                   (hd == 64 || hd == 96 || hd == 128 || hd == 192 || hd == 256);
         if (!champ_serves) {
             static int last_sink_il = -2;
