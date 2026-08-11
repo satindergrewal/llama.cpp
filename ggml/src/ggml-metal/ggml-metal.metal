@@ -12933,6 +12933,10 @@ template [[host_name("kernel_paged_attn_champ_dk96_dv96"  )]] kernel paged_champ
 template [[host_name("kernel_paged_attn_champ_dk128_dv128")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 128, 128>;
 template [[host_name("kernel_paged_attn_champ_dk192_dv192")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 192, 192>;
 template [[host_name("kernel_paged_attn_champ_dk256_dv256")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>;
+// ★ D=512 (DSV4 merged-KV head). smem: 8*(512 + 2*512 + 2*128)*2 = 28,672 B <= 32,768 --
+// fits by the same formula the 10,240 B @ D=128 measurement validated. f16 only; q8_0 at
+// D=512 would need the +16*32*nsg staging term and nsg<=4 -- not instantiated until needed.
+template [[host_name("kernel_paged_attn_champ_dk512_dv512")]] kernel paged_champ_t kernel_paged_attn_champ<FA_TYPES_PAGED, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512>;
 
 // ★ q8_0 INSTANTIATIONS. The template signature is one-for-one with upstream's flash_attn_ext, which
 // instantiates q8_0 fifteen ways; this port instantiated f16 five ways and left the dequant branch
@@ -13758,6 +13762,7 @@ template [[host_name("kernel_paged_champ_vec_dk96_dv96"  )]] kernel paged_champ_
 template [[host_name("kernel_paged_champ_vec_dk128_dv128")]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 128, 128, 4>;
 template [[host_name("kernel_paged_champ_vec_dk192_dv192")]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 192, 192, 4>;
 template [[host_name("kernel_paged_champ_vec_dk256_dv256")]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 256, 256, 4>;
+template [[host_name("kernel_paged_champ_vec_dk512_dv512")]] kernel paged_champ_vec_t kernel_paged_champ_vec<FA_TYPES_PVEC, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 512, 512, 4>;
 
 template<
     typename kd4x4_t,

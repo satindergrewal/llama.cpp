@@ -5239,8 +5239,10 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         // shader COMPILES it (0 program_source errors at pipeline load), so the tile fits. The host
         // lookup was always generic -- it builds the pipeline name from head_dim -- so this
         // whitelist was the only thing keeping the champion off 256-wide models like Gemma4.
+        // 512 admitted 2026-08-12 WITH its contract row (the forward rule from the audit): the
+        // dk512/vec instantiations exist, f16-only, smem 28,672 B by the validated formula.
         const bool hd_ok  = (head_dim == 64 || head_dim == 96 || head_dim == 128 || head_dim == 192 ||
-                             head_dim == 256);
+                             head_dim == 256 || head_dim == 512);
         // ⚠ A QUANTISED CACHE MUST REFUSE HERE, and the reason is not "unimplemented" -- it is that
         // the three stride lines further down divide nb[] by sizeof(ggml_fp16_t). Found by the
         // repo-wide sweep run after the fitter turned out to be the FIFTH site of the same f16
