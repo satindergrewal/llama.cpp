@@ -1710,6 +1710,14 @@ extern "C" {
     LLAMA_API int32_t llama_paged_scheduler_take_terminated(struct llama_paged_scheduler * sched,
                                                             int32_t * out, int32_t max_out);
 
+    // Tell the scheduler a request the CALLER has failed is dead: remove it from its queue and free
+    // its blocks. Without this, a request failed server-side (deadlock verdict, task cancel) keeps
+    // its queue entry and block claims forever and the pool starves -- measured 2026-08-11: after
+    // one capacity termination, a 12-token request against a 64-block pool deadlocked indefinitely.
+    // Returns false if the id is unknown (already finished) -- calling twice is safe.
+    LLAMA_API bool llama_paged_scheduler_abort_request(struct llama_paged_scheduler * sched,
+                                                       int32_t request_id);
+
     // n_accepted is OPTIONAL (nullable), and NEGATIVE ENTRIES ARE A PER-ROW OPT-OUT.
     //   NULL              legacy for every row
     //   n_accepted[i] < 0 legacy for THIS row: advance by batch_lens[i], append exactly ONE token,

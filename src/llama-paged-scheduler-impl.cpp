@@ -370,6 +370,43 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
     }
 }
 
+bool llama_paged_scheduler_impl::abort_request(int32_t request_id) {
+    // Resolve through id_to_group so a REUSED id (the server reuses slot ids) can never abort a
+    // newer request by accident: the map always points at the current owner of the id, and finish()
+    // already guards its erase the same way.
+    auto found = id_to_group.find(request_id);
+    if (found == id_to_group.end()) {
+        return false;   // already finished, or never queued -- calling twice is safe
+    }
+    llama_sequence_group * target = found->second;
+
+    for (llama_sequence_group_list * list : { &running, &swapped, &waiting }) {
+        for (auto it2 = list->begin(); it2 != list->end(); ++it2) {
+            if (it2->get() != target) {
+                continue;
+            }
+            LLAMA_LOG_WARN("%s: request %d aborted by the server -- freeing its blocks and removing "
+                           "it from the queue.\n", __func__, request_id);
+            target->status = llama_sequence_group_status::FINISHED;
+            // finish() frees the blocks, fires on_finish, erases the id mapping, and is idempotent.
+            // NOT pushed to terminated_ids: that channel is how the SCHEDULER tells the SERVER about
+            // capacity kills; here the server is the caller and has already failed the task -- using
+            // the channel would error the slot a second time.
+            finish(*target);
+            list->erase(it2);
+            return true;
+        }
+    }
+
+    // Mapped but in no queue: the group is inside the CURRENT batch's candidate walk. The server's
+    // single-threaded loop calls abort only after prepare_batch has returned, so this indicates a
+    // caller from somewhere new -- refuse rather than mutate a list mid-walk, and say so.
+    LLAMA_LOG_ERROR("%s: request %d is mapped but in no queue (mid-batch?) -- NOT aborted. If a new "
+                    "call site triggered this, it is running concurrently with prepare_batch.\n",
+                    __func__, request_id);
+    return false;
+}
+
 // Try to swap a running sequence out to CPU.
 // if the CPU pool is full, fall back to recomputation by resetting the sequence's decode state
 // and sending it back to the waiting queue.

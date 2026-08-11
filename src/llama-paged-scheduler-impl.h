@@ -47,6 +47,15 @@ class llama_paged_scheduler_impl {
     // does not fit the batch budget.
     bool set_draft(int32_t request_id, const llama_token * draft, int32_t n_draft);
 
+    // ★ SERVER-SIDE ABORT. The server can fail a request the scheduler still considers live --
+    // the DEADLOCK verdict path and task-cancel both release the slot server-side, and until this
+    // existed NOTHING told the scheduler, so the dead request kept its queue entry and its block
+    // claims forever. Measured 2026-08-11: after one designed pool-capacity termination, a 12-token
+    // request against a 64-block pool re-deadlocked indefinitely ("2 waiting"). Removes the request
+    // from whichever queue holds it, frees its blocks (via finish()), erases the id mapping.
+    // Returns false if the id is unknown (already finished, or never queued) -- safe to call twice.
+    bool abort_request(int32_t request_id);
+
     void set_on_finish(llama_paged_on_finish_cb cb, void * user_data);
     llama_sequence_group *         get_group_from_id(int32_t request_id) const;
     const llama_paged_batch_info * get_curr_batch_info() const;

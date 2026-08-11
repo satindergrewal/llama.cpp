@@ -2835,7 +2835,17 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            const int32_t rid = slot.id;
                             slot.release();
+                            // ★ A CANCELLED PAGED REQUEST MUST REACH THE SCHEDULER TOO. release()
+                            // only frees the SLOT; the scheduler would keep generating into blocks
+                            // nobody reads and keep the claims until the pool starves -- the same
+                            // two-ledger hole as the deadlock branch above (2026-08-11). Client
+                            // timeouts land here, so this is the path a real workload hits first.
+                            if (paged_sched) {
+                                llama_paged_scheduler_abort_request(paged_sched, rid);
+                                llama_memory_seq_rm(llama_get_memory(ctx_tgt), rid, -1, -1);
+                            }
                             break;
                         }
                     }
@@ -3298,6 +3308,13 @@ private:
                 const int32_t rid = sl.id;
                 sl.release();
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), rid, -1, -1);
+                // ★ TELL THE SCHEDULER. Until 2026-08-11 this branch failed the slot and stopped
+                // there, so the scheduler kept the dead request in its queue WITH its block claims,
+                // and every subsequent prepare_batch re-detected the same deadlock -- measured: after
+                // one designed capacity termination, a 12-token request against a 64-block pool
+                // deadlocked forever ("2 waiting"). The slot's death and the scheduler's queue are
+                // two ledgers; failing one and not the other poisons the server permanently.
+                llama_paged_scheduler_abort_request(paged_sched, rid);
             }
             return;
         }

@@ -260,6 +260,12 @@ LLAMA_API int32_t llama_paged_scheduler_take_terminated(struct llama_paged_sched
     return n;
 }
 
+LLAMA_API bool llama_paged_scheduler_abort_request(struct llama_paged_scheduler * sched,
+                                                   int32_t request_id) {
+    if (!sched) { return false; }
+    return sched->impl.abort_request(request_id);
+}
+
 LLAMA_API bool llama_paged_scheduler_last_was_deadlock(const struct llama_paged_scheduler * sched) {
     return sched != nullptr && sched->last_deadlock;
 }
