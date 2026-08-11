@@ -3240,8 +3240,13 @@ kernel void kernel_paged_attn_f32(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // Highest key position any row in this pack can see -> block count. Uniform.
+            // ⚠ CAUSAL-AWARE (the mask fix alone was not enough): under causal the highest
+            // visible key is the last row's own position; non-causal sees every WRITTEN key, and
+            // a block walk bounded by q_hi would never even STAGE the later keys the mask now
+            // admits -- the 7e-02 residual the gate caught after the first causal fix.
             const int q_hi  = ctx0 + (glast_c - off_s);
-            const int nblk  = (q_hi + 1 + bs - 1) / bs;
+            const int k_hi  = args.causal ? q_hi : (ctx_lens[seq] - 1);
+            const int nblk  = (k_hi + 1 + bs - 1) / bs;
 
             for (int bg = 0; bg < nblk; bg += SB) {
                 threadgroup_barrier(mem_flags::mem_threadgroup);   // prev iter's readers
@@ -3331,7 +3336,14 @@ kernel void kernel_paged_attn_f32(
                         if (args.rel_extent > 0 && rd >= 0 && rd < args.rel_extent) {
                             s += rel[((uint64_t) qgc * args.n_heads + head_idx) * args.rel_extent + rd];
                         }
-                        if (kpos > q_pos || kpos < lo) { s = -INFINITY; }
+                        // ⚠ CAUSAL, FINALLY CONSULTED (audit row #4: this site hard-coded the
+                        // causal bound and dflash's causal=false silently lost its future
+                        // context). Non-causal visibility ends at the sequence's WRITTEN length
+                        // -- not at q_pos -- and that bound is also what masks the garbage tail
+                        // of a partially-filled last block, which the causal bound used to hide
+                        // for free.
+                        const int hi = args.causal ? q_pos : (ctx_lens[seq] - 1);
+                        if (kpos > hi || kpos < lo) { s = -INFINITY; }
                         ss[jl*SH + c] = s;
                         mx = max(mx, s);
                     }
@@ -3432,7 +3444,10 @@ kernel void kernel_paged_attn_f32(
     const int num_new = batch_lens[seq];
     const int kv_h    = head_idx / (args.n_heads / args.n_heads_kv);
     const int q_pos   = (ctx_lens[seq] - num_new) + i_local;
-    const int n_tok   = q_pos + 1;
+    // causal: keys up to and including q_pos. non-causal (dflash): every WRITTEN key -- the whole
+    // ctx_lens[seq] span. One bound, three consumers (LPK row bound, single-pass loop, split-K
+    // loop), which is why the fix lives here and not at each loop.
+    const int n_tok   = args.causal ? (q_pos + 1) : ctx_lens[seq];
     const int lo      = args.visibility_window > 0
                       ? max(0, q_pos - args.visibility_window + 1) : 0;
 
@@ -3511,7 +3526,10 @@ kernel void kernel_paged_attn_f32(
 
         if (seq_f == seq_l && seq_l >= 0) {
             // SHARED-TILE PATH (same seq for the whole pack -- the common case)
-            const int n_tok_u = (ctx_lens[seq_l] - batch_lens[seq_l]) + il_l + 1;
+            // causal-aware for the same reason as the MMA walk above: non-causal stages the
+            // whole written span, not just up to the last row.
+            const int n_tok_u = args.causal ? ((ctx_lens[seq_l] - batch_lens[seq_l]) + il_l + 1)
+                                            : ctx_lens[seq_l];
             const int nblk    = (n_tok_u + bs - 1) / bs;
             const uint tid    = tpitg3[0];
 

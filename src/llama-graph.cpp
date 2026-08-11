@@ -4727,7 +4727,10 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
     // (dflash) landing on it would silently hide the future half of its context. rel/rel_extent
     // is implemented on BOTH paths (checked: scalar :3326/:3566, champion mask fill :13016) and
     // needs no guard.
-    if (sinks != nullptr || !causal) {
+    // (causal=false no longer forces the champion: the scalar kernel's causal fix is
+    //  gate-proven -- test-paged-vs-cpu ALL PASSED including the non-causal-vs-CPU and
+    //  causal-liveness arms, 2026-08-12. Only sinks remain champion-or-flag.)
+    if (sinks != nullptr) {
         static const bool champ_on_extras = []() {
             const char * e = getenv("DS4P_METAL_CHAMP");
             return e != nullptr && atoi(e) != 0;
@@ -4740,7 +4743,7 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
             const char * e = getenv("DS4P_SCALAR_SINKS");
             return e != nullptr && atoi(e) != 0;
         }();
-        if (causal && sinks != nullptr && scalar_sinks_on) {
+        if (scalar_sinks_on) {
             // sinks are the only champion-only argument in play and the scalar kernel serves
             // them now; fall through to the capability contract below.
         } else {
