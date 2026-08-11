@@ -4720,31 +4720,44 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
     // path, loudly. (The predicate is duplicated from paged_layer_supported's champ_geometry on
     // purpose: it must sit next to the argument it judges, per the window precedent above. If the
     // champion's instantiated set changes, BOTH sites change -- each comment names the other.)
-    if (sinks != nullptr) {
-        static const bool champ_on_sinks = []() {
+    // ⚠ CHAMPION-ONLY ARGUMENTS: sinks and causal=false are implemented ONLY where causality and
+    // extras come from the mask machinery -- the champion path. The scalar kernel aborts on sinks
+    // by design, and it HARD-CODES causal masking (`kpos > q_pos -> -INF` at both scalar sites,
+    // no args.causal consult -- read 2026-08-11, the audit's row #4), so a causal=false layer
+    // (dflash) landing on it would silently hide the future half of its context. rel/rel_extent
+    // is implemented on BOTH paths (checked: scalar :3326/:3566, champion mask fill :13016) and
+    // needs no guard.
+    if (sinks != nullptr || !causal) {
+        static const bool champ_on_extras = []() {
             const char * e = getenv("DS4P_METAL_CHAMP");
             return e != nullptr && atoi(e) != 0;
         }();
         const int64_t hd = hparams.n_embd_head_v(il);
-        const ggml_tensor * kv_sink_check = paged_ctx->get_k(il);
+        const ggml_tensor * kv_type_check = paged_ctx->get_k(il);
         // pool type f16 is part of the champion contract (audit hole #3, see champ_geometry) --
         // without it, sinks + q8_0 pool + champion geometry would pass here, get refused by the
         // kernel on type, fall to the scalar path, and hit the scalar sinks abort this guard exists
         // to prevent.
-        const bool champ_serves = champ_on_sinks && cparams.block_size == 64 &&
+        const bool champ_serves = champ_on_extras && cparams.block_size == 64 &&
                                   cparams.n_seq_max == 1 &&
-                                  kv_sink_check != nullptr && kv_sink_check->type == GGML_TYPE_F16 &&
+                                  kv_type_check != nullptr && kv_type_check->type == GGML_TYPE_F16 &&
                                   (hd == 64 || hd == 96 || hd == 128 || hd == 192 || hd == 256);
         if (!champ_serves) {
-            static int last_sink_il = -2;
-            if (il != last_sink_il) {
-                last_sink_il = il;
-                LLAMA_LOG_WARN("%s: layer %d passes attention SINKS, which only the champion "
-                               "kernel implements, and this configuration cannot take the champion "
-                               "(champ=%d bs=%u n_seq_max=%u head_dim=%lld; need champ on, bs 64, "
-                               "n_seq_max 1, head_dim in {64,96,128,192,256}) -- this layer takes "
-                               "the static path\n", __func__, il, (int) champ_on_sinks,
-                               cparams.block_size, cparams.n_seq_max, (long long) hd);
+            static int last_extra_il = -2;
+            if (il != last_extra_il) {
+                last_extra_il = il;
+                LLAMA_LOG_WARN("%s: layer %d passes %s, which only the champion path implements, "
+                               "and this configuration cannot take the champion (champ=%d bs=%u "
+                               "n_seq_max=%u head_dim=%lld ktype=%s; need champ on, bs 64, "
+                               "n_seq_max 1, f16 pool, head_dim in {64,96,128,192,256}) -- this "
+                               "layer takes the static path\n", __func__, il,
+                               sinks != nullptr ? (causal ? "attention SINKS"
+                                                          : "attention SINKS and causal=false")
+                                                : "causal=false (the scalar kernel hard-codes "
+                                                  "causal masking)",
+                               (int) champ_on_extras, cparams.block_size, cparams.n_seq_max,
+                               (long long) hd,
+                               kv_type_check ? ggml_type_name(kv_type_check->type) : "?");
             }
             return nullptr;
         }
