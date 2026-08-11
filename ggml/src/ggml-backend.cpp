@@ -1623,13 +1623,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // copy that set_input had filled correctly on the host side -- so either this
                 // copy never fired for that graph, fired with the wrong pairing, or fired and
                 // was later clobbered. Printing src/dst/pointers/content at THE copy names which.
-                if (getenv("DS4P_SCHED_CPY") && input->type == GGML_TYPE_I32 && ggml_nelements(input) <= 8192) {
-                    int32_t v0 = 0, vc = 0;
-                    ggml_backend_tensor_get(input,     &v0, 0, sizeof(v0));
-                    ggml_backend_tensor_get(input_cpy, &vc, 0, sizeof(vc));
-                    fprintf(stderr, "DS4P-SCHEDCPY split=%d in=%s src=%p dst=%s dstp=%p n=%lld src0=%d dst0=%d\n",
+                // ⚠ Host-side read ONLY. The first version also tensor_get'd input_cpy (the
+                // split-backend copy) and CRASHED the server after chunk 1 -- both probe runs
+                // died with a backtrace and one populate line, which made "chunk-2's copies
+                // never fire" look true. VOID: the server never REACHED chunk 2. Reading a
+                // Metal-side buffer from inside compute_splits mid-pipeline is not safe;
+                // reading the CPU-side src is.
+                // >=1: an EMPTY I32 input (an aligned chunk's zero-width state-write set) made
+                // the 4-byte read assert out-of-bounds -- the probe itself crashed the server at
+                // chunk 2 twice before this guard, faking a "copies never fire" signal.
+                if (getenv("DS4P_SCHED_CPY") && input->type == GGML_TYPE_I32 &&
+                    ggml_nelements(input) >= 1 && ggml_nelements(input) <= 8192) {
+                    int32_t v0 = 0;
+                    ggml_backend_tensor_get(input, &v0, 0, sizeof(v0));
+                    fprintf(stderr, "DS4P-SCHEDCPY split=%d in=%s src=%p dst=%s dstp=%p n=%lld src0=%d\n",
                             split_id, input->name, input->data, input_cpy->name, input_cpy->data,
-                            (long long) ggml_nelements(input), v0, vc);
+                            (long long) ggml_nelements(input), v0);
                 }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
