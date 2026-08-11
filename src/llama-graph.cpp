@@ -900,12 +900,15 @@ static bool dsv4_compress_debug() {
 // clobberer of inp_pos; this bisects WHICH sub-fill inside it. The pos tensor handle is set by
 // llm_graph_result::set_inputs (file-static, diagnostics only).
 ggml_tensor * g_ds4p_watch_pos = nullptr;
+void ds4p_pos_peek_ext(const char * where);
 static void ds4p_pos_peek(const char * where) {
     if (g_ds4p_watch_pos == nullptr || g_ds4p_watch_pos->data == nullptr) { return; }
     int32_t p0 = 0;
     ggml_backend_tensor_get(g_ds4p_watch_pos, &p0, 0, sizeof(p0));
     fprintf(stderr, "DS4P-POSPEEK %s pos[0]=%d\n", where, p0);
 }
+
+void ds4p_pos_peek_ext(const char * where) { ds4p_pos_peek(where); }
 
 static void dsv4_set_comp_inputs(
         const llm_graph_input_dsv4::comp_input & inp,
@@ -1024,17 +1027,29 @@ static void dsv4_build_comp_inputs(
 }
 
 void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
+    // stage-3 bisect: the raw input is the proven clobberer of inp_pos (POSPEEK stage 2);
+    // the core mask fill is bounded by dst->ne, so one of these three is writing out of
+    // bounds. Peek between them.
+    void ds4p_pos_peek_ext(const char * where);
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->set_input_k_idxs(self_k_idxs);
     }
+    ds4p_pos_peek_ext("raw-after-kidx");
 
     if (self_kq_mask && self_kq_mask->buffer) {
+        if (getenv("DS4P_POS_WATCH")) {
+            fprintf(stderr, "DS4P-RAWMASK tensor=%s data=%p bytes=%zu ne0=%lld ne1=%lld\n",
+                    self_kq_mask->name, self_kq_mask->data, ggml_nbytes(self_kq_mask),
+                    (long long) self_kq_mask->ne[0], (long long) self_kq_mask->ne[1]);
+        }
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
+    ds4p_pos_peek_ext("raw-after-mask");
 
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
     }
+    ds4p_pos_peek_ext("raw-after-krot");
 }
 
 void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
