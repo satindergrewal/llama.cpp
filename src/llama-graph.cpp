@@ -4732,6 +4732,18 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
             const char * e = getenv("DS4P_METAL_CHAMP");
             return e != nullptr && atoi(e) != 0;
         }();
+        // ★ DS4P_SCALAR_SINKS=1 (Tier 2(b), 2026-08-11): the scalar kernel now carries the sink
+        // join at all three finalize sites, gate-verified both arms (finite <= 4.5e-08 vs the CPU
+        // reference; -inf bit-exact) across D=64..512. Under the flag, SINKS no longer force the
+        // champion -- but causal=false still does (the kernel-side causal fix is its own change).
+        static const bool scalar_sinks_on = []() {
+            const char * e = getenv("DS4P_SCALAR_SINKS");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (causal && sinks != nullptr && scalar_sinks_on) {
+            // sinks are the only champion-only argument in play and the scalar kernel serves
+            // them now; fall through to the capability contract below.
+        } else {
         const int64_t hd = hparams.n_embd_head_v(il);
         const ggml_tensor * kv_type_check = paged_ctx->get_k(il);
         // pool type f16 is part of the champion contract (audit hole #3, see champ_geometry) --
@@ -4760,6 +4772,7 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
                                kv_type_check ? ggml_type_name(kv_type_check->type) : "?");
             }
             return nullptr;
+        }
         }
     }
 
