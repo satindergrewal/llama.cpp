@@ -152,6 +152,13 @@ public:
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
+    // Fourth wrapper, same resolution (Tier 0 of DSV4 paging): the paged scheduler resolves
+    // memory by dynamic_cast and asks the wrapper for its paged pool; without these two the
+    // composite is "not a paged memory type" and llama_paged_scheduler_init refuses at startup
+    // (the 2026-08-10 step-0 witness). Pattern copied from llama_kv_cache_iswa.
+    void                   set_attn_paged(llama_kv_cache_paged * paged);
+    llama_kv_cache_paged * get_mem_attn_paged() const;
+
 private:
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
@@ -170,6 +177,9 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> csa_state;
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
+
+    // non-const: handed over after construction, like the ISWA/hybrid wrappers
+    std::unique_ptr<llama_kv_cache_paged> mem_attn_paged;
 
     void clear_compressed(llama_seq_id seq_id, bool data);
 };
@@ -371,8 +381,16 @@ public:
     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
+    // Tier 0 of DSV4 paging: the graph asks the memory context for the paged context via
+    // get_attn_paged() (base-class override); the server's paged loop attaches it per ubatch
+    // via set_attn_paged_ctx(). Same pair as llama_kv_cache_iswa_context.
+    const llama_kv_cache_paged_context * get_attn_paged() const override;
+    void set_attn_paged_ctx(llama_memory_context_ptr ctx) { ctx_attn_paged = std::move(ctx); }
+
 private:
     size_t i_next = 0;
+
+    llama_memory_context_ptr ctx_attn_paged;
 
     std::vector<llama_ubatch> ubatches;
 

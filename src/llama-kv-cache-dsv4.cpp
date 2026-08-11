@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 #include "llama-impl.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -1643,6 +1644,14 @@ llama_dsv4_comp_state * llama_kv_cache_dsv4::get_lid_state() const {
     return lid_state.get();
 }
 
+void llama_kv_cache_dsv4::set_attn_paged(llama_kv_cache_paged * paged) {
+    mem_attn_paged.reset(paged);
+}
+
+llama_kv_cache_paged * llama_kv_cache_dsv4::get_mem_attn_paged() const {
+    return mem_attn_paged.get();
+}
+
 uint32_t llama_kv_cache_dsv4::get_n_rs_seq() const {
     return n_rs_seq;
 }
@@ -2081,6 +2090,10 @@ const llama_kv_cache_dsv4_raw_context * llama_kv_cache_dsv4_context::get_raw() c
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ctx_raw.get();
+}
+
+const llama_kv_cache_paged_context * llama_kv_cache_dsv4_context::get_attn_paged() const {
+    return static_cast<const llama_kv_cache_paged_context *>(ctx_attn_paged.get());
 }
 
 const llama_kv_cache_dsv4_comp_context * llama_kv_cache_dsv4_context::get_csa() const {

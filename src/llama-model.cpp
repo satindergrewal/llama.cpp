@@ -2180,7 +2180,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr);
                 } else {
-                    res = new llama_kv_cache_dsv4(
+                    auto * dsv4 = new llama_kv_cache_dsv4(
                             *this,
                             params.type_k,
                             params.type_v,
@@ -2195,6 +2195,53 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_rs_seq,
                             nullptr,
                             nullptr);
+
+                    // ★ Tier 0 of DSV4 paging (fourth wrapper, same resolution): give the composite
+                    // a paged pool so llama_paged_scheduler_init's dynamic_cast chain can accept it
+                    // instead of refusing with "not a paged memory type" (the 2026-08-10 step-0
+                    // witness). Donor pattern: the hybrid-iswa block below.
+                    //
+                    // ⚠⚠ BRING-UP GATED ON PURPOSE (DS4P_PAGED_DSV4=1). Tier 0 alone converts a
+                    // loud startup refusal into a server that allocates a pool NO GRAPH READS --
+                    // the silent-fallback state that produced 4.5 h of static-vs-static "parity"
+                    // on 2026-08-09. The board's rule is Tier 0+1+2 land together or nothing:
+                    // until the graph path (Tier 1) and the masked kernel (Tier 2) are in, the
+                    // DEFAULT --kv-paged on DSV4 must keep refusing, and this flag exists only so
+                    // the tiers can be developed against a scheduler that accepts the memory.
+                    static const bool paged_dsv4_dev = []() {
+                        const char * s = getenv("DS4P_PAGED_DSV4");
+                        return s != nullptr && atoi(s) != 0;
+                    }();
+                    if (cparams.kv_paged && paged_dsv4_dev) {
+                        LLAMA_LOG_INFO("%s: DS4P_PAGED_DSV4: constructing the DSV4 paged attention pool "
+                                "(Tier 0 bring-up; graph path and masked kernel pending)\n", __func__);
+
+                        const uint32_t pg_head_dim   = hparams.n_embd_head_v();
+                        const uint32_t pg_n_head     = hparams.n_head_kv();
+                        const uint32_t pg_n_layers   = hparams.n_layer();
+                        const uint32_t pg_block_size = cparams.block_size;
+
+                        auto * paged_attn = new llama_kv_cache_paged(pg_head_dim, pg_n_head,
+                                pg_block_size, pg_n_layers, cparams.n_ubatch, cparams.n_seq_max);
+
+                        bool pg_multi_dev = false;
+                        if (layer_backends.size() == pg_n_layers) {
+                            for (uint32_t il = 1; il < pg_n_layers; ++il) {
+                                if (layer_backends[il] != layer_backends[0]) { pg_multi_dev = true; break; }
+                            }
+                        }
+                        if (pg_multi_dev) {
+                            paged_attn->init_multi(layer_backends, backend_cpu, params.type_k,
+                                    cparams.n_gpu_blocks, cparams.n_cpu_blocks, cparams.kv_paged_watermark);
+                        } else {
+                            paged_attn->init(backend_gpu, backend_cpu, params.type_k,
+                                    cparams.n_gpu_blocks, cparams.n_cpu_blocks, cparams.kv_paged_watermark);
+                        }
+
+                        dsv4->set_attn_paged(paged_attn);
+                    }
+
+                    res = dsv4;
                 }
             } break;
         case LLM_ARCH_DFLASH:
