@@ -1217,6 +1217,32 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
+    // ★ DS4P_SETROWS_DUMP: every set_rows dispatch, verbatim -- dst name, index range, bound.
+    // The remaining ub-256 pool overwriter is in-bounds-but-WRONG somewhere in the server graph;
+    // an OOB assert cannot see it, so this prints what each dispatch is about to touch. stderr,
+    // not GGML_LOG (the server log callback swallows backend INFO -- measured 2026-08-12).
+    if (getenv("DS4P_SETROWS_DUMP")) {
+        const ggml_tensor * idxs = op->src[1];
+        std::vector<int64_t> v;
+        const int64_t n = ggml_nelements(idxs);
+        int64_t mn = 0, mx = 0;
+        double sum = 0.0;
+        if (idxs->type == GGML_TYPE_I64) {
+            std::vector<int64_t> h(n);
+            ggml_backend_tensor_get((ggml_tensor *) idxs, h.data(), 0, n*sizeof(int64_t));
+            mn = mx = n ? h[0] : 0;
+            for (int64_t x : h) { mn = std::min(mn, x); mx = std::max(mx, x); sum += (double) x; }
+        } else {
+            std::vector<int32_t> h(n);
+            ggml_backend_tensor_get((ggml_tensor *) idxs, h.data(), 0, n*sizeof(int32_t));
+            mn = mx = n ? h[0] : 0;
+            for (int32_t x : h) { mn = std::min<int64_t>(mn, x); mx = std::max<int64_t>(mx, x); sum += (double) x; }
+        }
+        fprintf(stderr, "DS4P-SETROWS dst=%s idx=%s n=%lld min=%lld max=%lld sum=%.9g bound(ne1)=%lld\n",
+                op->name, idxs->name, (long long) n, (long long) mn, (long long) mx, sum,
+                (long long) op->ne[1]);
+    }
+
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
