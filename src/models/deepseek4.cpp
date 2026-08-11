@@ -768,16 +768,15 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         static const char * split_sel = getenv("DS4P_SPLIT") ? getenv("DS4P_SPLIT") : "all";
         const bool split_on = strcmp(split_sel, "all") == 0 || strcmp(split_sel, "csa") == 0;
         const auto * pg_ctx = (mctx && split_on) ? mctx->get_attn_paged() : nullptr;
-        // ⚠ UNLIKE the raw builder, the static raw write STAYS under the split -- CONSERVATIVELY.
-        // Honest record: the degenerate '=====' this line was first added against turned out to be
-        // the NaN in the merge (fully-masked dense row -> -inf + inf), NOT write starvation; the
-        // write alone did not fix it and the clamp alone was never tested without the write. It
-        // stays because the compressor/indexer machinery plausibly reads the raw CACHE (not the
-        // in-flight kv) when committing compressed rows, and a starved commit would only surface
-        // beyond a short smoke's horizon. Removing it needs a long-conversation gate, not a hunch.
-        if (pg_ctx) {
-            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
-        }
+        // ⚠ The static raw write is DELETED here, and not on the raw builder's orphaning argument
+        // alone: it was the corruptor. When the paged branch serves, NOTHING sets this layer's
+        // static k_idxs input -- the leaf stays uninitialized, and this cpy_k scattered K rows
+        // through garbage indices (CPU: set_rows OOB i1=-2.9e17 at cache_k_l2; Metal: unchecked
+        // scatter into whatever the offsets hit, corrupting every plane of the paged pool). The
+        // apparent "ubatch % 256 == 0" trigger was allocator layout: at some shapes the stale
+        // leaf buffer happened to hold the PREVIOUS chunk's still-plausible indices. The read that
+        // retired the conservative rationale stands too: the compressor consumes hidden states
+        // (attn_comp_wkv(cur)), never this cache. 2026-08-12.
         ggml_tensor * pgp = build_attn_paged_or_null(pg_ctx, q, kv, kv, kq_scale, il,
                                 /*visibility_window=*/ hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0,
                                 /*rel=*/nullptr, /*rel_extent=*/0, /*sinks=*/nullptr,
@@ -861,16 +860,15 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
         static const char * split_sel = getenv("DS4P_SPLIT") ? getenv("DS4P_SPLIT") : "all";
         const bool split_on = strcmp(split_sel, "all") == 0 || strcmp(split_sel, "hca") == 0;
         const auto * pg_ctx = (mctx && split_on) ? mctx->get_attn_paged() : nullptr;
-        // ⚠ UNLIKE the raw builder, the static raw write STAYS under the split -- CONSERVATIVELY.
-        // Honest record: the degenerate '=====' this line was first added against turned out to be
-        // the NaN in the merge (fully-masked dense row -> -inf + inf), NOT write starvation; the
-        // write alone did not fix it and the clamp alone was never tested without the write. It
-        // stays because the compressor/indexer machinery plausibly reads the raw CACHE (not the
-        // in-flight kv) when committing compressed rows, and a starved commit would only surface
-        // beyond a short smoke's horizon. Removing it needs a long-conversation gate, not a hunch.
-        if (pg_ctx) {
-            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
-        }
+        // ⚠ The static raw write is DELETED here, and not on the raw builder's orphaning argument
+        // alone: it was the corruptor. When the paged branch serves, NOTHING sets this layer's
+        // static k_idxs input -- the leaf stays uninitialized, and this cpy_k scattered K rows
+        // through garbage indices (CPU: set_rows OOB i1=-2.9e17 at cache_k_l2; Metal: unchecked
+        // scatter into whatever the offsets hit, corrupting every plane of the paged pool). The
+        // apparent "ubatch % 256 == 0" trigger was allocator layout: at some shapes the stale
+        // leaf buffer happened to hold the PREVIOUS chunk's still-plausible indices. The read that
+        // retired the conservative rationale stands too: the compressor consumes hidden states
+        // (attn_comp_wkv(cur)), never this cache. 2026-08-12.
         ggml_tensor * pgp = build_attn_paged_or_null(pg_ctx, q, kv, kv, kq_scale, il,
                                 /*visibility_window=*/ hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0,
                                 /*rel=*/nullptr, /*rel_extent=*/0, /*sinks=*/nullptr,

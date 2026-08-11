@@ -5143,29 +5143,29 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         if (dumps_left < 0) { dumps_left = atoi(e); }
         if (dumps_left > 0) {
             dumps_left--;
-            GGML_LOG_INFO("%s: ARGDUMP n_tokens=%d head_dim=%d n_heads=%d n_heads_kv=%d "
+            fprintf(stderr, "%s: ARGDUMP n_tokens=%d head_dim=%d n_heads=%d n_heads_kv=%d "
                           "block_size=%d n_blocks=%d kv_type=%s kv_q8=%d\n",
-                          __func__, n_tokens, head_dim, (int) q->ne[1], n_heads_kv,
+                          "paged_attn", n_tokens, head_dim, (int) q->ne[1], n_heads_kv,
                           bs_pa_lpk, (int) btab->ne[0], ggml_type_name(kv_cache->type), args.kv_q8);
-            GGML_LOG_INFO("%s: ARGDUMP strides token=%llu head=%llu block=%llu | cache ne=[%lld %lld %lld %lld] "
-                          "nb=[%zu %zu %zu %zu]\n", __func__,
+            fprintf(stderr, "%s: ARGDUMP strides token=%llu head=%llu block=%llu | cache ne=[%lld %lld %lld %lld] "
+                          "nb=[%zu %zu %zu %zu]\n", "paged_attn",
                           (unsigned long long) args.stride_token, (unsigned long long) args.stride_head,
                           (unsigned long long) args.stride_block,
                           (long long) kv_cache->ne[0], (long long) kv_cache->ne[1],
                           (long long) kv_cache->ne[2], (long long) kv_cache->ne[3],
                           kv_cache->nb[0], kv_cache->nb[1], kv_cache->nb[2], kv_cache->nb[3]);
             const auto dump_i32 = [&](const char * name, const ggml_tensor * t, int cap) {
-                if (!t) { GGML_LOG_INFO("%s: ARGDUMP %s = (null)\n", __func__, name); return; }
+                if (!t) { fprintf(stderr, "%s: ARGDUMP %s = (null)\n", "paged_attn", name); return; }
                 const int n = (int) ggml_nelements(t) < cap ? (int) ggml_nelements(t) : cap;
                 std::vector<int32_t> v(n);
                 ggml_backend_tensor_get((ggml_tensor *) t, v.data(), 0, (size_t) n*sizeof(int32_t));
                 std::string s;
                 for (int i = 0; i < n; ++i) { s += " " + std::to_string(v[i]); }
-                GGML_LOG_INFO("%s: ARGDUMP %s[%lld] =%s%s\n", __func__, name,
+                fprintf(stderr, "%s: ARGDUMP %s[%lld] =%s%s\n", "paged_attn", name,
                               (long long) ggml_nelements(t), s.c_str(),
                               n < (int) ggml_nelements(t) ? " ..." : "");
             };
-            GGML_LOG_INFO("%s: ARGDUMP causal=%d\n", __func__, (int) args.causal);
+            fprintf(stderr, "%s: ARGDUMP causal=%d\n", "paged_attn", (int) args.causal);
             dump_i32("block_table",  btab,        32);
             dump_i32("write_slots",  op->src[6],  32);
             dump_i32("context_lens", clens,        8);

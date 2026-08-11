@@ -1329,6 +1329,40 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // ★ DS4P_TENSOR_SUMS=1: per-tensor sum tap for the paged-vs-static depth bisection.
+        // The eval-callback examples cannot drive the paged path (it needs the server's
+        // scheduler), so the tap lives HERE, on the one process that can run both arms.
+        // Filter: the attention outputs and per-layer l_out -- enough to name the first
+        // diverging layer without drowning in nodes. Diagnostics only; costs a GPU->host
+        // copy per matched tensor per ubatch, never on by default.
+        if (getenv("DS4P_TENSOR_SUMS") != nullptr) {
+            params_base.cb_eval = [](struct ggml_tensor * t, bool ask, void * ud) -> bool {
+                (void) ud;
+                const char * n = t->name;
+                const bool want = n && (strncmp(n, "split_", 6) == 0 ||
+                                        strncmp(n, "attn_",  5) == 0 ||
+                                        strncmp(n, "l_out",  5) == 0);
+                if (ask)   { return want; }
+                if (!want) { return true; }
+                std::vector<uint8_t> buf(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+                const size_t ne = (size_t) ggml_nelements(t);
+                double s = 0.0;
+                if (t->type == GGML_TYPE_F32) {
+                    const float * p = (const float *) buf.data();
+                    for (size_t i = 0; i < ne; ++i) { s += p[i]; }
+                } else if (t->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t * p = (const ggml_fp16_t *) buf.data();
+                    for (size_t i = 0; i < ne; ++i) { s += ggml_fp16_to_fp32(p[i]); }
+                } else {
+                    return true;
+                }
+                fprintf(stderr, "DS4P-TSUM %s ne=%lld %.9g\n", n, (long long) ggml_nelements(t), s);
+                return true;
+            };
+            SRV_WRN("%s", "DS4P_TENSOR_SUMS is ON -- per-tensor host copies; diagnostics only\n");
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();

@@ -222,7 +222,14 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
                                           // server produces this shape and this harness could not
                                           // express it, which is why 7 archs pass with the mask
                                           // untested across newly-submitted decode rows.
-                                          int rows_dec = 1) {
+                                          int rows_dec = 1,
+                                          // LAST, per the scars above. Same meaning as run_paged's:
+                                          // 0 none, 1 finite, 2 -inf control. The server-replay arm
+                                          // needs it because the DSV4 raw layers RUN with sinks.
+                                          int sink_mode = 0,
+                                          // LAST. Partials mode for every part -- the split-softmax
+                                          // shape the server runs on 38 of 46 DSV4 layers.
+                                          bool partials = false) {
     const int H   = getenv("DS4P_TEST_H")   ? atoi(getenv("DS4P_TEST_H"))   : 4;
     const int HKV = getenv("DS4P_TEST_HKV") ? atoi(getenv("DS4P_TEST_HKV")) : 2;
     const int E   = 8;
@@ -243,6 +250,8 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
 
     ggml_tensor * cache = ggml_new_tensor_4d(ctx, kv_type, D, BS, 2*HKV, NB);
     ggml_tensor * btab  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, NB, 1);
+    ggml_tensor * sinks_p = sink_mode ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H) : nullptr;
+    if (sinks_p) { ggml_set_name(sinks_p, "sinks"); }
 
     struct part {
         int n, off;
@@ -264,12 +273,25 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
         p.boffs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         p.blens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         p.rel   = with_rel ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, H, p.n) : nullptr;
-        p.out   = ggml_paged_attn_banded(ctx, p.q, p.k, p.v, cache, cache,
+        GGML_ASSERT(!(partials && sink_mode) && "partials excludes sinks (merge-side join)");
+        p.out   = partials
+            ? ggml_paged_attn_banded_partials(ctx, p.q, p.k, p.v, cache, cache,
                       btab, p.slots, p.clens, p.boffs, p.blens, p.rel,
-                      scale, BS, NB, NB, nullptr, with_rel ? E : 1, window, causal);
+                      scale, BS, NB, NB, with_rel ? E : 1, window, causal)
+            : ggml_paged_attn_banded(ctx, p.q, p.k, p.v, cache, cache,
+                      btab, p.slots, p.clens, p.boffs, p.blens, p.rel,
+                      scale, BS, NB, NB, sinks_p, with_rel ? E : 1, window, causal);
     }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    if (sinks_p) {
+        std::vector<float> sk(H);
+        for (int h = 0; h < H; ++h) {
+            sk[h] = sink_mode == 2 ? -INFINITY : (0.25f + 0.10f*h);
+        }
+        ggml_backend_tensor_set(sinks_p, sk.data(), 0, ggml_nbytes(sinks_p));
+    }
 
     std::vector<uint8_t> zeros(ggml_nbytes(cache), 0);
     ggml_backend_tensor_set(cache, zeros.data(), 0, zeros.size());
@@ -277,7 +299,8 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
     for (int b = 0; b < NB; ++b) { bt[b] = b; }
     ggml_backend_tensor_set(btab, bt.data(), 0, (size_t) NB*sizeof(int32_t));
 
-    std::vector<float> out((size_t) N*H*D);
+    const int DW = partials ? D + 2 : D;   // partials rows carry O[D], M, S
+    std::vector<float> out((size_t) N*H*DW);
 
     for (int s = 0; s < n_parts; ++s) {
         part & p = P[s];
@@ -312,7 +335,7 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
         ggml_build_forward_expand(gf, p.out);
         ggml_backend_graph_compute(backend, gf);
 
-        ggml_backend_tensor_get(p.out, out.data() + (size_t) p.off*H*D, 0, ggml_nbytes(p.out));
+        ggml_backend_tensor_get(p.out, out.data() + (size_t) p.off*H*DW, 0, ggml_nbytes(p.out));
     }
 
     // ★ CACHE-CONTENT CHECK, COVERAGE DERIVED FROM THE READ'S ADDRESS RANGE.
@@ -487,6 +510,44 @@ int main() {
     const bool same = strcmp(ggml_backend_name(backend), ggml_backend_name(cpu)) == 0;
     printf("backend: %s   reference: %s%s\n", ggml_backend_name(backend), ggml_backend_name(cpu),
            same ? "   (identical -- this run only proves the harness, not a port)" : "");
+
+    // ★★ SERVER-REPLAY ARM (2026-08-12). The server corrupts the paged cache when a NON-FIRST
+    // prompt chunk has n_tokens % 256 == 0 (knife-edge measured: ub255 exact, ub256 corrupt,
+    // ub257 exact; KVSUM diverges from the chunk's FIRST token at every paged layer). ARGDUMP
+    // gave the exact dispatch: D=512, H=64, HKV=1, BS=16, f16, causal, window=128, schedule
+    // 256-token prefill then a second full 256-row causal dispatch at ctx 512. This arm replays
+    // THAT shape via run_paged_split's rows_dec (a second multi-row causal dispatch is exactly a
+    // second prefill chunk) and compares against the one-call answer plus the CPU oracle.
+    //
+    // DS4P_TEST_REPLAY="D,window,c2" with H/HKV/BS/NB/N from the usual envs. Runs INSTEAD of the
+    // sweep so the knife-edge pair (c2=255 vs c2=256) is two cheap invocations, not two sweeps.
+    if (const char * rp = getenv("DS4P_TEST_REPLAY")) {
+        int D = 512, W = 128, C2 = 256, SM = 0, PT = 0;
+        sscanf(rp, "%d,%d,%d,%d,%d", &D, &W, &C2, &SM, &PT);
+        GGML_ASSERT(!(PT && SM) && "partials excludes sinks");
+        //   run_paged      (backend, D, with_rel, window, kv_type, sink_mode, causal, read_only, partials)
+        //   run_paged_split(backend, D, with_rel, window, kv_type, n1, n_dec, causal, rows_dec)
+        // (positions written out -- this file's own shifted-argument scar, twice)
+        //   run_paged      (backend, D, with_rel, window, kv_type, sink_mode, causal, read_only, partials)
+        const std::vector<float> whole = run_paged      (backend, D, false, W, GGML_TYPE_F16, SM, 1, false, PT != 0);
+        const std::vector<float> cref  = run_paged      (cpu,     D, false, W, GGML_TYPE_F16, SM, 1, false, PT != 0);
+        const std::vector<float> split = run_paged_split(backend, D, false, W, GGML_TYPE_F16, 1, 1, 1, C2, SM, PT != 0);
+        const std::vector<float> csplit= run_paged_split(cpu,     D, false, W, GGML_TYPE_F16, 1, 1, 1, C2, SM, PT != 0);
+        auto cmp = [](const std::vector<float> & a, const std::vector<float> & b) {
+            double m = 0.0;
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) m = std::max(m, (double) fabs(a[i]-b[i]));
+            return m;
+        };
+        const double m_wc = cmp(whole, cref);   // Metal one-call vs CPU one-call: baseline sanity
+        const double m_sw = cmp(split, whole);  // Metal split vs Metal whole: THE schedule defect
+        const double m_sc = cmp(csplit, cref);  // CPU split vs CPU whole-ref: oracle for the schedule
+        int nf = 0;
+        printf("replay D=%d W=%d c2=%d sm=%d: metal-whole vs cpu  max_abs=%.3e %s\n", D, W, C2, SM, m_wc, m_wc < 2e-3 ? "PASS" : "FAIL"); nf += m_wc < 2e-3 ? 0 : 1;
+        printf("replay D=%d W=%d c2=%d sm=%d: metal-split vs whole max_abs=%.3e %s\n", D, W, C2, SM, m_sw, m_sw < 2e-3 ? "PASS" : "FAIL"); nf += m_sw < 2e-3 ? 0 : 1;
+        printf("replay D=%d W=%d c2=%d sm=%d: cpu-split  vs cpu   max_abs=%.3e %s\n", D, W, C2, SM, m_sc, m_sc < 2e-3 ? "PASS" : "FAIL"); nf += m_sc < 2e-3 ? 0 : 1;
+        printf("%s\n", nf == 0 ? "REPLAY PASSED" : "REPLAY FAILED");
+        return nf == 0 ? 0 : 1;
+    }
 
     // head_dims the mma prefill instantiates or might: 64 and 128 ship today; 96/192 are the
     // ones test-paged-banded cannot reach, which is the whole reason this file exists.

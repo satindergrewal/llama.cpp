@@ -5168,6 +5168,12 @@ static void ggml_compute_forward_set_rows_impl(
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
+                // ★ Name the offender before dying: which set_rows, which index, what bound. An
+                // anonymous bounds assert cost a full server-side bisection to localize (2026-08-12).
+                if (!(i1 >= 0 && i1 < ne1)) {
+                    fprintf(stderr, "set_rows OOB: dst=%s src1=%s i=%lld i1=%lld ne1=%lld\n",
+                            dst->name, src1->name, (long long) i, (long long) i1, (long long) ne1);
+                }
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
                 if constexpr (std::is_same_v<src_t, float>) {
@@ -12289,6 +12295,18 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
             for (int j = 0; j < (int) ggml_blck_size(GGML_TYPE_Q8_0); ++j) { qs[j] = (int8_t) std::lround(src[b*(int) ggml_blck_size(GGML_TYPE_Q8_0) + j] * id); }
         }
     };
+
+    // ★ DS4P_CPU_KROW: per-row k_new checksums from the CPU reference, printed with the slot each
+    // row is headed to. The remaining ub-256 defect is backend-independent, so the CPU arm is the
+    // cheapest place to see whether the graph handed the op wrong K content (vs wrong routing).
+    if (getenv("DS4P_CPU_KROW") && !read_only && (int) (q->ne[2]) > 1) {
+        for (int i = 0; i < (int) q->ne[2]; i += 25) {
+            double ks = 0.0;
+            for (int d = 0; d < head_dim; ++d) { ks += k_data[(size_t) i*n_heads_kv*head_dim + d]; }
+            fprintf(stderr, "DS4P-KROW dst=%s ntok=%d row=%d slot=%d ksum=%.9g\n",
+                    dst->name, (int) q->ne[2], i, slots_data[i], ks);
+        }
+    }
 
     // Write to KV cache -- skipped entirely when there is no new K/V. The attention phase below
     // addresses the pool through the block table and ctx_lens and never consults k_data/v_data, so
