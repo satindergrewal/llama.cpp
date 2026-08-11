@@ -896,6 +896,17 @@ static bool dsv4_compress_debug() {
     return debug;
 }
 
+// ★ DS4P_POS_WATCH stage 2: the loop-level watch named llm_graph_input_dsv4::set_input as the
+// clobberer of inp_pos; this bisects WHICH sub-fill inside it. The pos tensor handle is set by
+// llm_graph_result::set_inputs (file-static, diagnostics only).
+ggml_tensor * g_ds4p_watch_pos = nullptr;
+static void ds4p_pos_peek(const char * where) {
+    if (g_ds4p_watch_pos == nullptr || g_ds4p_watch_pos->data == nullptr) { return; }
+    int32_t p0 = 0;
+    ggml_backend_tensor_get(g_ds4p_watch_pos, &p0, 0, sizeof(p0));
+    fprintf(stderr, "DS4P-POSPEEK %s pos[0]=%d\n", where, p0);
+}
+
 static void dsv4_set_comp_inputs(
         const llm_graph_input_dsv4::comp_input & inp,
         const llama_kv_cache_dsv4_context::comp_plan & plan,
@@ -1045,11 +1056,16 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
     const int64_t n_stream = plan_csa.n_stream;
 
     inp_raw->mctx = mctx->get_raw();
+    ds4p_pos_peek("before-raw");
     inp_raw->set_input(ubatch);
+    ds4p_pos_peek("after-raw");
 
     dsv4_set_comp_inputs(inp_csa, plan_csa, "csa", debug > 0, ubatch->n_tokens, n_stream);
+    ds4p_pos_peek("after-csa");
     dsv4_set_comp_inputs(inp_hca, plan_hca, "hca", debug > 0, ubatch->n_tokens, n_stream);
+    ds4p_pos_peek("after-hca");
     dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens, n_stream);
+    ds4p_pos_peek("after-lid");
 
     if (inp_csa.k_rot && inp_csa.k_rot->buffer) {
         mctx->get_csa()->set_input_k_rot(inp_csa.k_rot);
@@ -1719,8 +1735,33 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
                        (unsigned long long) n_calls, inputs.size(),
                        ubatch ? ubatch->n_tokens : 0u, names.c_str());
     }
+    // ★ DS4P_POS_WATCH: the host inp_pos tensor is proven CLOBBERED between its own set_input
+    // and the sched's input copy (guarded SCHED_CPY run, 2026-08-12). Every candidate clobberer
+    // is another input's set_input in THIS loop. Watch pos[0] after each call; the input whose
+    // call flips it IS the overrunner.
+    static const bool pos_watch = getenv("DS4P_POS_WATCH") != nullptr;
+    ggml_tensor * watch_pos = nullptr;
+    if (pos_watch && ubatch && ubatch->n_tokens > 1) {
+        for (auto & input : inputs) {
+            if (auto * ip = dynamic_cast<llm_graph_input_pos *>(input.get())) {
+                watch_pos = ip->pos;
+                break;
+            }
+        }
+    }
+    extern ggml_tensor * g_ds4p_watch_pos;
+    g_ds4p_watch_pos = watch_pos;
+    int32_t last_p0 = INT32_MIN;
     for (auto & input : inputs) {
         input->set_input(ubatch);
+        if (watch_pos != nullptr && watch_pos->data != nullptr) {
+            int32_t p0 = 0;
+            ggml_backend_tensor_get(watch_pos, &p0, 0, sizeof(p0));
+            if (p0 != last_p0) {
+                fprintf(stderr, "DS4P-POSWATCH after=%s pos[0]=%d\n", typeid(*input).name(), p0);
+                last_p0 = p0;
+            }
+        }
     }
 }
 
