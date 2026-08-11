@@ -1194,7 +1194,7 @@ struct llm_graph_context {
     // belongs here" -- its own comment); it was arch-local by ACCIDENT, not by design.
     static bool paged_cache_type_supported(ggml_type type, bool allow_quant);
 
-    bool paged_layer_supported(const llama_kv_cache_paged_context * pctx, int il) const;
+    bool paged_layer_supported(const llama_kv_cache_paged_context * pctx, int il, bool partials = false) const;
 
     // ★ GENERIC PAGED CONSUMER. Returns the paged attention output for layer `il`, or nullptr if
     // this layer cannot be paged (caller then takes its normal static path).

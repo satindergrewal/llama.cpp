@@ -4507,7 +4507,7 @@ bool llama_kv_paged_supports_cache_type(enum ggml_type type) {
     return llm_graph_context::paged_cache_type_supported(type, /*allow_quant =*/ true);
 }
 
-bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context * pctx, int il) const {
+bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context * pctx, int il, bool partials) const {
     // ⚠ Each rejection names its REASON. The first version returned a bare false and the caller
     // logged "layer N fails the paged capability contract" -- which told me 90 layers were refused
     // on gemma and nothing about which condition. A refusal that does not say why is a marker that
@@ -4669,11 +4669,20 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
     // wrong for any other type). Until non-f16 instantiations actually exist, the champion serves
     // f16 pools only; everything else keeps the scalar path's staged-tile bound and its genuine
     // multi-type dequant.
-    const bool champ_geometry = champ_on && cparams.block_size == 64 &&
+    // ⚠ !partials: a partials-emitting layer CANNOT ride the champion (op_params[9] exclusion),
+    // so relaxing the staged-tile bound for it admits a layer whose only executor is the scalar
+    // kernel at an illegal geometry -- the smem assert fires (measured: 2 champion dispatches,
+    // then abort at bs=64/D=512 when the first partials layer hit the scalar path).
+    const bool champ_geometry = champ_on && !partials && cparams.block_size == 64 &&
                                 cparams.n_seq_max == 1 &&
                                 kv->type == GGML_TYPE_F16 &&
                                 (head_dim == 64 || head_dim == 96 || head_dim == 128 ||
-                                 head_dim == 192 || head_dim == 256);
+                                 head_dim == 192 || head_dim == 256 || head_dim == 512);
+                                // 512 admitted 2026-08-12 in LOCKSTEP with the metal-side hd_ok --
+                                // this list is the third copy of the champion contract, and the bs64
+                                // champion no-op went undiagnosed precisely because THIS copy lagged:
+                                // the raw layers silently took the static path while the A/B measured
+                                // 'champion' rates that contained no champion at all.
 
     if (!champ_geometry && (int64_t) cparams.block_size * head_dim > 8192) {
         // ⚠ NAME THE CONDITION THAT ACTUALLY FIRED. This message used to blame the staged-tile
@@ -4869,7 +4878,7 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
         }
     }
 
-    if (!paged_layer_supported(paged_ctx, il)) {
+    if (!paged_layer_supported(paged_ctx, il, partials)) {
         // NEVER fall back silently: a scheduler-driven decode landing on the static cache defeats
         // the paged design while producing correct-LOOKING tokens. That indistinguishability is
         // exactly what made audit finding 5 survive as long as it did.

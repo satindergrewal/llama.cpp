@@ -5281,6 +5281,12 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             if (why != last_why) { last_why = why;
                 GGML_LOG_INFO("%s: CHAMP-PAGED REFUSED (%s) D=%d bs=%d n_seq=%d n_tokens=%d\n",
                               __func__, why, head_dim, bs_pa_lpk, n_seq_c, n_tokens);
+                // stderr twin: the INFO line is swallowed by the server's log callback, and an
+                // unreadable refusal is how the bs64 champion no-op went undiagnosed.
+                if (getenv("DS4P_CHAMP_COUNT")) {
+                    fprintf(stderr, "DS4P-CHAMPREF (%s) D=%d bs=%d n_seq=%d n_tokens=%d\n",
+                            why, head_dim, bs_pa_lpk, n_seq_c, n_tokens);
+                }
             }
             // ⚠⚠ FATAL WHEN THE CAPABILITY GATE WAS RELAXED FOR US. llm_graph_context skips the
             // staged-tile bound (block_size*head_dim <= 8192) when the champion will serve, so a
@@ -5574,6 +5580,17 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(clens),    9);  // plen
             ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),      10);  // dst
             ggml_metal_encoder_set_threadgroup_memory_size(enc, cp.smem, 0);
+            // ★ DS4P_CHAMP_COUNT: stderr presence COUNTER. The GGML_LOG_INFO marker below is
+            // swallowed by the server's log callback, which is how a decode A/B got run with
+            // 'champion serving' assumed and the one-factor control had to expose that nothing
+            // measurable changed. A count on stderr is the marker the server cannot eat.
+            if (getenv("DS4P_CHAMP_COUNT")) {
+                static long champ_n = 0;
+                if ((++champ_n & (champ_n - 1)) == 0) {   // powers of two: bounded output
+                    fprintf(stderr, "DS4P-CHAMPN %ld dispatches (D=%d n_tokens=%d)\n",
+                            champ_n, head_dim, n_tokens);
+                }
+            }
             {
                 static int last = -1;
                 const int key = head_dim | (champ_nsg<<16);
