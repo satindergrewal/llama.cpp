@@ -1689,7 +1689,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.kv_paged = value;
         }
-    ).set_env("LLAMA_ARG_KV_PAGED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PAGED}));
+    ).set_env("LLAMA_ARG_KV_PAGED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PAGED, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--paged-pool-clamp"},
         "shrink n_ctx to the largest context the paged KV pool can fit, instead of refusing to start "
@@ -1697,7 +1697,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.paged_pool_clamp = true;
         }
-    ).set_env("LLAMA_ARG_PAGED_POOL_CLAMP").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PAGED}));
+    ).set_env("LLAMA_ARG_PAGED_POOL_CLAMP").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PAGED, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"-ncpub", "--n-cpu-blocks"}, "N",
         "number of physical CPU blocks for paged KV cache (default: 1)",
@@ -1708,7 +1708,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // 20 GiB beside a co-tenant (caught by the P2-8 evict/preempt arm)
             params.fit_params = false;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"-ngpub", "--n-gpu-blocks"}, "N",
         "number of physical GPU blocks for paged KV cache (default: 1)",
@@ -1716,7 +1716,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_gpu_blocks = value;
             params.fit_params   = false;  // explicit wins over the auto-fitter
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"-kvbls", "--kv-block-size"}, "N",
         "fixed number of tokens for a given paged block (default: 16)",
@@ -1726,7 +1726,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.block_size = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--kv-paged-watermark"}, "N",
         "fraction of blocks reserved before processing new requests (default: 0.05, range [0.0, 1.0))",
@@ -1737,7 +1737,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.kv_paged_watermark = potential_watermark;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
