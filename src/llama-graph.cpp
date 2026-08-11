@@ -1845,6 +1845,9 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
         }
+        if (!cur && getenv("DS4P_ALLOC_TRACE")) {
+            fprintf(stderr, "DS4P-REUSE-FAIL input=%s\n", typeid(*input).name());
+        }
 
         res = res && cur;
     }

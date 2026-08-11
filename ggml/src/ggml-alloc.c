@@ -1002,6 +1002,18 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
+    // ★ DS4P_ALLOC_TRACE: the three-way discriminator's allocator arm. Prints (1) any tensor
+    // whose grown size forces realloc, (2) any tensor SKIPPED because it already has data --
+    // the only two ways the check can matter. One env, stderr, diagnostics only.
+    if (getenv("DS4P_ALLOC_TRACE")) {
+        if (node_size > talloc->size_max) {
+            fprintf(stderr, "DS4P-ALLOC grow: %s node_size=%zu size_max=%zu -> realloc\n",
+                    node->name, node_size, talloc->size_max);
+        } else if (node->data != NULL && !node->view_src) {
+            fprintf(stderr, "DS4P-ALLOC skip-has-data: %s data=%p nbytes=%zu size_max=%zu\n",
+                    node->name, node->data, ggml_nbytes(node), talloc->size_max);
+        }
+    }
     return talloc->size_max >= node_size;
 }
 
@@ -1018,6 +1030,26 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
         return true;
+    }
+
+    // ★★ LEAF CHECK (2026-08-12). This function checked every NODE and every node's direct
+    // srcs -- and never the LEAFS. A graph input reached only through views has view_src set
+    // on the consumer side, so the per-src check sized it at 0 ("fits"); the LEAF's own slot
+    // was never compared at all. A leaf that GROWS between topology-matching builds (measured:
+    // a DSV4 raw kq mask stepping 131072 -> 262144 bytes when the iswa n_kv pads 256 -> 512)
+    // then inherits its old, smaller offset and overruns into the next leaf's slot -- in the
+    // measured case obliterating inp_pos with F16 -inf and corrupting every downstream rope.
+    // Sizes must be checked wherever offsets are reused: nodes AND leafs.
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        struct leaf_alloc * leaf_alloc = &galloc->leaf_allocs[i];
+
+        if (!ggml_gallocr_node_needs_realloc(galloc, leaf, &leaf_alloc->leaf)) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: leaf %s is not valid\n", __func__, leaf->name);
+#endif
+            return true;
+        }
     }
 
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -1049,6 +1081,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    if (getenv("DS4P_ALLOC_TRACE")) {
+        fprintf(stderr, "DS4P-ALLOC alloc_graph: n_nodes=%d n_leafs=%d -> needs_realloc=%d\n",
+                graph->n_nodes, graph->n_leafs, ggml_gallocr_needs_realloc(galloc, graph));
+    }
     if (ggml_gallocr_needs_realloc(galloc, graph)) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
