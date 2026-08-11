@@ -4958,6 +4958,8 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.probe             =*/ 0,   // diagnostics only
         /*.blk_class         =*/ 1,   // set again at each mask dispatch from DS4P_CHAMP_BLKCLASS
         /*.causal            =*/ op->op_params[8] != 0,
+        /*.has_sinks         =*/ op->src[11] != nullptr,
+        /*.pad0              =*/ 0,
         // ⚠ UNIT DEPENDS ON THE CACHE TYPE. f16: strides in HALVES. q8_0: strides in BLOCKS,
         // because both quantised kernels index block arrays. I wrote "strides are in BLOCKS" in
         // the q8_0 kernel comment and then left this computing halves -- a comment asserting an
@@ -5604,6 +5606,10 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(blens),    6);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rel ? rel : q), 7);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),       8);
+    // sinks at 9, dummy q when absent (the rel pattern one line up); args.has_sinks gates reads
+    ggml_metal_encoder_set_buffer  (enc, op->src[11] != nullptr
+                                         ? ggml_metal_get_buffer_id(op->src[11])
+                                         : ggml_metal_get_buffer_id(q),      9);
 
     // prefill stages K+V tiles (2 * block_size * head_dim halves); decode keeps its
     // combine area. Take the max so either path fits.
@@ -5639,7 +5645,16 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // how a silent wrong answer gets built on purpose. The numeric gate caught the gap on its first
     // execution (sinks arm PASSES with the champion, FAILS without); this makes it impossible to hit
     // by accident until the kernel actually supports them.
-    if (op->src[11] != nullptr) {
+    // ★ DS4P_SCALAR_SINKS=1 (Tier 2(b) bring-up, 2026-08-11): the three scalar finalize sites
+    // now carry the sink join (same math as the CPU reference). The abort below stays the DEFAULT
+    // until test-paged-vs-cpu is green on BOTH sink arms across the sub-paths -- then the flag
+    // flips to default-on and the abort retires. A half-verified kernel behind a default-on path
+    // is how silent wrong answers ship; a flag is how they don't.
+    static const bool scalar_sinks_on = []() {
+        const char * e = getenv("DS4P_SCALAR_SINKS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (op->src[11] != nullptr && !scalar_sinks_on) {
         GGML_ABORT("%s: paged attention reached the SCALAR kernel with attention sinks, which it does "
                    "not implement. Running would silently drop the sink from every layer. Use a "
                    "geometry the champion serves (block_size 64, n_seq 1, head_dim in the "

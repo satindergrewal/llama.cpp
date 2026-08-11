@@ -3130,6 +3130,11 @@ kernel void kernel_paged_attn_f32(
         device const int32_t * batch_lens    [[buffer(6)]],
         device const float   * rel           [[buffer(7)]],
         device       float   * dst           [[buffer(8)]],
+        // ★ SINKS (scalar paths, 2026-08-11). One f32 logit per head; joins the softmax
+        // DENOMINATOR only, after each path's running max is final -- the exact math of the
+        // CPU reference (ggml-cpu/ops.cpp sink join), so the finite arm of test-paged-vs-cpu
+        // compares like against like. Bound as q when absent; args.has_sinks gates every read.
+        device const float   * sinks         [[buffer(9)]],
         threadgroup float    * shmem         [[threadgroup(0)]],
         // MSL requires every built-in position input to be all-scalar or all-vector of
         // the SAME width; mixing uint3 with uint fails the whole library, not just this
@@ -3383,8 +3388,21 @@ kernel void kernel_paged_attn_f32(
                 const int  qg = qbase + (int) jl;
                 if (qg >= args.n_tokens_total) { continue; }   // safe: no barrier below
                 const uint64_t o_off = ((uint64_t) qg * args.n_heads + head_idx) * D;
+                // sink join, per row, WITHOUT mutating the shared Mr/Sr (other lanes still read
+                // them): fold the rescale into the divide. -INF guards keep the no-sink arm
+                // bit-exact (exp(-INF - m) must be 0, never NaN, even when Mr is itself -INF).
+                float sk_scale = 1.0f;
+                float sk_denom = Sr[jl] + 1e-6f;
+                if (args.has_sinks) {
+                    const float sk = sinks[head_idx];
+                    const float m2 = max(Mr[jl], sk);
+                    const float eo = (Mr[jl] == -INFINITY) ? 0.0f : exp(Mr[jl] - m2);
+                    const float es = (sk     == -INFINITY) ? 0.0f : exp(sk     - m2);
+                    sk_scale = eo;
+                    sk_denom = Sr[jl]*eo + es + 1e-6f;
+                }
                 for (uint i = lnm; i < (uint) D; i += 32) {
-                    dst[o_off + i] = so[jl*PV + i] / (Sr[jl] + 1e-6f);
+                    dst[o_off + i] = so[jl*PV + i] * sk_scale / sk_denom;
                 }
             }
             return;
@@ -3675,9 +3693,21 @@ kernel void kernel_paged_attn_f32(
         }
 
         if (row_ok) {
+            // sink join (see the MMA site above for the guards); m_i/l_i are per-thread copies
+            // uniform across the simdgroup, so mutating locals here races nothing.
+            float sk_scale = 1.0f;
+            float sk_denom = l_i + 1e-6f;
+            if (args.has_sinks) {
+                const float sk = sinks[head_idx];
+                const float m2 = max(m_i, sk);
+                const float eo = (m_i == -INFINITY) ? 0.0f : exp(m_i - m2);
+                const float es = (sk  == -INFINITY) ? 0.0f : exp(sk  - m2);
+                sk_scale = eo;
+                sk_denom = l_i*eo + es + 1e-6f;
+            }
             for (int i = 0; i < NPT; ++i) {
                 const int d2 = (int) lane + i*32;
-                if (d2 < D) { dst[q_off + d2] = accv[i] / (l_i + 1e-6f); }
+                if (d2 < D) { dst[q_off + d2] = accv[i] * sk_scale / sk_denom; }
             }
         }
         return;
@@ -3746,6 +3776,18 @@ kernel void kernel_paged_attn_f32(
         for (uint t = 0; t < nsg; ++t) {
             l_all += sh_l[t] * ((sh_m[t] == -INFINITY) ? 0.0f : exp(sh_m[t] - m_all));
         }
+        // sink join at the COMBINED max (the per-simdgroup partials were merged at m_all just
+        // above, so this is the one place the whole row's max is final). Local scalars in the
+        // sg==0 branch; no shared state touched.
+        float sk_scale = 1.0f;
+        if (args.has_sinks) {
+            const float sk = sinks[head_idx];
+            const float m2 = max(m_all, sk);
+            const float eo = (m_all == -INFINITY) ? 0.0f : exp(m_all - m2);
+            const float es = (sk    == -INFINITY) ? 0.0f : exp(sk    - m2);
+            sk_scale = eo;
+            l_all    = l_all*eo + es;
+        }
         for (int i = 0; i < NPT; ++i) {
             const int d = (int) lane + i*32;
             if (d < D) {
@@ -3753,7 +3795,7 @@ kernel void kernel_paged_attn_f32(
                 for (uint t = 0; t < nsg; ++t) {
                     a += sh_acc[t*D + d] * ((sh_m[t] == -INFINITY) ? 0.0f : exp(sh_m[t] - m_all));
                 }
-                dst[q_off + d] = a / (l_all + 1e-6f);
+                dst[q_off + d] = a * sk_scale / (l_all + 1e-6f);
             }
         }
     }

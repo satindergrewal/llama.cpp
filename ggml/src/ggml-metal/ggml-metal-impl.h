@@ -1306,6 +1306,8 @@ typedef struct {
     int32_t  probe;             // diagnostics ONLY; 0 = off. Never overload a semantic field.
     int32_t  blk_class;         // 1 = classify champion blocks 0/2 as well as 1; 0 = always 1
     int32_t  causal;            // 1 = causal mask; 0 = every written key visible (dflash)
+    int32_t  has_sinks;         // 1 = buffer(9) holds one f32 sink logit per head (scalar paths)
+    int32_t  pad0;              // keep the uint64 strides 8-aligned identically in C and MSL
     uint64_t stride_token;      // in halves
     uint64_t stride_head;
     uint64_t stride_block;
