@@ -1184,7 +1184,7 @@ struct llm_graph_context {
     // attention
     //
     // ★ CAPABILITY TEST for the paged path -- deliberately NOT an architecture check.
-    // the owner's bar is "I load ANY model, it works as I expect", and an arch allow-list can
+    // The owner's bar is "I load ANY model, it works as I expect", and an arch allow-list can
     // never satisfy that; a capability test can. This asks ONLY what the LAYER reports: does it
     // have a paged K tensor, is the head geometry one the kernel handles, is GQA evenly
     // divisible, is the cache type supported. No arch name appears anywhere in it.
