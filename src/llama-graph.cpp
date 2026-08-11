@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "ggml-paged-champ.h"
+
 #include <atomic>
 
 // ★★ PAGED-CONSUMER COUNTER. A paged pool can be built while ZERO layers consume it -- every layer
@@ -4675,16 +4677,11 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
     // then abort at bs=64/D=512 when the first partials layer hit the scalar path).
     // !partials removed (second landing): both champion kernels now emit partials via FC
     // constants, so a partials layer at bs=64 has a legal executor.
-    const bool champ_geometry = champ_on && cparams.block_size == 64 &&
-                                cparams.n_seq_max == 1 &&
-                                kv->type == GGML_TYPE_F16 &&
-                                (head_dim == 64 || head_dim == 96 || head_dim == 128 ||
-                                 head_dim == 192 || head_dim == 256 || head_dim == 512);
-                                // 512 admitted 2026-08-12 in LOCKSTEP with the metal-side hd_ok --
-                                // this list is the third copy of the champion contract, and the bs64
-                                // champion no-op went undiagnosed precisely because THIS copy lagged:
-                                // the raw layers silently took the static path while the A/B measured
-                                // 'champion' rates that contained no champion at all.
+    // ONE-copy contract: ggml-paged-champ.h (the lagging-copy incident lives in its header
+    // comment). n_seq_max stays here -- only this site sees cparams.
+    const bool champ_geometry = champ_on && cparams.n_seq_max == 1 &&
+                                ggml_paged_champ_geometry_ok((int) cparams.block_size, (int) head_dim,
+                                                             kv->type == GGML_TYPE_F16);
 
     if (!champ_geometry && (int64_t) cparams.block_size * head_dim > 8192) {
         // ⚠ NAME THE CONDITION THAT ACTUALLY FIRED. This message used to blame the staged-tile
