@@ -144,6 +144,17 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
 
+        // ★ DS4P_INPUT_PTRS: where does inp_pos actually LIVE, and what got written. The
+        // DS4P-POS capture proved the executed graph read mask-patterned garbage from this
+        // tensor at ub%256==0 chunk-2 -- so either this write went to a different address than
+        // the graph read, or something wrote over it after us. Print address + span + first
+        // value at write time; the mask set_input prints the same; overlap names the clobber.
+        if (getenv("DS4P_INPUT_PTRS")) {
+            fprintf(stderr, "DS4P-INPTR pos    tensor=%s data=%p bytes=%zu n=%lld pos0=%d\n",
+                    pos->name, pos->data, ggml_nbytes(pos), (long long) n_tokens,
+                    (int) ubatch->pos[0]);
+        }
+
         if (ubatch->token && n_pos_per_embd == 4) {
             // in case we're using M-RoPE with text tokens, convert the 1D positions to 4D
             // the 3 first dims are the same, and 4th dim is all 0
@@ -510,6 +521,11 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+    if (getenv("DS4P_INPUT_PTRS") && self_kq_mask) {
+        fprintf(stderr, "DS4P-INPTR kqmask tensor=%s data=%p bytes=%zu\n",
+                self_kq_mask->name, self_kq_mask->data, ggml_nbytes(self_kq_mask));
+    }
+
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
@@ -1011,6 +1027,18 @@ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
+    if (getenv("DS4P_INPUT_PTRS")) {
+        const comp_input * cis[] = { &inp_csa, &inp_hca };
+        const char * nm[] = { "csa", "hca" };
+        for (int ci = 0; ci < 2; ++ci) {
+            if (cis[ci]->kq_mask) {
+                fprintf(stderr, "DS4P-INPTR %smask tensor=%s data=%p bytes=%zu\n",
+                        nm[ci], cis[ci]->kq_mask->name, cis[ci]->kq_mask->data,
+                        ggml_nbytes(cis[ci]->kq_mask));
+            }
+        }
+    }
+
     const auto & plan_csa = mctx->get_csa_plan(*ubatch);
     const auto & plan_hca = mctx->get_hca_plan(*ubatch);
     const auto & plan_lid = mctx->get_lid_plan(*ubatch);

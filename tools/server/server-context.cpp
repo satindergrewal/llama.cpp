@@ -1356,8 +1356,8 @@ private:
                     ggml_backend_tensor_get((ggml_tensor *) pos, ph.data(), 0, np*sizeof(int32_t));
                     int64_t mn = np ? ph[0] : -1, mx = mn; double sum = 0.0;
                     for (int32_t x : ph) { mn = std::min<int64_t>(mn, x); mx = std::max<int64_t>(mx, x); sum += x; }
-                    fprintf(stderr, "DS4P-POS %s n=%zu pos[0]=%d pos[last]=%d min=%lld max=%lld sum=%.9g\n",
-                            n, np, np ? ph[0] : -1, np ? ph[np-1] : -1,
+                    fprintf(stderr, "DS4P-POS %s n=%zu data=%p pos[0]=%d pos[last]=%d min=%lld max=%lld sum=%.9g\n",
+                            n, np, pos->data, np ? ph[0] : -1, np ? ph[np-1] : -1,
                             (long long) mn, (long long) mx, sum);
                 }
                 std::vector<uint8_t> buf(ggml_nbytes(t));
