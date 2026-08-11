@@ -12840,6 +12840,31 @@ void kernel_paged_champ_impl(
             break;
         }
 
+        // ★ PARTIALS EMISSION (split-softmax step for the champion). Three differences from the
+        // normal store, exactly the card's three deletions plus a stride:
+        //   - O goes out UN-normalized (no 1/S scale -- the merge divides once, after joining)
+        //   - M and S ride at row offsets DV and DV+1
+        //   - the row stride is DV+2 floats, which breaks float4 alignment on odd rows, so this
+        //     branch stores SCALARS; the finalize is a trivial fraction of kernel time.
+        // The sink join above is compile-time absent for partials pipelines (no sinks src; the
+        // funnel asserts the pair). The merge owns the sink, once.
+        if (args.emit_partials) {
+            device float * dstp = (device float *) dst + ((uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1)*(uint64_t)(DV + 2);
+
+            for (short i = tiisg; i < DV4; i += NW) {
+                const float4 v = (float4) so4[j*PV4 + i];
+                dstp[4*i + 0] = v.x;
+                dstp[4*i + 1] = v.y;
+                dstp[4*i + 2] = v.z;
+                dstp[4*i + 3] = v.w;
+            }
+            if (tiisg == 0) {
+                dstp[DV + 0] = M[jj];
+                dstp[DV + 1] = S[jj];
+            }
+            continue;
+        }
+
         device float4 * dst4 = (device float4 *) dst + ((uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1)*DV4;
 
         const float scale = S[jj] == 0.0 ? 0.0f : 1.0f/S[jj];
