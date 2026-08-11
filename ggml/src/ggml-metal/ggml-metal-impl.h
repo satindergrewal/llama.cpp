@@ -1307,7 +1307,8 @@ typedef struct {
     int32_t  blk_class;         // 1 = classify champion blocks 0/2 as well as 1; 0 = always 1
     int32_t  causal;            // 1 = causal mask; 0 = every written key visible (dflash)
     int32_t  has_sinks;         // 1 = buffer(9) holds one f32 sink logit per head (scalar paths)
-    int32_t  pad0;              // keep the uint64 strides 8-aligned identically in C and MSL
+    int32_t  emit_partials;     // 1 = dst is [D+2,H,N]: un-normalized O + M(row D) + S(row D+1);
+                                //     scalar paths only (the champion writes normalized D-stride)
     uint64_t stride_token;      // in halves
     uint64_t stride_head;
     uint64_t stride_block;

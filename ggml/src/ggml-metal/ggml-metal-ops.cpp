@@ -4959,7 +4959,7 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
         /*.blk_class         =*/ 1,   // set again at each mask dispatch from DS4P_CHAMP_BLKCLASS
         /*.causal            =*/ op->op_params[8] != 0,
         /*.has_sinks         =*/ op->src[11] != nullptr,
-        /*.pad0              =*/ 0,
+        /*.emit_partials     =*/ op->op_params[9],
         // ⚠ UNIT DEPENDS ON THE CACHE TYPE. f16: strides in HALVES. q8_0: strides in BLOCKS,
         // because both quantised kernels index block arrays. I wrote "strides are in BLOCKS" in
         // the q8_0 kernel comment and then left this computing halves -- a comment asserting an
@@ -5202,7 +5202,12 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     //   n_seq == 1      : plen[0] is the single sequence's context length in this first cut.
     //   prefill only    : decode takes the combine path.
     //   head_dim in the instantiated set.
-    if (ggml_metal_paged_champ_enabled()) {
+    // ⚠ CONTRACT ROW FOR THE NEW ARGUMENT (landed with the argument, per the forward rule):
+    // partials are SCALAR-ONLY. The champion normalizes in-kernel and writes D-stride output; in
+    // partials mode that is the wrong layout AND the wrong values, silently. Excluding it here --
+    // rather than teaching the champion the mode -- keeps step 1 minimal; the merge composes with
+    // the scalar raw half, which is the half DSV4's CSA/HCA actually page.
+    if (ggml_metal_paged_champ_enabled() && op->op_params[9] == 0) {
         const int n_seq_c = (int) blens->ne[0];
         // 256 added 2026-08-06: the champion is now instantiated at dk256_dv256 and the Metal
         // shader COMPILES it (0 program_source errors at pipeline load), so the tile fits. The host

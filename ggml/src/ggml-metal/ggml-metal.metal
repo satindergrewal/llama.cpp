@@ -3399,7 +3399,15 @@ kernel void kernel_paged_attn_f32(
                 const uint jl = 8*sgm + r;
                 const int  qg = qbase + (int) jl;
                 if (qg >= args.n_tokens_total) { continue; }   // safe: no barrier below
-                const uint64_t o_off = ((uint64_t) qg * args.n_heads + head_idx) * D;
+                const int      ODm   = D + (args.emit_partials ? 2 : 0);
+                const uint64_t o_off = ((uint64_t) qg * args.n_heads + head_idx) * ODm;
+                if (args.emit_partials) {
+                    for (uint i = lnm; i < (uint) D; i += 32) {
+                        dst[o_off + i] = so[jl*PV + i];
+                    }
+                    if (lnm == 0) { dst[o_off + D] = Mr[jl]; dst[o_off + D + 1] = Sr[jl]; }
+                    continue;
+                }
                 // sink join, per row, WITHOUT mutating the shared Mr/Sr (other lanes still read
                 // them): fold the rescale into the divide. -INF guards keep the no-sink arm
                 // bit-exact (exp(-INF - m) must be 0, never NaN, even when Mr is itself -INF).
@@ -3451,7 +3459,13 @@ kernel void kernel_paged_attn_f32(
     const int lo      = args.visibility_window > 0
                       ? max(0, q_pos - args.visibility_window + 1) : 0;
 
-    const uint64_t q_off = (uint64_t) gtok * args.n_heads * D + (uint64_t) head_idx * D;
+    // ⚠ TWO OFFSETS, ONE FORMULA, DIFFERENT STRIDES -- the first partials build used OD for
+    // q_off and silently mis-read Q in partials mode (q is [D,H,N]; only DST grows to D+2).
+    // The gate caught it as a ~2e-2 "norm" divergence: plausible output, wrong queries. Admission/
+    // delivery again, inside its own fix: the stride was admitted, the wrong consumer received it.
+    const int      OD    = D + (args.emit_partials ? 2 : 0);
+    const uint64_t q_off = (uint64_t) gtok * args.n_heads * D  + (uint64_t) head_idx * D;   // Q READ
+    const uint64_t o_off = (uint64_t) gtok * args.n_heads * OD + (uint64_t) head_idx * OD;  // DST WRITE
     const int NPT = (D + 31) / 32;
     const uint nsg  = ntg / 32;
     const uint sg   = tpitg / 32;
@@ -3711,6 +3725,15 @@ kernel void kernel_paged_attn_f32(
         }
 
         if (row_ok) {
+            if (args.emit_partials) {
+                // un-normalized O; M and S in the tail. No sinks by contract (host asserts).
+                for (int i = 0; i < NPT; ++i) {
+                    const int d2 = (int) lane + i*32;
+                    if (d2 < D) { dst[o_off + d2] = accv[i]; }
+                }
+                if (lane == 0) { dst[o_off + D] = m_i; dst[o_off + D + 1] = l_i; }
+                return;
+            }
             // sink join (see the MMA site above for the guards); m_i/l_i are per-thread copies
             // uniform across the simdgroup, so mutating locals here races nothing.
             float sk_scale = 1.0f;
@@ -3725,7 +3748,7 @@ kernel void kernel_paged_attn_f32(
             }
             for (int i = 0; i < NPT; ++i) {
                 const int d2 = (int) lane + i*32;
-                if (d2 < D) { dst[q_off + d2] = accv[i] * sk_scale / sk_denom; }
+                if (d2 < D) { dst[o_off + d2] = accv[i] * sk_scale / sk_denom; }
             }
         }
         return;
@@ -3813,8 +3836,11 @@ kernel void kernel_paged_attn_f32(
                 for (uint t = 0; t < nsg; ++t) {
                     a += sh_acc[t*D + d] * ((sh_m[t] == -INFINITY) ? 0.0f : exp(sh_m[t] - m_all));
                 }
-                dst[q_off + d] = a * sk_scale / (l_all + 1e-6f);
+                dst[o_off + d] = args.emit_partials ? a : (a * sk_scale / (l_all + 1e-6f));
             }
+        }
+        if (args.emit_partials && lane == 0) {
+            dst[o_off + D] = m_all; dst[o_off + D + 1] = l_all;
         }
     }
 }
