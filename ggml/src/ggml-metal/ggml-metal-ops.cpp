@@ -5233,7 +5233,9 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
     // partials mode that is the wrong layout AND the wrong values, silently. Excluding it here --
     // rather than teaching the champion the mode -- keeps step 1 minimal; the merge composes with
     // the scalar raw half, which is the half DSV4's CSA/HCA actually page.
-    if (ggml_metal_paged_champ_enabled() && op->op_params[9] == 0) {
+    // op_params[9] (partials) no longer excludes the champion: both champ and champ_vec carry
+    // FC-constant partials branches (2026-08-12, second landing -- FC constant, not args field).
+    if (ggml_metal_paged_champ_enabled()) {
         const int n_seq_c = (int) blens->ne[0];
         // 256 added 2026-08-06: the champion is now instantiated at dk256_dv256 and the Metal
         // shader COMPILES it (0 program_source errors at pipeline load), so the tile fits. The host
@@ -5317,11 +5319,20 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             // own vec path runs nwg=32 for exactly this reason. DS4P_CHAMP_VEC_NWG=1 falls back to
             // the single-dispatch form as a one-factor control.
             int vec_nwg = DS4P_CHAMP_VEC_NWG;
+            // partials emission is NWG==1-only: the NWG>1 cross-workgroup combine has no
+            // partials mode and would normalize what must stay raw.
+            if (op->op_params[9] != 0) { vec_nwg = 1; }
             if (const char * e = getenv("DS4P_CHAMP_VEC_NWG")) {
                 const int v = atoi(e);
                 if (v == 1 || v == DS4P_CHAMP_VEC_NWG) { vec_nwg = v; }
             }
-            const int vec_nsg = vec_nwg == 1 ? 4 : 1;
+            // nsg default 4 at nwg=1 predates the D=512 use; the decode sweep on the champ
+            // (non-vec) found nsg monotonic to 32. Env knob for the A/B; default unchanged.
+            int vec_nsg = vec_nwg == 1 ? 4 : 1;
+            if (const char * e = getenv("DS4P_CHAMP_VEC_NSG")) {
+                const int v = atoi(e);
+                if (v == 1 || v == 2 || v == 4 || v == 8 || v == 16 || v == 32) { vec_nsg = v; }
+            }
             const bool has_sinks_d = op->src[11] != nullptr;
             auto vp = ggml_metal_library_get_pipeline_paged_champ_vec(lib, op, vec_nsg, vec_nwg, has_sinks_d);
             // ⚠ st is the ELEMENT stride and exists ONLY for ns10/ns20, which the f16 branch uses

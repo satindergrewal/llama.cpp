@@ -7269,6 +7269,10 @@ constant bool FC_flash_attn_ext_has_sinks [[function_constant(FC_FLASH_ATTN_EXT 
 constant bool FC_flash_attn_ext_has_bias  [[function_constant(FC_FLASH_ATTN_EXT + 2)]];
 constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT + 3)]];
 constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
+// ★ partials emission (split-softmax): the champion kernels branch on this at the sink-join
+// site. An FC constant, not an args field -- the champ kernels ride kargs_flash_attn_ext,
+// which has no emit_partials member (the reverted first attempt's core error).
+constant bool FC_flash_attn_ext_partials [[function_constant(FC_FLASH_ATTN_EXT + 5)]];
 
 constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 
@@ -8146,6 +8150,8 @@ constant bool FC_flash_attn_ext_vec_has_sinks [[function_constant(FC_FLASH_ATTN_
 constant bool FC_flash_attn_ext_vec_has_bias  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 2)]];
 constant bool FC_flash_attn_ext_vec_has_scap  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 3)]];
 constant bool FC_flash_attn_ext_vec_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT_VEC + 4)]];
+// ★ partials emission for the vec/decode champion -- see FC_flash_attn_ext_partials.
+constant bool FC_flash_attn_ext_vec_partials [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
 
 //constant float FC_flash_attn_ext_vec_scale         [[function_constant(FC_FLASH_ATTN_EXT_VEC + 10)]];
 //constant float FC_flash_attn_ext_vec_max_bias      [[function_constant(FC_FLASH_ATTN_EXT_VEC + 11)]];
@@ -12831,9 +12837,41 @@ void kernel_paged_champ_impl(
                 }
             }
         }
+
+        // ★ PARTIALS EMISSION (split-softmax): REPLACES sink-join + normalize. Emitted HERE, at
+        // the sink-join site, because M[] is BLOCK-scoped and dies before the normal store (the
+        // reverted first attempt wrote at the store and got 'M undeclared'). Contract mirrors the
+        // scalar kernel: [D+2] rows, O UN-normalized, M@DV, S@DV+1, scalar stores (514-float rows
+        // misalign float4 on odd rows). Sinks never coexist (funnel asserts; the merge owns the
+        // sink, once). Compile-time constant: zero cost on normal pipelines.
+        if (FC_flash_attn_ext_partials) {
+            FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                const short j = jj*NSG + sgitg;
+                if (iq1 + j >= args.ne01) {
+                    continue;
+                }
+
+                device float * dstp = (device float *) dst + ((uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1)*(uint64_t)(DV + 2);
+
+                for (short i = tiisg; i < DV4; i += NW) {
+                    const float4 v = (float4) so4[j*PV4 + i];
+                    dstp[4*i + 0] = v.x;
+                    dstp[4*i + 1] = v.y;
+                    dstp[4*i + 2] = v.z;
+                    dstp[4*i + 3] = v.w;
+                }
+                if (tiisg == 0) {
+                    dstp[DV + 0] = M[jj];
+                    dstp[DV + 1] = S[jj];
+                }
+            }
+        }
     }
 
     // store to global memory
+    if (FC_flash_attn_ext_partials) {
+        return;   // partials already stored at the sink-join site
+    }
     for (short jj = 0; jj < NQ; ++jj) {
         const short j = jj*NSG + sgitg;
         if (iq1 + j >= args.ne01) {
@@ -13716,6 +13754,27 @@ kernel void kernel_paged_champ_vec(
     if (sgitg == 0) {
         const int64_t nrows = args.ne3*args.ne2*args.ne1;
         const int64_t rid   = iq3*args.ne2*args.ne1 + iq2 + iq1*args.ne1;
+
+        // ★ PARTIALS EMISSION, vec/decode half (NWG==1-only; host forces nwg=1 for partials --
+        // the NWG>1 cross-workgroup combine has no partials mode). Same [D+2] contract as the
+        // champ prefill branch and the scalar kernel: O UN-normalized, M@DV, S@DV+1, scalar
+        // stores. ss[0]=S, ss[1]=M -- the NWG>1 emission order below, NOT the row order.
+        if (FC_flash_attn_ext_vec_partials) {
+            device float * dstp = (device float *) dst + rid*(uint64_t)(DV + 2);
+
+            for (short i = tiisg; i < DV4; i += NW) {
+                const float4 v = (float4) so4[i];
+                dstp[4*i + 0] = v.x;
+                dstp[4*i + 1] = v.y;
+                dstp[4*i + 2] = v.z;
+                dstp[4*i + 3] = v.w;
+            }
+            if (tiisg == 0) {
+                dstp[DV + 0] = ss[1];   // M
+                dstp[DV + 1] = ss[0];   // S
+            }
+            return;
+        }
 
         device float4 * dst4 = (device float4 *) dst;
         device float  * dst1 = (device float  *) dst + nrows*DV*NWG; // the S and M are stored after the results

@@ -1332,14 +1332,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_champ_vec(
     const ggml_tensor * kvc = op->src[3];
     const int32_t ns10 = (int32_t) (kvc->nb[1] / sizeof(ggml_fp16_t));   // stride_token, elements
 
+    const bool vec_partials = op->op_params[9] != 0;
     snprintf(base, 256, "kernel_paged_champ_vec_dk%d_dv%d", head_dim, head_dim);
-    snprintf(name, 256, "%s_ns%d_nsg%d_nwg%d_sk%d", base, ns10, nsg, nwg, has_sinks ? 1 : 0);
+    snprintf(name, 256, "%s_ns%d_nsg%d_nwg%d_sk%d_pp%d", base, ns10, nsg, nwg, has_sinks ? 1 : 0, vec_partials ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
         ggml_metal_cv_set_bool (cv, true,  FC_FLASH_ATTN_EXT_VEC + 0);   // has_mask: causality
         ggml_metal_cv_set_bool (cv, has_sinks, FC_FLASH_ATTN_EXT_VEC + 1);   // has_sinks
+        ggml_metal_cv_set_bool (cv, vec_partials, FC_FLASH_ATTN_EXT_VEC + 5);   // partials emission
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT_VEC + 2);
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT_VEC + 3);
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT_VEC + 4);   // kvpad: block walk handles the tail
@@ -1386,7 +1388,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_champ
     } else {
         snprintf(base, 256, "kernel_paged_attn_champ_dk%d_dv%d", head_dim, head_dim);
     }
-    snprintf(name, 256, "%s_nsg%d_ns%d_sk%d", base, nsg, ns10, has_sinks ? 1 : 0);
+    // partials rides IN THE NAME as well as the CV: two pipelines differing only in a function
+    // constant must not alias in the cache (the reverted first attempt's checklist, item 1).
+    const bool champ_partials = op->op_params[9] != 0;
+    snprintf(name, 256, "%s_nsg%d_ns%d_sk%d_pp%d", base, nsg, ns10, has_sinks ? 1 : 0, champ_partials ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1396,6 +1401,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_champ
         // not by a pad buffer. bc_mask off for the same reason.
         ggml_metal_cv_set_bool (cv, true,  FC_FLASH_ATTN_EXT + 0);   // has_mask: causality
         ggml_metal_cv_set_bool (cv, has_sinks, FC_FLASH_ATTN_EXT + 1);   // has_sinks
+        ggml_metal_cv_set_bool (cv, champ_partials, FC_FLASH_ATTN_EXT + 5);   // partials emission
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 2);
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 3);
         ggml_metal_cv_set_bool (cv, false, FC_FLASH_ATTN_EXT + 4);

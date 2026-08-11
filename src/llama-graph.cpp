@@ -4673,7 +4673,9 @@ bool llm_graph_context::paged_layer_supported(const llama_kv_cache_paged_context
     // so relaxing the staged-tile bound for it admits a layer whose only executor is the scalar
     // kernel at an illegal geometry -- the smem assert fires (measured: 2 champion dispatches,
     // then abort at bs=64/D=512 when the first partials layer hit the scalar path).
-    const bool champ_geometry = champ_on && !partials && cparams.block_size == 64 &&
+    // !partials removed (second landing): both champion kernels now emit partials via FC
+    // constants, so a partials layer at bs=64 has a legal executor.
+    const bool champ_geometry = champ_on && cparams.block_size == 64 &&
                                 cparams.n_seq_max == 1 &&
                                 kv->type == GGML_TYPE_F16 &&
                                 (head_dim == 64 || head_dim == 96 || head_dim == 128 ||
