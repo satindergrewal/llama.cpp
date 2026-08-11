@@ -1618,6 +1618,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(split_backend);
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
+                // ★ DS4P_SCHED_CPY: every user-input split copy of a small I32 tensor, verbatim.
+                // The DSV4 join run proved the ROPE reads garbage positions from a split-input
+                // copy that set_input had filled correctly on the host side -- so either this
+                // copy never fired for that graph, fired with the wrong pairing, or fired and
+                // was later clobbered. Printing src/dst/pointers/content at THE copy names which.
+                if (getenv("DS4P_SCHED_CPY") && input->type == GGML_TYPE_I32 && ggml_nelements(input) <= 8192) {
+                    int32_t v0 = 0, vc = 0;
+                    ggml_backend_tensor_get(input,     &v0, 0, sizeof(v0));
+                    ggml_backend_tensor_get(input_cpy, &vc, 0, sizeof(vc));
+                    fprintf(stderr, "DS4P-SCHEDCPY split=%d in=%s src=%p dst=%s dstp=%p n=%lld src0=%d dst0=%d\n",
+                            split_id, input->name, input->data, input_cpy->name, input_cpy->data,
+                            (long long) ggml_nelements(input), v0, vc);
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
