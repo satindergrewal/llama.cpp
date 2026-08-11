@@ -12115,7 +12115,16 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
     // ★ CAUSAL at op_params[8]. 0 means every WRITTEN key is visible -- dflash's attention is
     // non-causal by design. The bound becomes ctx_len rather than q_pos + 1.
     const int causal = dst->op_params[8];
+    // ★ PARTIALS (op_params[9], split-softmax composition): emit un-normalized O plus M and S as
+    // two extra rows, so a graph-side merge can combine this half with a dense masked half.
+    // This CPU path is the M/S ORACLE: the self-consistency check (normalize(partials) == normal)
+    // cannot see a wrong M -- M cancels out of O/(S+eps) -- so the gate compares all three fields
+    // against this reference. Contract: partials exclude sinks (the constructor passes none; the
+    // sink joins exactly once, at the merge).
+    const int emit_partials = dst->op_params[9];
     if (sinks) {
+        GGML_ASSERT(!emit_partials && "paged attention: partials mode excludes sinks -- the sink "
+                    "joins at the graph-side merge, once (see the partials constructor)");
         GGML_ASSERT(sinks->type == GGML_TYPE_F32 && ggml_is_contiguous(sinks) &&
                     "paged attention: sinks must be contiguous F32 (reference impl)");
     }
@@ -12430,10 +12439,20 @@ void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_te
                     qk_max = qk_max_new;
                 }
 
-                // Write output
-                const size_t out_idx = (size_t) token_batch_idx * n_heads * head_dim + (size_t) h_id * head_dim;
-                for (int d_id = 0; d_id < head_dim; ++d_id) {
-                    out_data[out_idx + d_id] = acc[d_id] / (exp_sum + 1e-6f);
+                // Write output. Partials mode defers the divide to the merge and appends
+                // M (row D) and S (row D+1) -- the two fields only THIS reference can vouch for.
+                const int    out_stride = head_dim + (emit_partials ? 2 : 0);
+                const size_t out_idx = (size_t) token_batch_idx * n_heads * out_stride + (size_t) h_id * out_stride;
+                if (emit_partials) {
+                    for (int d_id = 0; d_id < head_dim; ++d_id) {
+                        out_data[out_idx + d_id] = acc[d_id];
+                    }
+                    out_data[out_idx + head_dim]     = qk_max;
+                    out_data[out_idx + head_dim + 1] = exp_sum;
+                } else {
+                    for (int d_id = 0; d_id < head_dim; ++d_id) {
+                        out_data[out_idx + d_id] = acc[d_id] / (exp_sum + 1e-6f);
+                    }
                 }
             }
         }

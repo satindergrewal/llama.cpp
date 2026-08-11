@@ -47,7 +47,9 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
                                     // causal DEFAULTED TO 1, and the non-causal arm quietly tested
                                     // causal attention. It compiled. It ran. It "passed" its CPU
                                     // comparison, because both sides were causal.
-                                    bool read_only_check = false) {
+                                    bool read_only_check = false,
+                                    // LAST, per the two scars above.
+                                    bool partials = false) {
     // ⚠ H/HKV ARE ENV-OVERRIDABLE so the harness can be REPLAYED at the server's real geometry.
     // The ARGDUMP showed the server running head_dim=256, n_heads=16, n_heads_kv=4 (GQA 4:1) with
     // n_blocks=1 -- while this file had GQA 2:1 hardcoded. Every "PASS" it has printed was at a GQA
@@ -93,7 +95,11 @@ static std::vector<float> run_paged(ggml_backend_t backend, int D, bool with_rel
     ggml_tensor * sinks_p = sink_mode ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H) : nullptr;
     if (sinks_p) { ggml_set_name(sinks_p, "sinks"); }
 
-    ggml_tensor * out_p = ggml_paged_attn_banded(ctx, q_p, k_new, v_new, cache, cache,
+    GGML_ASSERT(!(partials && sink_mode) && "partials excludes sinks (merge-side join)");
+    ggml_tensor * out_p = partials
+        ? ggml_paged_attn_banded_partials(ctx, q_p, k_new, v_new, cache, cache,
+            btab, slots, clens, boffs, blens, rel_p, scale, BS, NB, NB, with_rel ? E : 1, window, causal)
+        : ggml_paged_attn_banded(ctx, q_p, k_new, v_new, cache, cache,
             btab, slots, clens, boffs, blens, rel_p, scale, BS, NB, NB, sinks_p, with_rel ? E : 1, window, causal);
     ggml_set_name(out_p, "out_paged");
 
@@ -468,6 +474,38 @@ int main() {
                 printf("D=%3d non-causal differs from causal: max_abs=%.3e %s\n",
                        D, dc, dc > 1e-3 ? "PASS" : "FAIL (flag is a no-op)");
                 n_fail += dc > 1e-3 ? 0 : 1;
+
+                // ★ PARTIALS ARM (split-softmax step 1). Two checks, deliberately BOTH:
+                //   1. O, M and S each against the CPU oracle -- because the self-consistency
+                //      check below CANNOT see a wrong M (M cancels out of O/(S+eps)), and M is
+                //      the field the merge depends on.
+                //   2. normalize(partials) against this backend's own NORMAL answer -- proves the
+                //      deferred divide is the only difference on the fast path.
+                {
+                    const std::vector<float> pm = run_paged(backend, D, with_rel, window, GGML_TYPE_F16, 0, 1, false, true);
+                    const std::vector<float> pcref = run_paged(cpu,  D, with_rel, window, GGML_TYPE_F16, 0, 1, false, true);
+                    double mo = 0.0;
+                    for (size_t i = 0; i < pm.size() && i < pcref.size(); ++i)
+                        mo = std::max(mo, (double) fabs(pm[i]-pcref[i]));
+                    printf("D=%3d partials OMS : max_abs=%.3e %s\n", D, mo, mo < 2e-3 ? "PASS" : "FAIL");
+                    n_fail += mo < 2e-3 ? 0 : 1;
+
+                    // env-derived exactly as run_paged derives it -- a hardcoded 4 here is the
+                    // "bound beside a sized array" scar this file already documents twice.
+                    const int H = getenv("DS4P_TEST_H") ? atoi(getenv("DS4P_TEST_H")) : 4;
+                    const int N = (int) (a.size() / ((size_t) H * D));
+                    double mn2 = 0.0;
+                    for (int t = 0; t < N; ++t) for (int h = 0; h < H; ++h) {
+                        const size_t pi = ((size_t) t*H + h) * (D + 2);
+                        const float  S  = pm[pi + D + 1];
+                        for (int d = 0; d < D; ++d) {
+                            const float norm = pm[pi + d] / (S + 1e-6f);
+                            mn2 = std::max(mn2, (double) fabs(norm - a[((size_t) t*H + h)*D + d]));
+                        }
+                    }
+                    printf("D=%3d partials norm: max_abs=%.3e %s\n", D, mn2, mn2 < 2e-3 ? "PASS" : "FAIL");
+                    n_fail += mn2 < 2e-3 ? 0 : 1;
+                }
 
                 // ★ READ-ONLY: same pool, second op with K/V null, must equal the ordinary answer.
                 // It is ON now that the op implements it (n_heads_kv comes from the pool, the write

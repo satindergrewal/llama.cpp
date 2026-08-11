@@ -8355,3 +8355,43 @@ struct ggml_tensor * ggml_paged_attn_banded(
 
     return result;
 }
+
+struct ggml_tensor * ggml_paged_attn_banded_partials(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * q,
+    struct ggml_tensor  * k_new,
+    struct ggml_tensor  * v_new,
+    struct ggml_tensor  * k_cache,
+    struct ggml_tensor  * v_cache,
+    struct ggml_tensor  * block_table,
+    struct ggml_tensor  * write_slots,
+    struct ggml_tensor  * context_lens,
+    struct ggml_tensor  * batch_offsets,
+    struct ggml_tensor  * batch_lens,
+    struct ggml_tensor  * rel_logits,
+    float                 scale,
+    int                   block_size,
+    int                   max_blocks,
+    int                   max_blocks_live,
+    int64_t               rel_extent,
+    int64_t               visibility_window,
+    int                   causal) {
+
+    // sinks deliberately absent from the signature: in split-softmax composition the sink joins
+    // exactly once, at the graph-side merge. Passing one here would double-count it.
+    struct ggml_tensor * result = ggml_paged_attn_banded(ctx, q, k_new, v_new, k_cache, v_cache,
+            block_table, write_slots, context_lens, batch_offsets, batch_lens, rel_logits,
+            scale, block_size, max_blocks, max_blocks_live, /*sinks=*/NULL,
+            rel_extent, visibility_window, causal);
+
+    // the base constructor mirrors q's shape; partials carry two extra rows (M at D, S at D+1),
+    // so dst needs its OWN geometry. Contiguous [D+2, H, N] in q->type.
+    const int64_t ne[4] = { q->ne[0] + 2, q->ne[1], q->ne[2], q->ne[3] };
+    struct ggml_tensor * dstp = ggml_new_tensor(ctx, q->type, ggml_n_dims(q), ne);
+    dstp->op = result->op;
+    memcpy(dstp->op_params, result->op_params, sizeof(result->op_params));
+    for (int i = 0; i < GGML_MAX_SRC; ++i) { dstp->src[i] = result->src[i]; }
+    dstp->op_params[9] = 1;   // emit_partials
+
+    return dstp;
+}

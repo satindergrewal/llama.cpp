@@ -3035,6 +3035,36 @@ extern "C" {
                                                   int64_t               visibility_window,
                                                   int                   causal);
 
+    // Partials variant for split-softmax composition (DSV4 CSA/HCA): returns UN-normalized
+    // attention as [head_dim+2, n_heads, n_tokens] -- rows [0,D) hold O (numerator), row D the
+    // running max M, row D+1 the denominator S. normalize = O / (S + eps); two partials merge as
+    //   m = max(M1,M2);  out = (O1*e^{M1-m} + O2*e^{M2-m}) / (S1*e^{M1-m} + S2*e^{M2-m})
+    // which is plain graph algebra -- no merge kernel needed.
+    // ⚠ CONTRACT (audit row for the new argument, same commit as the argument itself):
+    //   - partials take NO sinks: a sink joins a softmax exactly once, and in split composition
+    //     that once is the MERGE, graph-side. The constructor asserts.
+    //   - M and S are only meaningful against the SAME scale/band/causal settings on both halves
+    //     of a merge; the caller owns that agreement.
+    GGML_API struct ggml_tensor * ggml_paged_attn_banded_partials(struct ggml_context * ctx,
+                                                  struct ggml_tensor  * q,
+                                                  struct ggml_tensor  * k_new,
+                                                  struct ggml_tensor  * v_new,
+                                                  struct ggml_tensor  * k_cache,
+                                                  struct ggml_tensor  * v_cache,
+                                                  struct ggml_tensor  * block_table,
+                                                  struct ggml_tensor  * write_slots,
+                                                  struct ggml_tensor  * context_lens,
+                                                  struct ggml_tensor  * batch_offsets,
+                                                  struct ggml_tensor  * batch_lens,
+                                                  struct ggml_tensor  * rel_logits,
+                                                  float                 scale,
+                                                  int                   block_size,
+                                                  int                   max_blocks,
+                                                  int                   max_blocks_live,
+                                                  int64_t               rel_extent,
+                                                  int64_t               visibility_window,
+                                                  int                   causal);
+
 #ifdef  __cplusplus
 }
 #endif
