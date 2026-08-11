@@ -1234,6 +1234,20 @@ struct llama_model_deepseek4 : public llama_model_base {
                 float kq_scale,
                 int il) const;
 
+        // ★ Split-softmax merge (Tier 2(a) step 2): combine the RAW half's paged partials
+        // [D+2,H,N] with a DENSE compressed half (comp_k attended under comp_mask), the sink
+        // folding into the merged denominator exactly once. Returns the mha-shaped [D*H, N].
+        // The dense math mirrors build_attn_mha's non-flash path with the softmax decomposed
+        // at a true row max (pool_1d MAX -- the row-max ggml never had as a named op).
+        ggml_tensor * build_split_paged_attention(
+                ggml_tensor * pg_partials,
+                ggml_tensor * q,
+                ggml_tensor * comp_k,
+                ggml_tensor * comp_mask,
+                ggml_tensor * sinks,
+                float kq_scale,
+                int il) const;
+
         ggml_tensor * build_hc_pre(
                 ggml_tensor * x,
                 ggml_tensor * weights,

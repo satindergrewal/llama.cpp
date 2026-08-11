@@ -379,11 +379,110 @@ static std::vector<float> run_paged_split(ggml_backend_t backend, int D, bool wi
     return out;
 }
 
+// ★ MERGE-ALGEBRA ORACLE (split-softmax step 2). The DSV4 wiring produced degenerate output with
+// every marker green -- plumbing cannot distinguish wrong algebra from right, so the algebra gets
+// its own arm on synthetic data: reference = ONE softmax attention over concat(k1,k2) with a mask
+// on the k2 half; candidate = the exact merge recipe (pool_1d row-max, exp/sum_rows halves, LSE
+// combine) built from raw ggml ops. Runs on whichever backend it is handed; CPU vs Metal agreement
+// on the candidate is checked by the caller running it twice.
+static double merge_algebra_check(ggml_backend_t backend, int D, int H, int N, int n1, int n2) {
+    ggml_init_params ip = { 256*1024*1024, nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+
+    ggml_tensor * q  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, N, H);   // pre-permuted [D,N,H]
+    ggml_tensor * k1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n1, H);
+    ggml_tensor * k2 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n2, H);
+    ggml_tensor * mk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n2, N);     // mask on the k2 half
+    const float scale = 0.25f;
+
+    // reference: softmax over the concat with mask [0 | mk]
+    ggml_tensor * kall = ggml_concat(ctx, k1, k2, 1);
+    ggml_tensor * z0   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n1, N);
+    ggml_tensor * mall = ggml_concat(ctx, z0, mk, 0);
+    ggml_tensor * kqA  = ggml_mul_mat(ctx, kall, q);                       // [n1+n2, N, H]
+    ggml_mul_mat_set_prec(kqA, GGML_PREC_F32);
+    ggml_tensor * pA   = ggml_soft_max_ext(ctx, kqA, mall, scale, 0.0f);
+    ggml_tensor * vAt  = ggml_cont(ctx, ggml_transpose(ctx, kall));
+    ggml_tensor * outA = ggml_mul_mat(ctx, vAt, pA);                       // [D, N, H]
+    ggml_set_name(outA, "ref");
+
+    // candidate: decompose BOTH halves, merge with the recipe
+    ggml_tensor * kq1 = ggml_mul_mat(ctx, k1, q); ggml_mul_mat_set_prec(kq1, GGML_PREC_F32);
+    ggml_tensor * s1  = ggml_scale(ctx, kq1, scale);
+    ggml_tensor * s1c = ggml_cont(ctx, s1);
+    ggml_tensor * M1  = ggml_pool_1d(ctx, s1c, GGML_OP_POOL_MAX, n1, n1, 0);   // [1,N,H]
+    ggml_tensor * p1  = ggml_exp(ctx, ggml_sub(ctx, s1c, M1));
+    ggml_tensor * S1  = ggml_sum_rows(ctx, p1);
+    ggml_tensor * v1t = ggml_cont(ctx, ggml_transpose(ctx, k1));
+    ggml_tensor * O1  = ggml_mul_mat(ctx, v1t, p1);                            // [D,N,H]
+
+    ggml_tensor * kq2 = ggml_mul_mat(ctx, k2, q); ggml_mul_mat_set_prec(kq2, GGML_PREC_F32);
+    ggml_tensor * s2  = ggml_add(ctx, ggml_scale(ctx, kq2, scale), mk);
+    ggml_tensor * s2c = ggml_clamp(ctx, ggml_cont(ctx, s2), -1e9f, INFINITY);   // NaN-safety, as the helper
+    ggml_tensor * M2  = ggml_pool_1d(ctx, s2c, GGML_OP_POOL_MAX, n2, n2, 0);
+    ggml_tensor * m   = ggml_add(ctx, M2, ggml_relu(ctx, ggml_sub(ctx, M1, M2)));
+    ggml_tensor * e1  = ggml_exp(ctx, ggml_sub(ctx, M1, m));
+    ggml_tensor * p2  = ggml_exp(ctx, ggml_sub(ctx, s2c, m));
+    ggml_tensor * S2  = ggml_sum_rows(ctx, p2);
+    ggml_tensor * v2t = ggml_cont(ctx, ggml_transpose(ctx, k2));
+    ggml_tensor * O2  = ggml_mul_mat(ctx, v2t, p2);
+
+    ggml_tensor * O   = ggml_add(ctx, ggml_mul(ctx, O1, e1), O2);
+    ggml_tensor * S   = ggml_add(ctx, ggml_mul(ctx, S1, e1), S2);
+    ggml_tensor * outB = ggml_div(ctx, O, S);
+    ggml_set_name(outB, "cand");
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buf);
+
+    auto fillt = [&](ggml_tensor * t, float base, float step) {
+        std::vector<float> tmp(ggml_nelements(t));
+        for (size_t i = 0; i < tmp.size(); ++i) tmp[i] = sinf(base + step * (float) i);
+        ggml_backend_tensor_set(t, tmp.data(), 0, ggml_nbytes(t));
+    };
+    fillt(q, 0.1f, 0.37f); fillt(k1, 0.5f, 0.23f); fillt(k2, 0.9f, 0.31f);
+    { // mask: a third of the k2 entries -inf (the top-k shape) -- and query 0's row is ALL -inf,
+      // because a fully-masked dense row is exactly the case that produced -inf + inf = NaN in
+      // the live wiring while this oracle stayed green. A gate that never presents the killing
+      // input is a gate that cannot fail.
+        std::vector<float> tmp((size_t) n2 * N);
+        for (size_t i = 0; i < tmp.size(); ++i) tmp[i] = (i % 3 == 0) ? -INFINITY : 0.0f;
+        for (int j = 0; j < n2; ++j) tmp[j] = -INFINITY;
+        ggml_backend_tensor_set(mk, tmp.data(), 0, ggml_nbytes(mk));
+    }
+    { std::vector<float> z((size_t) n1 * N, 0.0f);
+      ggml_backend_tensor_set(z0, z.data(), 0, ggml_nbytes(z0)); }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, outA);
+    ggml_build_forward_expand(gf, outB);
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+    std::vector<float> ra(ggml_nelements(outA)), rb(ggml_nelements(outB));
+    ggml_backend_tensor_get(outA, ra.data(), 0, ggml_nbytes(outA));
+    ggml_backend_tensor_get(outB, rb.data(), 0, ggml_nbytes(outB));
+
+    double mx = 0.0;
+    for (size_t i = 0; i < ra.size(); ++i) mx = std::max(mx, (double) fabs(ra[i]-rb[i]));
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return mx;
+}
+
 int main() {
     ggml_backend_t backend = ggml_backend_init_best();
     GGML_ASSERT(backend);
     ggml_backend_t cpu = ggml_backend_cpu_init();
     GGML_ASSERT(cpu);
+
+    {
+        const double mc = merge_algebra_check(cpu,     64, 4, 5, 40, 24);
+        const double mm = merge_algebra_check(backend, 64, 4, 5, 40, 24);
+        printf("merge-algebra  cpu: max_abs=%.3e %s   metal: max_abs=%.3e %s\n",
+               mc, mc < 1e-4 ? "PASS" : "FAIL", mm, mm < 1e-4 ? "PASS" : "FAIL");
+        if (mc >= 1e-4 || mm >= 1e-4) { printf("test-paged-vs-cpu: merge algebra FAILED\n"); return 1; }
+    }
 
     const bool same = strcmp(ggml_backend_name(backend), ggml_backend_name(cpu)) == 0;
     printf("backend: %s   reference: %s%s\n", ggml_backend_name(backend), ggml_backend_name(cpu),

@@ -4640,7 +4640,10 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
         ggml_tensor * rel,
         int64_t       rel_extent,
         ggml_tensor * sinks,
-        bool          causal) const {
+        bool          causal,
+        bool          partials) const {
+    GGML_ASSERT(!(partials && sinks != nullptr) &&
+                "paged partials exclude sinks -- the sink joins once, at the graph-side merge");
     if (paged_ctx == nullptr) {
         // ⚠ THIS EXIT WAS SILENT, and that silence cost hours on Hy3 2026-08-06. The layer-contract
         // exit below warns; this one did not, so "paged pool is live but no layer ever paged" and
@@ -4842,7 +4845,17 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
 
     ggml_tensor * rel_p = rel ? ggml_cont(ctx0, rel) : nullptr;
 
-    ggml_tensor * cur_p = ggml_paged_attn_banded(ctx0,
+    ggml_tensor * cur_p = partials
+        ? ggml_paged_attn_banded_partials(ctx0,
+            q, k, v, kv_cache_l, kv_cache_l,
+            inp_paged->paged_block_table, inp_paged->paged_write_slots,
+            inp_paged->paged_context_lens, inp_paged->paged_batch_offsets,
+            inp_paged->paged_batch_lens, rel_p,
+            kq_scale, (int) cparams.block_size, (int) inp_paged->paged_block_table->ne[0],
+            ds4p_live_blocks(paged_ctx, (int) cparams.block_size,
+                             (int) inp_paged->paged_block_table->ne[0]),
+            rel_extent, visibility_window, causal ? 1 : 0)
+        : ggml_paged_attn_banded(ctx0,
             q, k, v, kv_cache_l, kv_cache_l,
             inp_paged->paged_block_table, inp_paged->paged_write_slots,
             inp_paged->paged_context_lens, inp_paged->paged_batch_offsets,
@@ -4852,7 +4865,9 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
                              (int) inp_paged->paged_block_table->ne[0]),
             sinks, rel_extent, visibility_window, causal ? 1 : 0);
 
-    ggml_tensor * cur = ggml_reshape_2d(ctx0, cur_p, cur_p->ne[0]*cur_p->ne[1], cur_p->ne[2]);
+    // partials keep [D+2,H,N] for the merge; the normal path flattens as before
+    ggml_tensor * cur = partials ? cur_p
+                                 : ggml_reshape_2d(ctx0, cur_p, cur_p->ne[0]*cur_p->ne[1], cur_p->ne[2]);
 
     // ★ CONSUMER-SIDE PRESENCE MARKER. Every other paged signal in this fork is either produced
     // upstream of the graph (DS4P-CHECKOUT: the block pool served a request) or fires on the FAILURE

@@ -757,6 +757,49 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_build_forward_expand(gf, q);
     ggml_build_forward_expand(gf, kv);
 
+    // ★ Tier 2(a) step 2: SPLIT-SOFTMAX. The raw half is the same windowed-causal span the raw
+    // layers page (partials; the sink is withheld here and joins at the merge, once); the
+    // compressed half stays dense under its top-k mask. Resolution at the COMPOSITE mctx, same
+    // as the raw builder. Placed BEFORE the static cpy_k for the raw-builder's reason: a
+    // paged-served layer's raw cache is consumed only by its own attention, so the static write
+    // is skipped, not duplicated. A null/refused funnel falls through to the static path intact.
+    {
+        // DS4P_SPLIT=csa|hca|all|off -- bring-up discriminator, default all
+        static const char * split_sel = getenv("DS4P_SPLIT") ? getenv("DS4P_SPLIT") : "all";
+        const bool split_on = strcmp(split_sel, "all") == 0 || strcmp(split_sel, "csa") == 0;
+        const auto * pg_ctx = (mctx && split_on) ? mctx->get_attn_paged() : nullptr;
+        // ⚠ UNLIKE the raw builder, the static raw write STAYS under the split -- CONSERVATIVELY.
+        // Honest record: the degenerate '=====' this line was first added against turned out to be
+        // the NaN in the merge (fully-masked dense row -> -inf + inf), NOT write starvation; the
+        // write alone did not fix it and the clamp alone was never tested without the write. It
+        // stays because the compressor/indexer machinery plausibly reads the raw CACHE (not the
+        // in-flight kv) when committing compressed rows, and a starved commit would only surface
+        // beyond a short smoke's horizon. Removing it needs a long-conversation gate, not a hunch.
+        if (pg_ctx) {
+            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+        }
+        ggml_tensor * pgp = build_attn_paged_or_null(pg_ctx, q, kv, kv, kq_scale, il,
+                                /*visibility_window=*/ hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0,
+                                /*rel=*/nullptr, /*rel_extent=*/0, /*sinks=*/nullptr,
+                                /*causal=*/true, /*partials=*/true);
+        if (pgp) {
+            ggml_tensor * csa_k_sp = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
+            const int64_t n_csa_sp = inp_csa.kq_mask->ne[0];
+            GGML_ASSERT(n_csa_sp > 0 && n_csa_sp <= csa_k_sp->ne[2]);
+            csa_k_sp = ggml_view_4d(ctx0, csa_k_sp,
+                    csa_k_sp->ne[0], csa_k_sp->ne[1], n_csa_sp, csa_k_sp->ne[3],
+                    csa_k_sp->nb[1], csa_k_sp->nb[2], csa_k_sp->nb[3], 0);
+            ggml_tensor * csa_mask_sp = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+            ggml_tensor * out_sp = build_split_paged_attention(pgp, q, csa_k_sp, csa_mask_sp,
+                                                               sinks, kq_scale, il);
+            if (k_rot) {
+                out_sp = llama_mul_mat_hadamard(ctx0, out_sp, k_rot);
+            }
+            cb(out_sp, "attn_csa_lid", il);
+            return out_sp;
+        }
+    }
+
     const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
 
     ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
@@ -812,6 +855,43 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     ggml_build_forward_expand(gf, q);
     ggml_build_forward_expand(gf, kv);
 
+    // ★ Tier 2(a) step 2: split-softmax, same shape as the CSA branch (see there for the why);
+    // HCA's mask needs no top-k build -- it is inp_hca.kq_mask directly.
+    {
+        static const char * split_sel = getenv("DS4P_SPLIT") ? getenv("DS4P_SPLIT") : "all";
+        const bool split_on = strcmp(split_sel, "all") == 0 || strcmp(split_sel, "hca") == 0;
+        const auto * pg_ctx = (mctx && split_on) ? mctx->get_attn_paged() : nullptr;
+        // ⚠ UNLIKE the raw builder, the static raw write STAYS under the split -- CONSERVATIVELY.
+        // Honest record: the degenerate '=====' this line was first added against turned out to be
+        // the NaN in the merge (fully-masked dense row -> -inf + inf), NOT write starvation; the
+        // write alone did not fix it and the clamp alone was never tested without the write. It
+        // stays because the compressor/indexer machinery plausibly reads the raw CACHE (not the
+        // in-flight kv) when committing compressed rows, and a starved commit would only surface
+        // beyond a short smoke's horizon. Removing it needs a long-conversation gate, not a hunch.
+        if (pg_ctx) {
+            ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+        }
+        ggml_tensor * pgp = build_attn_paged_or_null(pg_ctx, q, kv, kv, kq_scale, il,
+                                /*visibility_window=*/ hparams.is_swa(il) ? (int64_t) hparams.n_swa : 0,
+                                /*rel=*/nullptr, /*rel_extent=*/0, /*sinks=*/nullptr,
+                                /*causal=*/true, /*partials=*/true);
+        if (pgp) {
+            ggml_tensor * hca_k_sp = inp_dsv4->mctx->get_hca()->get_k(ctx0, il);
+            const int64_t n_hca_sp = inp_hca.kq_mask->ne[0];
+            GGML_ASSERT(n_hca_sp > 0 && n_hca_sp <= hca_k_sp->ne[2]);
+            hca_k_sp = ggml_view_4d(ctx0, hca_k_sp,
+                    hca_k_sp->ne[0], hca_k_sp->ne[1], n_hca_sp, hca_k_sp->ne[3],
+                    hca_k_sp->nb[1], hca_k_sp->nb[2], hca_k_sp->nb[3], 0);
+            ggml_tensor * out_sp = build_split_paged_attention(pgp, q, hca_k_sp, inp_hca.kq_mask,
+                                                               sinks, kq_scale, il);
+            if (k_rot) {
+                out_sp = llama_mul_mat_hadamard(ctx0, out_sp, k_rot);
+            }
+            cb(out_sp, "attn_hca", il);
+            return out_sp;
+        }
+    }
+
     const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
 
     ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
@@ -844,6 +924,95 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     }
     cb(out, "attn_hca", il);
 
+    return out;
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_split_paged_attention(
+        ggml_tensor * pg_partials,
+        ggml_tensor * q,
+        ggml_tensor * comp_k,
+        ggml_tensor * comp_mask,
+        ggml_tensor * sinks,
+        float kq_scale,
+        int il) const {
+    // Bring-up constraints, asserted rather than assumed: single stream, no alibi. Both hold for
+    // DSV4 under the dev flags (-np 1); widening either is a deliberate change, not a default.
+    GGML_ASSERT(comp_k->ne[3] == 1 && "split merge: single stream only (bring-up)");
+    GGML_ASSERT(hparams.f_max_alibi_bias == 0.0f && "split merge: no alibi (bring-up)");
+
+    const int64_t D = q->ne[0];
+    const int64_t H = q->ne[1];
+    const int64_t N = q->ne[2];
+    GGML_ASSERT(pg_partials->ne[0] == D + 2 && pg_partials->ne[1] == H && pg_partials->ne[2] == N);
+
+    // --- views of the paged partials: O1 [D,H,N], M1/S1 [1,H,N] (row stride spans D+2) ---
+    ggml_tensor * O1 = ggml_view_3d(ctx0, pg_partials, D, H, N,
+            pg_partials->nb[1], pg_partials->nb[2], 0);
+    ggml_tensor * M1 = ggml_view_3d(ctx0, pg_partials, 1, H, N,
+            pg_partials->nb[1], pg_partials->nb[2], (size_t) D * ggml_type_size(pg_partials->type));
+    ggml_tensor * S1 = ggml_view_3d(ctx0, pg_partials, 1, H, N,
+            pg_partials->nb[1], pg_partials->nb[2], (size_t) (D + 1) * ggml_type_size(pg_partials->type));
+
+    // --- dense half, mirroring build_attn_mha's non-flash choreography ---
+    ggml_tensor * qp = ggml_permute(ctx0, q,      0, 2, 1, 3);   // [D, N, H]
+    ggml_tensor * kp = ggml_permute(ctx0, comp_k, 0, 2, 1, 3);   // [D, n_comp, Hkv]
+    ggml_tensor * vp = ggml_permute(ctx0, comp_k, 0, 2, 1, 3);   // K == V on this arch
+
+    ggml_tensor * kq = ggml_mul_mat(ctx0, kp, qp);               // [n_comp, N, H]
+    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+    cb(kq, "split_kq", il);
+
+    // soft_max_ext computes softmax(kq*scale + mask); the decomposition reproduces that sum
+    // explicitly so M and S exist as tensors.
+    ggml_tensor * s2 = ggml_scale(ctx0, kq, kq_scale);
+    // flash-attn configurations build F16 masks; the decomposition adds in F32
+    ggml_tensor * mask_f32 = comp_mask->type == GGML_TYPE_F32
+                           ? comp_mask : ggml_cast(ctx0, comp_mask, GGML_TYPE_F32);
+    s2 = ggml_add(ctx0, s2, mask_f32);                           // -inf on unselected: top-k for free
+    cb(s2, "split_s2", il);
+
+    // true row max: pool_1d(MAX) over the full row -- Metal-implemented (ggml-metal-ops.cpp:474)
+    // ⚠ CLAMPED first: a FULLY-masked row (top-k selecting nothing -- guaranteed at short
+    // prompts) makes m2 = -inf, and m2 + relu(M1 - m2) = -inf + inf = NaN, which poisons the
+    // whole output (measured: '=====' degenerate, consume green, aborts zero -- algebra-level
+    // NaN is invisible to every plumbing marker). -1e9 keeps exp(s - m) an exact 0 for masked
+    // entries while every finite score within 80 nats of the max is untouched.
+    ggml_tensor * s2c = ggml_clamp(ctx0, ggml_cont(ctx0, s2), -1e9f, INFINITY);
+    ggml_tensor * m2  = ggml_pool_1d(ctx0, s2c, GGML_OP_POOL_MAX, (int) s2c->ne[0], (int) s2c->ne[0], 0);
+    cb(m2, "split_m2", il);                                      // [1, N, H]
+
+    // merged reference max: m = max(M1p, m2) = m2 + relu(M1p - m2)
+    ggml_tensor * M1p = ggml_permute(ctx0, M1, 0, 2, 1, 3);      // [1, N, H]
+    ggml_tensor * S1p = ggml_permute(ctx0, S1, 0, 2, 1, 3);
+    ggml_tensor * O1p = ggml_permute(ctx0, O1, 0, 2, 1, 3);      // [D, N, H]
+    ggml_tensor * m   = ggml_add(ctx0, m2, ggml_relu(ctx0, ggml_sub(ctx0, ggml_cont(ctx0, M1p), m2)));
+    cb(m, "split_m", il);
+
+    ggml_tensor * e1 = ggml_exp(ctx0, ggml_sub(ctx0, ggml_cont(ctx0, M1p), m));   // [1,N,H]
+    ggml_tensor * p2 = ggml_exp(ctx0, ggml_sub(ctx0, s2c, m));                    // [n_comp,N,H]
+
+    ggml_tensor * S2 = ggml_sum_rows(ctx0, p2);                  // [1, N, H]
+
+    // kqv, exactly as mha does it: v transposed-contiguous, then mul_mat(v, p)
+    ggml_tensor * vt = ggml_cont(ctx0, ggml_transpose(ctx0, vp));
+    ggml_tensor * O2 = ggml_mul_mat(ctx0, vt, p2);               // [D, N, H]
+
+    ggml_tensor * O = ggml_add(ctx0, ggml_mul(ctx0, ggml_cont(ctx0, O1p), e1), O2);
+    ggml_tensor * S = ggml_add(ctx0, ggml_mul(ctx0, ggml_cont(ctx0, S1p), e1), S2);
+
+    if (sinks) {
+        // the sink joins the merged denominator ONCE -- the partials contract's other half
+        ggml_tensor * sk3 = ggml_reshape_3d(ctx0, sinks, 1, 1, H);
+        // sub broadcasts b INTO a, so the [1,N,H]-shaped operand must be a: sk-m = -(m-sk)
+        S = ggml_add(ctx0, S, ggml_exp(ctx0, ggml_neg(ctx0, ggml_sub(ctx0, m, sk3))));
+    }
+
+    ggml_tensor * out = ggml_div(ctx0, O, S);                    // [D, N, H]
+    out = ggml_permute(ctx0, out, 0, 2, 1, 3);                   // [D, H, N]
+    out = ggml_cont_2d(ctx0, out, D * H, N);
+    cb(out, "split_merged", il);
+
+    ggml_build_forward_expand(gf, out);
     return out;
 }
 
