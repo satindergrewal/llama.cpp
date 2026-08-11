@@ -1309,13 +1309,33 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
 
         auto sinfos_raw_swa_read = dsv4_build_raw_read_sinfos(sinfos_raw_swa_write, ubatches);
 
-        return std::make_unique<llama_kv_cache_dsv4_context>(
+        // ★ THE FIFTH SET FUNNEL (Tier 1 of DSV4 paging). The four existing funnels
+        // (hybrid, hybrid-iswa, iswa x2) attach the paged batch context inside their own
+        // init_batch; the dsv4 composite had the accessor (Tier 0) and NO producer, so the
+        // consumer logged "no paged context" 107x on a live pool -- measured 2026-08-11,
+        // true DS4P-SET fires: ZERO (every prior count was the consumer's own advisory text
+        // matching the grep). Correct-producer-no-consumer's mirror image, fifth instance
+        // of the funnel class in this lineage.
+        llama_memory_context_ptr paged_ctx;
+        if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
+            paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches);   // copy: ctx owns originals
+        }
+
+        auto ctx = std::make_unique<llama_kv_cache_dsv4_context>(
                 this,
                 std::move(sinfos_raw_base_write),
                 std::move(sinfos_raw_swa_write),
                 std::move(sinfos_raw_swa_read),
                 std::move(ubatches),
                 std::move(ubatches_raw));
+
+        LLAMA_LOG_DEBUG("%s: DS4P-SET attn paged ctx=%p on dsv4 ctx=%p\n", __func__,
+                        (const void *) paged_ctx.get(), (const void *) ctx.get());
+        if (paged_ctx) {
+            ctx->set_attn_paged_ctx(std::move(paged_ctx));
+        }
+
+        return ctx;
     };
 
     // Match llama_kv_cache_iswa splitting when DSV4 compressed state does not

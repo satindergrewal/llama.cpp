@@ -866,6 +866,38 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
     ggml_build_forward_expand(gf, q);
     ggml_build_forward_expand(gf, kv);
 
+    // ★ Tier 1 of DSV4 paging: the raw (compress_ratio 0) layers are the one shape the paged
+    // funnel already serves -- STANDARD window (read from the loader, not inferred), causal, sinks
+    // supported, and the Hadamard rotation sits entirely OUTSIDE the kernel (q/kv arrive rotated,
+    // the pool stores rotated kv, the output is rotated back below -- same on both branches).
+    //
+    // Resolution is at the COMPOSITE (this graph's base mctx is llama_kv_cache_dsv4_context, which
+    // overrides get_attn_paged() as of Tier 0) -- NOT at inp_attn->mctx, which is the raw CHILD
+    // context and would return nullptr every time: the hybrid-resolution rule, and the silent
+    // static-fallback it prevents is the one measured on Qwen3.6 (110 layer-instances, exit-A).
+    //
+    // ⚠ MERGED K=V, option (a): this arch runs build_attn_mha(q, k, k) -- one tensor for both.
+    // The paged pool stores K and V as separate planes, so the funnel is handed kv TWICE and
+    // writes it into both. Correctness-first; the V=K aliasing that halves the waste is folded
+    // into the Tier 2 kernel pass. Bounded: only the raw layers (5 of 46 on the 0731 GGUF).
+    //
+    // ⚠ The static cpy_k below is SKIPPED when the paged branch serves: these layers' raw cache
+    // is consumed only by their own attention (the CSA/HCA compressors run on their OWN layers'
+    // caches), so a paged-served layer leaving the static cache unwritten orphans nothing.
+    // wo convention here is NONE (build_attn_mha gets nullptr) -- the paged branch returns raw
+    // attention output into the same post-rotation, applying nothing.
+    const auto * pg_ctx = mctx ? mctx->get_attn_paged() : nullptr;
+    ggml_tensor * out_pg = build_attn_paged_or_null(pg_ctx, q, kv, kv, kq_scale, il,
+                               /*visibility_window=*/ (int64_t) hparams.n_swa,
+                               /*rel=*/nullptr, /*rel_extent=*/0, sinks, /*causal=*/true);
+    if (out_pg) {
+        if (k_rot) {
+            out_pg = llama_mul_mat_hadamard(ctx0, out_pg, k_rot);
+        }
+        cb(out_pg, "attn_raw", il);
+        return out_pg;
+    }
+
     const llama_kv_cache_dsv4_raw_context * mctx_cur = inp_attn->mctx;
 
     ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));

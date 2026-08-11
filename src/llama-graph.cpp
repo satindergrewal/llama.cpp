@@ -4692,6 +4692,46 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
         return nullptr;
     }
 
+    // ⚠⚠ SINKS, CHECKED WHERE THE ARGUMENT IS VISIBLE -- the same shape as the window guard above.
+    //
+    // Only the CHAMPION kernel implements attention sinks; the scalar kernel ABORTS on them by
+    // design (ggml-metal-ops.cpp: running without the sink drops probability mass from every
+    // softmax and produces fluent, wrong output). paged_layer_supported() cannot see this argument,
+    // so until 2026-08-11 the contract ADMITTED a sinks layer whose geometry lands on the scalar
+    // kernel -- and the abort fired at the first decode. Measured on DSV4 Tier 1 bring-up: the raw
+    // layers pass sinks at head_dim 512, the champion has no d512 instantiation, the scalar path
+    // aborted the server. The admission test was narrower than the kernel's real precondition,
+    // second instance of the class (the first was n_seq_max).
+    //
+    // The champion serves sinks iff its whole contract holds: DS4P_METAL_CHAMP=1, block_size 64,
+    // n_seq_max 1, head_dim in the instantiated set. Anything else with sinks must take the static
+    // path, loudly. (The predicate is duplicated from paged_layer_supported's champ_geometry on
+    // purpose: it must sit next to the argument it judges, per the window precedent above. If the
+    // champion's instantiated set changes, BOTH sites change -- each comment names the other.)
+    if (sinks != nullptr) {
+        static const bool champ_on_sinks = []() {
+            const char * e = getenv("DS4P_METAL_CHAMP");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        const int64_t hd = hparams.n_embd_head_v(il);
+        const bool champ_serves = champ_on_sinks && cparams.block_size == 64 &&
+                                  cparams.n_seq_max == 1 &&
+                                  (hd == 64 || hd == 96 || hd == 128 || hd == 192 || hd == 256);
+        if (!champ_serves) {
+            static int last_sink_il = -2;
+            if (il != last_sink_il) {
+                last_sink_il = il;
+                LLAMA_LOG_WARN("%s: layer %d passes attention SINKS, which only the champion "
+                               "kernel implements, and this configuration cannot take the champion "
+                               "(champ=%d bs=%u n_seq_max=%u head_dim=%lld; need champ on, bs 64, "
+                               "n_seq_max 1, head_dim in {64,96,128,192,256}) -- this layer takes "
+                               "the static path\n", __func__, il, (int) champ_on_sinks,
+                               cparams.block_size, cparams.n_seq_max, (long long) hd);
+            }
+            return nullptr;
+        }
+    }
+
     if (!paged_layer_supported(paged_ctx, il)) {
         // NEVER fall back silently: a scheduler-driven decode landing on the static cache defeats
         // the paged design while producing correct-LOOKING tokens. That indistinguishability is
