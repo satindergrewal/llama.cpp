@@ -1339,11 +1339,27 @@ private:
             params_base.cb_eval = [](struct ggml_tensor * t, bool ask, void * ud) -> bool {
                 (void) ud;
                 const char * n = t->name;
-                const bool want = n && (strncmp(n, "split_", 6) == 0 ||
-                                        strncmp(n, "attn_",  5) == 0 ||
-                                        strncmp(n, "l_out",  5) == 0);
+                // kv_pe = the rope node whose src[1] IS inp_pos: observing it post-execution is
+                // the zero-pos deduction's confirm instrument (boarded 2026-08-12). The filter
+                // claims only layer "-2"'s instance to keep the split count low.
+                const bool want_pos = n && strncmp(n, "kv_pe-2", 7) == 0;
+                const bool want = want_pos ||
+                                  (n && (strncmp(n, "split_", 6) == 0 ||
+                                         strncmp(n, "attn_",  5) == 0 ||
+                                         strncmp(n, "l_out",  5) == 0));
                 if (ask)   { return want; }
                 if (!want) { return true; }
+                if (want_pos && t->src[1] != nullptr && t->src[1]->type == GGML_TYPE_I32) {
+                    const ggml_tensor * pos = t->src[1];
+                    const size_t np = (size_t) ggml_nelements(pos);
+                    std::vector<int32_t> ph(np);
+                    ggml_backend_tensor_get((ggml_tensor *) pos, ph.data(), 0, np*sizeof(int32_t));
+                    int64_t mn = np ? ph[0] : -1, mx = mn; double sum = 0.0;
+                    for (int32_t x : ph) { mn = std::min<int64_t>(mn, x); mx = std::max<int64_t>(mx, x); sum += x; }
+                    fprintf(stderr, "DS4P-POS %s n=%zu pos[0]=%d pos[last]=%d min=%lld max=%lld sum=%.9g\n",
+                            n, np, np ? ph[0] : -1, np ? ph[np-1] : -1,
+                            (long long) mn, (long long) mx, sum);
+                }
                 std::vector<uint8_t> buf(ggml_nbytes(t));
                 ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
                 const size_t ne = (size_t) ggml_nelements(t);
