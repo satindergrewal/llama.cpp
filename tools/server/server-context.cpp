@@ -2139,6 +2139,30 @@ private:
 
             const llama_tokens toks = slot.task->tokens.get_text_tokens();
 
+            // ★ ADMISSION PARITY WITH THE STATIC PATH. update_slots() runs a request-size check
+            // before prompt processing ("request (N tokens) exceeds the available context size"),
+            // but paged slots never reach it -- update_slots() returns early into
+            // update_slots_paged(), so the one place that refuses oversized requests upfront is
+            // exactly the place paged serving skips. Measured 2026-08-11 (35B, -c 98304 -np 2,
+            // so 49,152 tokens per slot, request 50,011 tokens): the STATIC arm refused in ~0 s with
+            // the named limit; the PAGED arm ADMITTED the request, prefilled all 50,011 tokens
+            // (527 s of GPU), then failed with a generic "paged decode failed" -- and the next
+            // 12-token request on the poisoned slot failed the same way.
+            // Same check, same bound, same message text as the static site: the gates match
+            // designed refusals on MESSAGE TEXT, and two different strings for one refusal is how
+            // a gate goes blind (see the media refusal above for the pattern).
+            // ⚠ the SLOT overload, not the id one: send_error(id,...) defaults its token counts to
+            // 0 and the EXCEED_CONTEXT_SIZE branch asserts both > 0 -- the 3-arg form would turn
+            // this refusal into a server ABORT. Caught by reading the overload before compiling.
+            if ((int32_t) toks.size() >= slot.n_ctx) {
+                send_error(slot,
+                    string_format("request (%d tokens) exceeds the available context size (%d "
+                                  "tokens), try increasing it",
+                                  (int32_t) toks.size(), slot.n_ctx),
+                    ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                return false;
+            }
+
             // P1-5 WARM ADMIT. get_available_slot() has already run prompt_load(), so if
             // this prompt hit the RAM cache or the disk bank, slot.prompt.tokens is the
             // RESTORED record and its KV is parked in the paged cache waiting to be
