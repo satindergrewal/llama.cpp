@@ -735,6 +735,34 @@ int32_t llama_kv_cache_paged::debug_seq_kv_checksum(const llama_sequence_group &
                 break;  // beyond the group's allocated span
             }
             const size_t off_base = (size_t) group.block_table[bt] * nb_block + (size_t) (t % block_size) * nb_token;
+            // ★ DS4P_KVSUM_ROWDUMP="lo-hi": raw first-8-halves of the K row for tokens in [lo,hi],
+            // layers 0-2 -- POST-EXECUTION pool truth through the same addressing as the checksum.
+            // Encode-time tensor_get in the op handler lies on Metal (graph encodes before it
+            // runs); this is the valid placement. Byte PATTERN tells the story: garbage vs
+            // an identifiable other-token's row.
+            if (il < 3) {
+                static int rd_lo = -1, rd_hi = -2;
+                static bool rd_init = false;
+                if (!rd_init) {
+                    rd_init = true;
+                    if (const char * e = getenv("DS4P_KVSUM_ROWDUMP")) { sscanf(e, "%d-%d", &rd_lo, &rd_hi); }
+                }
+                if (t >= rd_lo && t <= rd_hi) {
+                    // Per head-plane (K then V) x per row segment: a full-row bit-sum plus the
+                    // first 4 halves. The first-8-halves-of-K version printed IDENTICAL rows
+                    // while the full checksum differed -- the divergence hides deeper in the row
+                    // or in the V plane, so cover the WHOLE row this time.
+                    for (uint32_t hp = 0; hp < 2 * n_heads_kv; ++hp) {
+                        std::vector<uint16_t> rr(row_sz / 2);
+                        ggml_backend_tensor_get(kv, rr.data(), off_base + (size_t) hp * nb_head, row_sz);
+                        uint64_t bitsum = 0;
+                        for (uint16_t x : rr) { bitsum += x; }
+                        fprintf(stderr, "DS4P-ROWDUMP L%d t=%d hp=%u blk=%d off=%d bitsum=%llu head4: %04x %04x %04x %04x\n",
+                                il, t, hp, (int) group.block_table[bt], (int) (t % block_size),
+                                (unsigned long long) bitsum, rr[0], rr[1], rr[2], rr[3]);
+                    }
+                }
+            }
             for (uint32_t h = 0; h < 2 * n_heads_kv; ++h) {  // K heads then V heads (interleaved layout)
                 ggml_backend_tensor_get(kv, buf.data(), off_base + (size_t) h * nb_head, row_sz);
                 const uint16_t * half_vals = (const uint16_t *) buf.data();
