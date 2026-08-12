@@ -525,10 +525,10 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
             continue;
         }
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-            continue; // FIXME: ISWA KV cache initialization needs more fixture params
+            continue; // FIXME: ISWA KV fixture params; also arch_supported() denylists it (@ngxson)
         }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
-            continue;
+            continue;  // speculative DRAFT heads -- not standalone-servable, paging N/A by design
         }
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
