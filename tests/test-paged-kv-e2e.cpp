@@ -148,6 +148,12 @@ static path_result run_paged(const std::string & model_path) {
     bool        did_accept_probe        = false;
     llama_batch batch                   = {};
 
+    // #19 Tier 1: DS4P_NO_SPEC=1 strips the speculative-decode probes (sentinel + draft +
+    // multi-accept), leaving a CLEAN basic paged decode. minimax-m3's MSA memory does not
+    // implement draft rollback, so the probes false-fail it; this isolates "does basic paged
+    // decode match non-paged" from "does speculation work".
+    const bool no_spec = getenv("DS4P_NO_SPEC") != nullptr;
+
     while ((int) result.tokens.size() < N_PREDICT) {
         bool prepared = llama_paged_scheduler_prepare_batch(sched, &batch);
         EXPECT_TRUE(prepared);
@@ -198,7 +204,7 @@ static path_result run_paged(const std::string & model_path) {
         // of this test, and they must produce IDENTICAL results -- a sentinel row is BY DEFINITION
         // today's behaviour, just reached through the other branch and the other token layout.
         // If the two ever disagree, this test fails rather than B inheriting a broken contract.
-        const bool use_sentinel = (result.tokens.size() % 2) == 1;
+        const bool use_sentinel = !no_spec && (result.tokens.size() % 2) == 1;
         if (use_sentinel) {
             // batch-offset layout: sentinel rows read their ONE token at batch_offsets[i]
             std::vector<llama_token> toks((size_t) info->batch_offsets[0] + (size_t) info->batch_lens[0], 0);
@@ -276,7 +282,7 @@ static path_result run_paged(const std::string & model_path) {
         //   - accepting both must advance n_past by exactly 2 (A's blocks, D's counter, E's max_pos)
         // and the generated text must be IDENTICAL to the non-drafting run, because greedy
         // speculative decoding is lossless. compare_results() at the end is what enforces that.
-        if (!did_draft_probe && result.tokens.size() >= 2) {
+        if (!no_spec && !did_draft_probe && result.tokens.size() >= 2) {
             did_draft_probe = true;
 
             // draft one token: whatever greedy would pick next is unknown here, so use the token we
