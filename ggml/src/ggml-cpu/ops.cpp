@@ -12104,6 +12104,60 @@ void ggml_compute_forward_lightning_indexer(
     }
 }
 
+// #19: STORE-ONLY write into the interleaved paged pool. Reference (single-threaded) impl using the
+// index math verified by a standalone CPU round-trip test (2026-08-13):
+//   kv_cache [hd, bs, 2*hkv, nblk]; token t (ws=write_slots[t]): K head h -> (d, ws%bs, h,       ws/bs)
+//   V head h -> (d, ws%bs, hkv+h, ws/bs). dst aliases kv_cache (write in place through its data ptr).
+void ggml_compute_forward_paged_kv_store(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * kv  = dst->src[0]; // [hd, bs, 2*hkv, nblk] -- dst aliases this
+    const ggml_tensor * k   = dst->src[1]; // [hd, hkv, n_tokens]
+    const ggml_tensor * v   = dst->src[2]; // [hd, hkv, n_tokens]
+    const ggml_tensor * ws  = dst->src[3]; // [n_tokens] i32
+    const int bs   = ((const int32_t *) dst->op_params)[0];
+    const int64_t hd   = kv->ne[0];
+    const int64_t hkv  = kv->ne[2] / 2;
+    const int64_t nblk = kv->ne[3];
+    const int64_t ntok = k->ne[2];
+    GGML_ASSERT(kv->ne[1] == bs && "paged_kv_store: kv_cache ne[1] must be block_size");
+    GGML_ASSERT(k->ne[0] == hd && k->ne[1] == hkv && "paged_kv_store: k_cur shape");
+    GGML_ASSERT(v->ne[0] == hd && v->ne[1] == hkv && "paged_kv_store: v_cur shape");
+    GGML_ASSERT(ws->type == GGML_TYPE_I32);
+    GGML_ASSERT((kv->type == GGML_TYPE_F16 || kv->type == GGML_TYPE_F32) && "paged_kv_store: pool f16/f32");
+
+    const int32_t * slots = (const int32_t *) ws->data;
+    char * kvbase = (char *) kv->data;
+
+    for (int64_t t = 0; t < ntok; ++t) {
+        const int32_t s = slots[t];
+        if (s < 0) { continue; } // unmapped token slot -- skip
+        const int64_t blk = s / bs, pos = s % bs;
+        GGML_ASSERT(blk < nblk && "paged_kv_store: write slot exceeds pool blocks");
+        for (int64_t h = 0; h < hkv; ++h) {
+            const char * ksrc = (const char *) k->data + h*k->nb[1] + t*k->nb[2];
+            const char * vsrc = (const char *) v->data + h*v->nb[1] + t*v->nb[2];
+            for (int64_t d = 0; d < hd; ++d) {
+                const float kval = (k->type == GGML_TYPE_F16)
+                    ? GGML_FP16_TO_FP32(((const ggml_fp16_t *) ksrc)[d]) : ((const float *) ksrc)[d];
+                const float vval = (v->type == GGML_TYPE_F16)
+                    ? GGML_FP16_TO_FP32(((const ggml_fp16_t *) vsrc)[d]) : ((const float *) vsrc)[d];
+                // K head h at i2=h ; V head h at i2=hkv+h
+                char * kdst = kvbase + d*kv->nb[0] + pos*kv->nb[1] + (h)      *kv->nb[2] + blk*kv->nb[3];
+                char * vdst = kvbase + d*kv->nb[0] + pos*kv->nb[1] + (hkv + h)*kv->nb[2] + blk*kv->nb[3];
+                if (kv->type == GGML_TYPE_F16) {
+                    *((ggml_fp16_t *) kdst) = GGML_FP32_TO_FP16(kval);
+                    *((ggml_fp16_t *) vdst) = GGML_FP32_TO_FP16(vval);
+                } else {
+                    *((float *) kdst) = kval;
+                    *((float *) vdst) = vval;
+                }
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_tensor * dst) {
     // Single threaded reference
     if (params->ith != 0) {

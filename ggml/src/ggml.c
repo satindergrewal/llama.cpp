@@ -1168,9 +1168,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "PAGED_ATTN",
+    "PAGED_KV_STORE",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1287,9 +1288,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "paged_attn(x)",
+    "paged_kv_store(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -8304,6 +8306,38 @@ struct ggml_tensor * ggml_paged_attn(
     // [0..3] hold scale/block_size/max_blocks/max_blocks_live and [4..7] hold rel_extent and
     // visibility_window as int64 pairs, so [8] is the first free slot.
     result->op_params[8] = 1;
+
+    return result;
+}
+
+// #19 (minimax-m3 MSA paging): STORE-ONLY write into the paged pool. The existing paged ops fuse
+// store+attend; MSA does its own sparse attention, so it needs to WRITE K/V into the interleaved
+// pool buffer without attending. Layout (llama-kv-cache-paged.cpp:202): kv_cache is
+// [head_dim, block_size, 2*n_head_kv, n_blocks]; token t at write_slots[t]=ws writes K head h into
+// [:, ws%bs, h, ws/bs] and V head h into [:, ws%bs, hkv+h, ws/bs] (index math verified by a
+// standalone CPU round-trip test, 2026-08-13). The RESULT ALIASES kv_cache (a view sharing its
+// data): it represents the pool AFTER the store, so any consumer that reads the result is ordered
+// after this op -- that is how store-before-gather is expressed to the graph without a fused kernel.
+struct ggml_tensor * ggml_paged_kv_store(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * kv_cache,     // [hd, bs, 2*hkv, nblk], written in place
+    struct ggml_tensor  * k_cur,        // [hd, hkv, n_tokens]
+    struct ggml_tensor  * v_cur,        // [hd, hkv, n_tokens]
+    struct ggml_tensor  * write_slots,  // [n_tokens] i32
+    int                   block_size) {
+    GGML_ASSERT(ggml_is_contiguous(k_cur) && "paged_kv_store: k_cur must be contiguous");
+    GGML_ASSERT(ggml_is_contiguous(v_cur) && "paged_kv_store: v_cur must be contiguous");
+    GGML_ASSERT(write_slots->type == GGML_TYPE_I32);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, kv_cache); // aliases kv_cache (post-store view)
+    result->op     = GGML_OP_PAGED_KV_STORE;
+    result->src[0] = kv_cache;
+    result->src[1] = k_cur;
+    result->src[2] = v_cur;
+    result->src[3] = write_slots;
+
+    int32_t * p = (int32_t *) result->op_params;
+    p[0] = block_size;
 
     return result;
 }

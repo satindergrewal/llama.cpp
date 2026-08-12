@@ -614,6 +614,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_PAGED_ATTN,
+        GGML_OP_PAGED_KV_STORE,
 
         GGML_OP_COUNT,
     };
@@ -3005,6 +3006,17 @@ extern "C" {
                                                   int                   max_blocks,
             int                   max_blocks_live,
             struct ggml_tensor  * sinks);
+
+    // #19: STORE-ONLY write into the interleaved paged pool (for archs like minimax-m3 that do
+    // their own sparse attention and cannot use the fused paged_attn). Writes k_cur/v_cur into
+    // kv_cache [hd, bs, 2*hkv, nblk] at write_slots; result aliases kv_cache (post-store view) so
+    // a later gather reading it is ordered after the store.
+    GGML_API struct ggml_tensor * ggml_paged_kv_store(struct ggml_context * ctx,
+                                                  struct ggml_tensor  * kv_cache,
+                                                  struct ggml_tensor  * k_cur,
+                                                  struct ggml_tensor  * v_cur,
+                                                  struct ggml_tensor  * write_slots,
+                                                  int                   block_size);
 
     // paged attention with the banded relative-position bias (3b: paged hybrid archs).
     // Same op as ggml_paged_attn with rel_logits at src[10]; rel_extent and

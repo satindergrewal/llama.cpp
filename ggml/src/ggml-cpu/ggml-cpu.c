@@ -2191,6 +2191,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_paged_attn(params, tensor);
             } break;
+        case GGML_OP_PAGED_KV_STORE:
+            {
+                ggml_compute_forward_paged_kv_store(params, tensor);
+            } break;
         case GGML_OP_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -2530,6 +2534,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_PAGED_ATTN:
             {
                 n_tasks = 0;
+            } break;
+        case GGML_OP_PAGED_KV_STORE:
+            {
+                n_tasks = 1;
             } break;
         default:
             {
