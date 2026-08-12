@@ -5356,6 +5356,17 @@ int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {
             ggml_metal_buffer_id bid_blk_d = bid_mask_d;
             bid_blk_d.offs += GGML_PAD((size_t) n_heads * n_tokens * n_kv_d * sizeof(ggml_fp16_t), 32);
 
+            // ★ bug #21 (ub255+bs64 non-determinism, CONFIRMED a scheduling race: x8 flips 3/8 with
+            // the concurrent encoder, 8/8 stable under GGML_METAL_CONCURRENCY_DISABLE=1). The mask
+            // scratch (bid_mask_d) is carved past op's LOGICAL bytes, so ggml_mem_ranges never tracks
+            // it -- concurrency_check at the graph-node level cannot see a prior op whose buffer
+            // physically overlaps this scratch, and the concurrent encoder runs that prior write in
+            // parallel with the mask fill below. Ubatch changes the whole graph's allocation layout,
+            // which is why ub255 lands the scratch on a live region and ub256 does not. An
+            // unconditional barrier here serialises the champion's untracked-scratch writes after all
+            // prior concurrent work; the existing reset after the fill still orders mask->vec.
+            ggml_metal_encoder_memory_barrier(enc);
+
             {
                 auto mp = ggml_metal_library_get_pipeline_paged_champ_mask(lib);
                 ggml_metal_encoder_set_pipeline(enc, mp);
