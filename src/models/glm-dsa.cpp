@@ -253,6 +253,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
     // See https://huggingface.co/zai-org/GLM-5.2/blob/main/config.json#L30
     ggml_tensor * prev_top_k = nullptr;
     for (int il = 0; il < n_layer; ++il) {
+        res->t_layer_inp[il] = inpL;
         ggml_tensor * inpSA = inpL;
 
         // norm
