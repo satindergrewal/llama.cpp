@@ -3101,6 +3101,32 @@ kernel void kernel_paged_attn_write_f32(
     kv_cache[base + (uint64_t) (args.n_heads_kv + h) * args.stride_head + d]    = (half) (taint * v_new[in + d]);
 }
 
+// #19: STANDALONE store into the pool (GGML_OP_PAGED_KV_STORE). Same scatter/index math as
+// kernel_paged_attn_write_f32, but write_slots is I64 (the arch passes kv_base's set_rows indices)
+// and unmapped slots (< 0) are skipped. grid (n_tokens, n_heads_kv), D threads.
+kernel void kernel_paged_kv_store_f32(
+        constant ggml_metal_kargs_paged_attn & args,
+        device const float   * k_new       [[buffer(1)]],
+        device const float   * v_new       [[buffer(2)]],
+        device       half    * kv_cache    [[buffer(3)]],
+        device const int64_t * write_slots [[buffer(4)]],
+        uint3  tgpig  [[threadgroup_position_in_grid]],
+        uint3  tpitg3 [[thread_position_in_threadgroup]]) {
+    const int D = args.head_dim;
+    const int d = (int) tpitg3[0];
+    if (d >= D) { return; }
+    const int gtok = (int) tgpig[0];
+    const int h    = (int) tgpig[1];
+    const int slot = (int) write_slots[gtok];
+    if (slot < 0) { return; }
+    const int block_id       = slot / args.block_size;
+    const int token_in_block = slot % args.block_size;
+    const uint64_t base = (uint64_t) block_id * args.stride_block + (uint64_t) token_in_block * args.stride_token;
+    const uint64_t in   = (uint64_t) gtok * args.n_heads_kv * D + (uint64_t) h * D;
+    kv_cache[base + (uint64_t) h * args.stride_head + d]                     = (half) k_new[in + d];
+    kv_cache[base + (uint64_t) (args.n_heads_kv + h) * args.stride_head + d] = (half) v_new[in + d];
+}
+
 // ---------------------------------------------------------------------------
 // Paged attention (GGML_OP_PAGED_ATTN) -- SCALAR port of the CPU reference in
 // ggml-cpu/ops.cpp:12101. Functionality before performance: before this, --kv-paged

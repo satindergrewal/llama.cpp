@@ -12124,14 +12124,15 @@ void ggml_compute_forward_paged_kv_store(const ggml_compute_params * params, ggm
     GGML_ASSERT(kv->ne[1] == bs && "paged_kv_store: kv_cache ne[1] must be block_size");
     GGML_ASSERT(k->ne[0] == hd && k->ne[1] == hkv && "paged_kv_store: k_cur shape");
     GGML_ASSERT(v->ne[0] == hd && v->ne[1] == hkv && "paged_kv_store: v_cur shape");
-    GGML_ASSERT(ws->type == GGML_TYPE_I32);
+    GGML_ASSERT((ws->type == GGML_TYPE_I32 || ws->type == GGML_TYPE_I64));
     GGML_ASSERT((kv->type == GGML_TYPE_F16 || kv->type == GGML_TYPE_F32) && "paged_kv_store: pool f16/f32");
 
-    const int32_t * slots = (const int32_t *) ws->data;
+    const int32_t * slots32 = ws->type == GGML_TYPE_I32 ? (const int32_t *) ws->data : NULL;
+    const int64_t * slots64 = ws->type == GGML_TYPE_I64 ? (const int64_t *) ws->data : NULL;
     char * kvbase = (char *) kv->data;
 
     for (int64_t t = 0; t < ntok; ++t) {
-        const int32_t s = slots[t];
+        const int64_t s = slots32 ? (int64_t) slots32[t] : slots64[t];
         if (s < 0) { continue; } // unmapped token slot -- skip
         const int64_t blk = s / bs, pos = s % bs;
         GGML_ASSERT(blk < nblk && "paged_kv_store: write slot exceeds pool blocks");

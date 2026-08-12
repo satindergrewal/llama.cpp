@@ -89,7 +89,7 @@ std::unique_ptr<llm_graph_context> llama_model_minimax_m3::build_arch_graph(cons
 class llm_graph_input_msa : public llm_graph_input_i {
 public:
     llm_graph_input_msa(const llama_kv_cache_msa_context * mctx, int blk, int local) :
-        mctx(mctx), blk(blk), local(local) {}
+        mctx(mctx), blk(blk), local(local), was_paged(mctx->get_attn_paged() != nullptr) {}
 
     void set_input(const llama_ubatch * ubatch) override {
         if (pos_slot_i) { mctx->set_input_pos_slot(pos_slot_i, ubatch); }
@@ -128,6 +128,11 @@ public:
 
         bool res = true;
 
+        // #19 Tier 1: the graph structure branches on paged-ctx presence (dense vs pool gather), so a
+        // dense-built graph must NOT be reused for a paged decode (or vice versa) -- force a rebuild
+        // on the transition. Without this the reserve's dense graph is reused and the pool never read.
+        res &= was_paged == (mctx_new->get_attn_paged() != nullptr);
+
         res &= bias->ne[0] * blk == n_ps;
         res &= bias->ne[1]       == params.ubatch.n_tokens;
 
@@ -160,6 +165,7 @@ public:
     ggml_tensor * cell_blk   = nullptr; // I32 [n_kv, ns]       cell -> position block (batch)
 
     const llama_kv_cache_msa_context * mctx;
+    const bool was_paged;   // #19: graph built on the paged path? (reuse must not cross this)
 
     int blk;
     int local;
@@ -413,19 +419,50 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                             ggml_reshape_3d(ctx0, msa->pos_slot_f, 1, n_ps, ns), tokj);   // [1, blk*K*Hd, ns]
                     cs = ggml_reshape_4d(ctx0, cs, blk, K, Hd, ns);
 
-                    ggml_tensor * tr = ggml_add(ctx0,
-                            ggml_scale(ctx0, cs, (float) HKV),
-                            ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0.0f, (float) HKV, 1.0f), 1, 1, Hd));
-
-                    ggml_tensor * tokr = ggml_cast(ctx0, ggml_reshape_2d(ctx0, tr, (int64_t) blk*K*Hd, ns), GGML_TYPE_I32);
-
-                    ggml_tensor * k3 = ggml_view_3d(ctx0, k, D, HKV*n_kv, ns, k->nb[1], k->nb[3], 0);
-                    ggml_tensor * v3 = ggml_view_3d(ctx0, v, D, HKV*n_kv, ns, v->nb[1], v->nb[3], 0);
                     ggml_tensor * mp = ggml_reshape_3d(ctx0, msa->pos_mask, 1, n_ps, ns);
-
-                    ggml_tensor * kg = ggml_get_rows(ctx0, k3, tokr);
-                    ggml_tensor * vg = ggml_get_rows(ctx0, v3, tokr);
                     ggml_tensor * mg = ggml_get_rows(ctx0, mp, tokj);
+
+                    // #19 Tier 1: read K/V from the PAGED pool when active. pos_slot (cs) is the
+                    // kv_base DENSE cell, so STORE into the pool at kv_base's own indices (get_k_idxs)
+                    // -- pool cell == kv_base cell == cs -- and the gather needs no block_table (v1).
+                    // Pool [hd, pbs, 2*HKV, nblk]: flat row (cs,h) = (cs%pbs) + pbs*h + pbs*2*HKV*(cs/pbs).
+                    const auto * pg_ctx = static_cast<const llama_kv_cache_msa_context *>(mctx)->get_attn_paged();
+                    if (getenv("DS4P_MSA_POSTRACE") && il == n_layer - 1) {
+                        fprintf(stderr, "DS4P-GATHER il=%d n_tps=%lld -> %s\n", il, (long long) n_tps, pg_ctx ? "POOL" : "dense");
+                    }
+                    ggml_tensor * kg, * vg;
+                    if (pg_ctx != nullptr) {
+                        const int      pbs     = (int) cparams.block_size;
+                        ggml_tensor *  pool_kv = pg_ctx->get_k(il);
+                        const int64_t  nblk_p  = pool_kv->ne[3];
+                        if (getenv("DS4P_MSA_NOSTORE") == nullptr) {
+                            ggml_build_forward_expand(gf, ggml_paged_kv_store(ctx0, pool_kv,
+                                    ggml_cont(ctx0, Kcur), ggml_cont(ctx0, Vcur), inp_attn->get_k_idxs(), pbs));
+                        }
+                        ggml_tensor * pool_flat = ggml_reshape_2d(ctx0, pool_kv, D, pbs*2*HKV*nblk_p);
+                        ggml_tensor * blkf = ggml_floor(ctx0, ggml_scale(ctx0, cs, 1.0f/(float) pbs));
+                        ggml_tensor * pos  = ggml_sub(ctx0, cs, ggml_scale(ctx0, blkf, (float) pbs));
+                        ggml_tensor * blkt = ggml_scale(ctx0, blkf, (float) (pbs*2*HKV));
+                        ggml_tensor * hK = ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0.0f,       (float) HKV,     1.0f), 1, 1, Hd);
+                        ggml_tensor * hV = ggml_reshape_3d(ctx0, ggml_arange(ctx0, (float) HKV, (float)(2*HKV), 1.0f), 1, 1, Hd);
+                        ggml_tensor * rowK = ggml_add(ctx0, ggml_add(ctx0, pos, ggml_scale(ctx0, hK, (float) pbs)), blkt);
+                        ggml_tensor * rowV = ggml_add(ctx0, ggml_add(ctx0, pos, ggml_scale(ctx0, hV, (float) pbs)), blkt);
+                        ggml_tensor * rowKi = ggml_cast(ctx0, ggml_reshape_2d(ctx0, rowK, (int64_t) blk*K*Hd, ns), GGML_TYPE_I32);
+                        ggml_tensor * rowVi = ggml_cast(ctx0, ggml_reshape_2d(ctx0, rowV, (int64_t) blk*K*Hd, ns), GGML_TYPE_I32);
+                        kg = ggml_get_rows(ctx0, pool_flat, rowKi);
+                        vg = ggml_get_rows(ctx0, pool_flat, rowVi);
+                        if (getenv("DS4P_MSA_GARBAGE")) { kg = ggml_scale(ctx0, kg, 100.0f); }
+                    } else {
+                        ggml_tensor * tr = ggml_add(ctx0,
+                                ggml_scale(ctx0, cs, (float) HKV),
+                                ggml_reshape_3d(ctx0, ggml_arange(ctx0, 0.0f, (float) HKV, 1.0f), 1, 1, Hd));
+                        ggml_tensor * tokr = ggml_cast(ctx0, ggml_reshape_2d(ctx0, tr, (int64_t) blk*K*Hd, ns), GGML_TYPE_I32);
+                        ggml_tensor * k3 = ggml_view_3d(ctx0, k, D, HKV*n_kv, ns, k->nb[1], k->nb[3], 0);
+                        ggml_tensor * v3 = ggml_view_3d(ctx0, v, D, HKV*n_kv, ns, v->nb[1], v->nb[3], 0);
+                        kg = ggml_get_rows(ctx0, k3, tokr);
+                        vg = ggml_get_rows(ctx0, v3, tokr);
+                        if (getenv("DS4P_MSA_DENSEGARBAGE")) { kg = ggml_scale(ctx0, kg, 100.0f); }
+                    }
 
                     // fold (group, stream) onto the FA channel dim
                     const ggml_type kt = ggml_is_quantized(k->type) ? GGML_TYPE_F16 : k->type;
@@ -438,6 +475,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                     ggml_tensor * mfa = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mg, (int64_t) blk*K, 1, 1, Hd*ns), GGML_TYPE_F16);
 
                     cur = build_attn_msa_fa(Qcur, kfa, vfa, mfa, Gp, kq_scale, il);
+                    if (getenv("DS4P_MSA_ATTNGARBAGE")) { cur = ggml_scale(ctx0, cur, 100.0f); }  // sanity: does MSA attn output reach logits?
                 } else {
                     // batch: per-stream loop
                     std::vector<ggml_tensor *> outs(ns);

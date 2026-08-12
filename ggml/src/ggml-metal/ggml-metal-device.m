@@ -1228,10 +1228,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[1]->type == GGML_TYPE_I32 &&
                 op->type == GGML_TYPE_I64;
         case GGML_OP_PAGED_KV_STORE:
-            // #19 store-only write into the pool. Reuses the paged_attn write kernel (f16/q8 pool);
-            // k_cur/v_cur are F32/F16, write_slots I32.
-            return (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_Q8_0) &&
-                   op->src[3]->type == GGML_TYPE_I32;
+            // #19 store-only write into the pool (dedicated I64-write_slots kernel; f16 pool).
+            return op->src[0]->type == GGML_TYPE_F16 &&
+                   (op->src[3]->type == GGML_TYPE_I32 || op->src[3]->type == GGML_TYPE_I64);
         case GGML_OP_PAGED_ATTN:
             // scalar Metal paged attention: F32 q/out, F16 cache, head_dim within the
             // threadgroup width we dispatch. Functionality before performance -- before

@@ -8327,7 +8327,8 @@ struct ggml_tensor * ggml_paged_kv_store(
     int                   block_size) {
     GGML_ASSERT(ggml_is_contiguous(k_cur) && "paged_kv_store: k_cur must be contiguous");
     GGML_ASSERT(ggml_is_contiguous(v_cur) && "paged_kv_store: v_cur must be contiguous");
-    GGML_ASSERT(write_slots->type == GGML_TYPE_I32);
+    GGML_ASSERT((write_slots->type == GGML_TYPE_I32 || write_slots->type == GGML_TYPE_I64) &&
+                "paged_kv_store: write_slots must be I32 or I64");
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, kv_cache); // aliases kv_cache (post-store view)
     result->op     = GGML_OP_PAGED_KV_STORE;

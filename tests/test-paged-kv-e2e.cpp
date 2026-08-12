@@ -44,6 +44,9 @@ static constexpr int          MIN_TOP_K_OVERLAP = 4;  // at least 4 of top-5 mus
 // Result of running one path: prefill-final logits + sampled token sequence.
 struct path_result {
     std::vector<float>       prefill_logits;  // [n_vocab]
+    std::vector<float>       decode_logits;   // [n_vocab] -- logits AFTER the first decode step
+                                              // (#19: the ONLY thing sensitive to the DECODE-only MSA
+                                              //  gather; the token/prefill checks are blind to it).
     std::vector<llama_token> tokens;          // [N_PREDICT]
     int                      n_vocab = 0;
 };
@@ -99,6 +102,11 @@ static path_result run_non_paged(const std::string & model_path) {
 
         llama_batch step = llama_batch_get_one(&cur, 1);
         EXPECT_TRUE(llama_decode(ctx, step) == 0);
+        // #19: capture the FIRST decode step's logits -- this pass runs the DECODE-only MSA gather.
+        if (i == 0) {
+            const float * raw = llama_get_logits_ith(ctx, -1);
+            if (raw) { result.decode_logits.assign(raw, raw + n_vocab); }
+        }
     }
 
     common_sampler_free(smpl);
@@ -176,6 +184,10 @@ static path_result run_paged(const std::string & model_path) {
             EXPECT_TRUE(raw != nullptr);
             result.prefill_logits.assign(raw, raw + n_vocab);
             captured_prefill_logits = true;
+        } else if (result.decode_logits.empty()) {
+            // #19: the FIRST real decode step -- runs the DECODE-only MSA gather. Sensitive.
+            const float * raw = llama_get_logits_ith(ctx, last_idx);
+            if (raw) { result.decode_logits.assign(raw, raw + n_vocab); }
         }
 
         llama_token next = common_sampler_sample(smpl, ctx, last_idx);
@@ -407,6 +419,30 @@ static void compare_results(const path_result & ref, const path_result & paged) 
             throw std::runtime_error("FAILED test.");
         }
     }
+
+    // #19: decode-logit check. NOTE (measured 2026-08-13): for MSA this compares the DIRECT-decode
+    // path (llama_decode without the paged scheduler), where has_paged_batch_info is false, so the
+    // DENSE gather runs -- garbaging the POOL path by 100x leaves this UNCHANGED. It is therefore
+    // sensitive for the DENSE arch, NOT proof of the paged MSA gather. The paged MSA store+gather is
+    // verified separately by scratchpad/msa_gather_roundtrip.cpp (a real model would close the rest).
+    if (!ref.decode_logits.empty() && ref.decode_logits.size() == paged.decode_logits.size()) {
+        double max_abs = 0.0; int worst = -1;
+        for (size_t i = 0; i < ref.decode_logits.size(); ++i) {
+            const double d = std::fabs((double) ref.decode_logits[i] - (double) paged.decode_logits[i]);
+            if (d > max_abs) { max_abs = d; worst = (int) i; }
+        }
+        fprintf(stderr, "test-paged-kv-e2e: decode-logit max_abs_diff = %.6g (tok %d)\n", max_abs, worst);
+        const double tol = 1e-2;  // f16 KV + Metal vs CPU accumulation; generous but garbage (100x) blows past it
+        if (max_abs > tol) {
+            fprintf(stderr, "FAIL: decode logits diverge (max_abs %.6g > tol %.6g) -- the paged DECODE gather is wrong\n",
+                    max_abs, tol);
+            throw std::runtime_error("FAILED test.");
+        }
+    } else {
+        fprintf(stderr, "test-paged-kv-e2e: WARN decode_logits not captured/comparable (ref=%zu paged=%zu)\n",
+                ref.decode_logits.size(), paged.decode_logits.size());
+    }
+
     fprintf(stderr, "test-paged-kv-e2e: PASSED\n");
 }
 
