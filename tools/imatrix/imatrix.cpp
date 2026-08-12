@@ -1143,6 +1143,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // the MTP second pass below needs the nextn tensors of the model loaded; since #26296
+    // load_mtp is gated on speculative types, so request draft-mtp unless --no-mtp
+    if (!params.imat_no_mtp) {
+        params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    }
+
     // set_params before show_statistics so load_imatrix has valid n_ctx/n_parallel
     g_collector.set_params(params);
 
