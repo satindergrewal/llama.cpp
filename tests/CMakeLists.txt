@@ -282,6 +282,13 @@ target_link_libraries(test-paged-vs-cpu PRIVATE ggml)
 
 add_executable(test-paged-write-q8 test-paged-write-q8.cpp)
 target_link_libraries(test-paged-write-q8 PRIVATE ggml)
+
+# #19: paged MSA store+gather round-trip -- the only backend-sensitive check of the paged MSA path
+# (the model-level e2e gate is blind to it; see tests/test-paged-msa-roundtrip.cpp header).
+add_executable(test-paged-msa-roundtrip test-paged-msa-roundtrip.cpp)
+target_link_libraries(test-paged-msa-roundtrip PRIVATE ggml)
+add_test(NAME test-paged-msa-roundtrip COMMAND test-paged-msa-roundtrip)
+
 add_test(NAME test-paged-banded COMMAND test-paged-banded)
 
 add_executable(test-flash-attn-generic-hash test-flash-attn-generic-hash.cpp)
