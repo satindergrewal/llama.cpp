@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "llama-context.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-kv-cache-msa.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-impl.h"
@@ -65,6 +66,16 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
             paged_kv = dsv4->get_mem_attn_paged();
             if (paged_kv) {
                 LLAMA_LOG_INFO("%s: using the dsv4 composite's paged attention pool\n", __func__);
+                is_hybrid = true;
+            }
+        } else if (auto * msa = dynamic_cast<llama_kv_cache_msa *>(ctx->get_memory())) {
+            // #19 Tier 0 (minimax-m3 MSA): a composite of two sub-caches (kv_base + kv_idx),
+            // neither a paged type itself, so every branch above missed it and init refused with
+            // "non-paged memory type". Fifth wrapper, same resolution as dsv4 -- the pool exists
+            // only under DS4P_PAGED_MSA=1 bring-up until Tier 1+2 (graph reads + eviction) land.
+            paged_kv = msa->get_mem_attn_paged();
+            if (paged_kv) {
+                LLAMA_LOG_INFO("%s: using the msa composite's paged attention pool\n", __func__);
                 is_hybrid = true;
             }
         }

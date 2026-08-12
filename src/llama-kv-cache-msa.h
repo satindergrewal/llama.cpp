@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-paged.h"   // #19 Tier 0: unique_ptr<llama_kv_cache_paged> member needs the complete type (header-defaulted dtor)
 
 #include <vector>
 
@@ -67,6 +68,14 @@ public:
     llama_kv_cache * get_base() const;
     llama_kv_cache * get_idx () const;
 
+    // ★ #19 Tier 0 (paging bring-up, DEV-GATED). Mirrors the dsv4 composite: MSA is a
+    // non-paged memory type, so the paged scheduler's dynamic_cast chain misses it and refuses.
+    // Attaching a pool here lets the scheduler resolve it (see llama-paged-scheduler.cpp). The
+    // pool backs kv_base's dense K/V storage; the graph does NOT read it yet (that is Tier 1), so
+    // this is bring-up scaffolding only -- constructed only under DS4P_PAGED_MSA=1.
+    void                   set_attn_paged(llama_kv_cache_paged * paged);
+    llama_kv_cache_paged * get_mem_attn_paged() const;
+
     uint32_t       get_n_pad()    const { return n_pad; }
     uint32_t       get_n_seq_max() const { return n_seq_max; }
     uint32_t       get_n_swa()    const { return n_swa; }
@@ -85,6 +94,9 @@ private:
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_idx;
+
+    // #19 Tier 0 dev-gated paged pool (see set_attn_paged). Null unless DS4P_PAGED_MSA=1.
+    std::unique_ptr<llama_kv_cache_paged> mem_attn_paged;
 };
 
 class llama_kv_cache_msa_context : public llama_memory_context_i {

@@ -175,6 +175,15 @@ llama_kv_cache * llama_kv_cache_msa::get_idx() const {
     return kv_idx.get();
 }
 
+// #19 Tier 0 (dev-gated). Mirror of llama_kv_cache_dsv4::{set_attn_paged,get_mem_attn_paged}.
+void llama_kv_cache_msa::set_attn_paged(llama_kv_cache_paged * paged) {
+    mem_attn_paged.reset(paged);
+}
+
+llama_kv_cache_paged * llama_kv_cache_msa::get_mem_attn_paged() const {
+    return mem_attn_paged.get();
+}
+
 // llama_kv_cache_msa_context
 
 llama_kv_cache_msa_context::llama_kv_cache_msa_context(llama_memory_status status) :

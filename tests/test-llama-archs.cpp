@@ -313,7 +313,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, bool kv_paged = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -328,6 +328,18 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads_batch = 4;
     if (!encode) {
         ctx_params.n_ubatch = 64;
+    }
+    // #19 Tier 0 paged-accept probe. Paging needs n_batch == n_ubatch and a small pool; MSA also
+    // needs flash attention on. Only taken when the probe asks for it -- default false leaves every
+    // existing (non-paged equivalence) call byte-identical.
+    if (kv_paged) {
+        ctx_params.kv_paged        = true;
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        ctx_params.n_batch         = 64;
+        ctx_params.n_ubatch        = 64;
+        ctx_params.block_size      = 16;
+        ctx_params.n_gpu_blocks    = 64;
+        ctx_params.n_cpu_blocks    = 16;
     }
 
     size_t tmp = seed;
@@ -714,6 +726,49 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     return all_ok ? 0 : 1;
 }
 
+// #19 Tier 0 gate: does llama_paged_scheduler_init ACCEPT a paged context for minimax-m3?
+// The dev-gate (DS4P_PAGED_MSA) is a process-lifetime static, so this probe does NOT set it -- the
+// CALLER drives it, and the two-run pair IS the control: DS4P_PAGED_MSA=1 must ACCEPT (Tier 0
+// attached the pool, the scheduler's msa branch resolves it) and DS4P_PAGED_MSA=0/unset must
+// REFUSE (no pool -> the pre-existing "non-paged memory type" refusal). A single arch tested both
+// ways rules out a false ACCEPT far more tightly than a second arch with its own fixture quirks.
+static int run_paged_probe(size_t seed) {
+    const char * flag = getenv("DS4P_PAGED_MSA");
+    const bool expect_accept = flag != nullptr && atoi(flag) != 0;
+
+    std::vector<ggml_backend_dev_t> devs;
+    const size_t device_count = ggml_backend_dev_count();
+    for (size_t i = 0; i < device_count; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devs.push_back(dev);
+        }
+    }
+    if (devs.empty()) {
+        for (size_t i = 0; i < device_count; i++) { devs.push_back(ggml_backend_dev_get(i)); }
+    }
+
+    bool accepted = false;
+    std::string err;
+    try {
+        gguf_context_ptr g = get_gguf_ctx(LLM_ARCH_MINIMAX_M3, moe_mandatory(LLM_ARCH_MINIMAX_M3));
+        auto mc = get_model_and_ctx(g.get(), nullptr, seed, devs,
+                                    LLAMA_SPLIT_MODE_LAYER, /*encode=*/false, /*kv_paged=*/true);
+        llama_paged_scheduler * s = llama_paged_scheduler_init(mc.second.get());
+        accepted = (s != nullptr);
+        if (s) { llama_paged_scheduler_free(s); }
+    } catch (const std::exception & e) { err = e.what(); }
+
+    const bool ok = (accepted == expect_accept);
+    printf("paged-probe: minimax-m3 DS4P_PAGED_MSA=%s -> %s (expected %s) %s%s\n",
+           expect_accept ? "1" : "0/unset",
+           accepted ? "ACCEPT" : "REFUSE",
+           expect_accept ? "ACCEPT" : "REFUSE",
+           ok ? "PASS" : "FAIL",
+           err.empty() ? "" : ("  err=" + err).c_str());
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
@@ -723,8 +778,13 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool paged_probe = false;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--paged-probe") == 0) {  // #19 Tier 0 gate (opt-in; leaves the equivalence suite untouched)
+            paged_probe = true;
+            continue;
+        }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -762,6 +822,9 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (paged_probe) {
+            return run_paged_probe(seed);
+        }
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }
