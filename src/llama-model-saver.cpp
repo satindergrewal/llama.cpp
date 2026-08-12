@@ -25,11 +25,13 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
         case LLM_ARCH_EXAONE_MOE:
         case LLM_ARCH_AFMOE:
         case LLM_ARCH_APERTUS:
-        case LLM_ARCH_MIMO2:
-        case LLM_ARCH_STEP35:
         case LLM_ARCH_MELLUM:
-        case LLM_ARCH_LAGUNA:
             return false;
+        // MIMO2/STEP35/LAGUNA un-denylisted 2026-08-12: their required loader keys are all
+        // covered by the explicit-KV fixture path (mimo2/step35 ride the alternating
+        // SWA-pattern branch; laguna's LEADING_DENSE_BLOCK_COUNT is in the generic block;
+        // the remaining expert keys are optional or in the MoE block). If a loader assert
+        // fires on a synthetic, add the missing key in test-llama-archs, not here.
         // LLM_ARCH_INKLING supported for the explicit-KV path (test-llama-archs supplies its
         // six arch-specific keys); the save-from-model path does not re-emit loader-side
         // extra keys for any arch, so inkling is no worse off than the rest.
@@ -219,8 +221,10 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
     add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp);
     add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_chexp);
-    add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                  hparams.swiglu_clamp_exp);
-    add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP,                hparams.swiglu_clamp_shexp);
+    // truncate-to-n_layer: step35 reads this via get_key_or_arr, so a MAX_LAYERS-sized
+    // emission fails its length check (same class as the SWA pattern array).
+    add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                  hparams.swiglu_clamp_exp, true);
+    add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP,                hparams.swiglu_clamp_shexp, true);
     add_kv(LLM_KV_USE_PARALLEL_RESIDUAL,             hparams.use_par_res);
     // add_kv(LLM_KV_TENSOR_DATA_LAYOUT,                ???);
     add_kv(LLM_KV_EXPERT_COUNT,                      hparams.n_expert);
@@ -277,12 +281,17 @@ void llama_model_saver::add_kv_from_model() {
     // ^ the generic re-emit is unresolved (scalar-modulo vs per-layer-array semantics differ
     //   by arch). For INKLING the loader reads it via get_key_or_arr, so the expanded
     //   per-layer array is the faithful form; emitted arch-scoped below with its other keys.
-    if (model->arch == LLM_ARCH_INKLING) {
+    // MIMO2/STEP35 added 2026-08-12: like inkling, their loaders read the pattern via
+    // get_key_or_arr, so the expanded per-layer array is the faithful re-emit for them too.
+    if (model->arch == LLM_ARCH_INKLING || model->arch == LLM_ARCH_MIMO2 ||
+        model->arch == LLM_ARCH_STEP35) {
         std::vector<uint32_t> swa_pattern(hparams.n_layer());
         for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
             swa_pattern[il] = hparams.is_swa_impl[il];
         }
         add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_pattern);
+    }
+    if (model->arch == LLM_ARCH_INKLING) {
         add_kv(LLM_KV_INKLING_D_REL,             hparams.inkling_d_rel);
         add_kv(LLM_KV_INKLING_REL_EXTENT,        hparams.inkling_rel_extent);
         add_kv(LLM_KV_INKLING_REL_EXTENT_SWA,    hparams.inkling_rel_extent_swa);
