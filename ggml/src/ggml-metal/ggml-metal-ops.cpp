@@ -484,6 +484,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_paged_attn(ctx, idx);
             } break;
+        case GGML_OP_PAGED_KV_STORE:
+            {
+                n_fuse = ggml_metal_op_paged_kv_store(ctx, idx);
+            } break;
         case GGML_OP_ARGMAX:
             {
                 n_fuse = ggml_metal_op_argmax(ctx, idx);
@@ -4838,6 +4842,51 @@ static void ds4p_dump_env_once() {
     } else {
         GGML_LOG_INFO("%s: DS4P-ENV none set (clean run)\n", __func__);
     }
+}
+
+// #19: standalone STORE into the paged pool. Reuses the paged_attn WRITE kernel (same scatter +
+// index math) -- see the pipeline getter. Mirrors the write-phase dispatch in ggml_metal_op_paged_attn.
+int ggml_metal_op_paged_kv_store(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * kv_cache = op->src[0]; // [hd, bs, 2*hkv, nblk]
+    const ggml_tensor * k_cur    = op->src[1]; // [hd, hkv, n_tokens]
+    const ggml_tensor * v_cur    = op->src[2];
+    const ggml_tensor * wslots   = op->src[3]; // [n_tokens] i32
+
+    const int head_dim   = (int) kv_cache->ne[0];
+    const int n_heads_kv = (int) (kv_cache->ne[2] / 2);
+    const int n_tokens   = (int) k_cur->ne[2];
+    const int block_size = ((const int32_t *) op->op_params)[0];
+
+    ggml_metal_kargs_paged_attn args = {};
+    args.head_dim     = head_dim;
+    args.n_heads_kv   = n_heads_kv;
+    args.block_size   = block_size;
+    args.stride_token = kv_cache->nb[1] / ggml_type_size(kv_cache->type);
+    args.stride_head  = kv_cache->nb[2] / ggml_type_size(kv_cache->type);
+    args.stride_block = kv_cache->nb[3] / ggml_type_size(kv_cache->type);
+    args.probe        = 0;
+
+    auto wpipe = ggml_metal_library_get_pipeline_paged_kv_store(lib, op);
+
+    const bool w_q8    = kv_cache->type == GGML_TYPE_Q8_0;
+    const int  w_units = w_q8 ? (head_dim / 32) : head_dim;
+    int wnth = 32;
+    while (wnth < w_units) { wnth *= 2; }
+
+    ggml_metal_encoder_set_pipeline(enc, wpipe);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(k_cur),    1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(v_cur),    2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_cache), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wslots),   4);
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, n_heads_kv, 1, wnth, 1, 1);
+
+    return 1;
 }
 
 int ggml_metal_op_paged_attn(ggml_metal_op_t ctx, int idx) {

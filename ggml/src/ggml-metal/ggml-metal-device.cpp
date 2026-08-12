@@ -1235,6 +1235,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax(ggml_meta
     return res;
 }
 
+// #19: pipeline for the standalone store op. REUSES the paged_attn write kernel (identical scatter
+// + index math, verified), but the store op carries kv_cache at src[0] (not src[3]) -- so this is a
+// copy of get_pipeline_paged_attn_write that reads src[0] for the type.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_kv_store(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_PAGED_KV_STORE);
+
+    char base[256];
+    char name[256];
+
+    const ggml_type kvt = op->src[0]->type;   // the paged pool tensor (store op layout)
+    if (kvt == GGML_TYPE_Q8_0) {
+        snprintf(base, 256, "kernel_paged_attn_write_q8_0");
+    } else {
+        snprintf(base, 256, "kernel_paged_attn_write_f32");
+    }
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+    res.smem = 0;
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_paged_attn_write(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_PAGED_ATTN);
 
