@@ -305,6 +305,24 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
     cparams.kv_paged   = params.kv_paged;
     cparams.block_size = params.block_size;
+
+    // ★ bs64 + champion as the DSV4 paged default (the approved config). The champion is
+    // the only paged kernel that clears the 256k-1M bar, and it requires --kv-block-size 64; the
+    // CLI default is 16, which routes DSV4 to the slower scalar path. So when DSV4 pages
+    // single-sequence and block_size is still at the default 16, promote it to 64 so plain
+    // --kv-paged ships the fast path. GATED on n_seq_max == 1: the champion is single-sequence,
+    // and at -np > 1 the scalar (bs16) kernel is what pages multi-slot -- promoting there would
+    // make every layer refuse the champion and fall back to static ("paging does nothing"). An
+    // explicit --kv-block-size != 16 is honored untouched. Logged, never silent: a block-size
+    // this project changed under the user is exactly the kind of default it distrusts.
+    if (cparams.kv_paged && model.arch == LLM_ARCH_DEEPSEEK4 &&
+        cparams.n_seq_max == 1 && cparams.block_size == 16) {
+        LLAMA_LOG_INFO("%s: DSV4 + --kv-paged single-sequence: promoting --kv-block-size 16 -> 64 "
+                       "to engage the champion kernel (the bar-clearing paged path). Pass an explicit "
+                       "--kv-block-size to override; run -np > 1 for scalar multi-slot paging.\n", __func__);
+        cparams.block_size = 64;
+    }
+
     cparams.n_gpu_blocks = params.n_gpu_blocks;
     cparams.n_cpu_blocks = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
