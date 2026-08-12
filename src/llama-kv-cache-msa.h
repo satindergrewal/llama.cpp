@@ -150,8 +150,16 @@ public:
     void set_input_pos_slot(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_pos_mask(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // #19 Tier 1 (dev-gated): the graph asks the context for the paged context via get_attn_paged();
+    // init_batch attaches it per ubatch via set_attn_paged_ctx(). Mirror of the dsv4 context pair.
+    const llama_kv_cache_paged_context * get_attn_paged() const override;
+    void set_attn_paged_ctx(llama_memory_context_ptr ctx) { ctx_attn_paged = std::move(ctx); }
+
 private:
     llama_kv_cache_msa * kv;
+
+    // #19 Tier 1: the per-ubatch paged pool context (null unless DS4P_PAGED_MSA=1 and produced).
+    llama_memory_context_ptr ctx_attn_paged;
 
     // the index of the next ubatch to process
     size_t i_next = 0;

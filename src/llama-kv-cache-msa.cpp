@@ -136,8 +136,21 @@ llama_memory_context_ptr llama_kv_cache_msa::init_batch(
 
         assert(sinfos_base.size() == sinfos_idx.size());
 
-        return std::make_unique<llama_kv_cache_msa_context>(
+        // #19 Tier 1 (dev-gated): the PRODUCER. When the scheduler has set the pool's paged batch
+        // info, derive the paged context from the SAME ubatches as the dense caches and attach it,
+        // so a later graph can read the pool through ONE ledger. Mirror of dsv4 init_batch's fifth
+        // funnel. Null when the pool is absent (DS4P_PAGED_MSA off) -> graph keeps the dense path.
+        llama_memory_context_ptr paged_ctx;
+        if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
+            paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches);   // copy: ctx owns originals
+        }
+
+        auto ctx = std::make_unique<llama_kv_cache_msa_context>(
                 this, std::move(sinfos_base), std::move(sinfos_idx), std::move(ubatches));
+        if (paged_ctx) {
+            ctx->set_attn_paged_ctx(std::move(paged_ctx));
+        }
+        return ctx;
     } while (false);
 
     return std::make_unique<llama_kv_cache_msa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -182,6 +195,11 @@ void llama_kv_cache_msa::set_attn_paged(llama_kv_cache_paged * paged) {
 
 llama_kv_cache_paged * llama_kv_cache_msa::get_mem_attn_paged() const {
     return mem_attn_paged.get();
+}
+
+// #19 Tier 1 (dev-gated). Mirror of llama_kv_cache_dsv4_context::get_attn_paged.
+const llama_kv_cache_paged_context * llama_kv_cache_msa_context::get_attn_paged() const {
+    return static_cast<const llama_kv_cache_paged_context *>(ctx_attn_paged.get());
 }
 
 // llama_kv_cache_msa_context
