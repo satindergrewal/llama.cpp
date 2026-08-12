@@ -4851,10 +4851,17 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
         // without it, sinks + q8_0 pool + champion geometry would pass here, get refused by the
         // kernel on type, fall to the scalar path, and hit the scalar sinks abort this guard exists
         // to prevent.
+        // ★ ONE-copy contract, not an inline list. This site used to hard-code
+        // (hd == 64 || ... || hd == 256), which EXCLUDED 512 -- the exact lagging-copy the
+        // consolidated header exists to prevent. ggml_paged_champ_head_dim_ok admits 512 (smem
+        // 28,672 B < 32,768 budget, dk512 templates instantiated), and the non-sink geometry
+        // check above already routes 512 layers to the champion; the sink path disagreeing was a
+        // stale copy, so a head_dim-512 SINK layer (DSV4's raw layers) was needlessly kicked to
+        // static. Using the contract lets those layers take their intended executor.
         const bool champ_serves = champ_on_extras && cparams.block_size == 64 &&
                                   cparams.n_seq_max == 1 &&
                                   kv_type_check != nullptr && kv_type_check->type == GGML_TYPE_F16 &&
-                                  (hd == 64 || hd == 96 || hd == 128 || hd == 192 || hd == 256);
+                                  ggml_paged_champ_head_dim_ok((int) hd);
         if (!champ_serves) {
             static int last_extra_il = -2;
             if (il != last_extra_il) {
@@ -4862,7 +4869,7 @@ ggml_tensor * llm_graph_context::build_attn_paged_or_null(
                 LLAMA_LOG_WARN("%s: layer %d passes %s, which only the champion path implements, "
                                "and this configuration cannot take the champion (champ=%d bs=%u "
                                "n_seq_max=%u head_dim=%lld ktype=%s; need champ on, bs 64, "
-                               "n_seq_max 1, f16 pool, head_dim in {64,96,128,192,256}) -- this "
+                               "n_seq_max 1, f16 pool, head_dim in {64,96,128,192,256,512}) -- this "
                                "layer takes the static path\n", __func__, il,
                                sinks != nullptr ? (causal ? "attention SINKS"
                                                           : "attention SINKS and causal=false")
