@@ -2201,20 +2201,23 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // instead of refusing with "not a paged memory type" (the 2026-08-10 step-0
                     // witness). Donor pattern: the hybrid-iswa block below.
                     //
-                    // ⚠⚠ BRING-UP GATED ON PURPOSE (DS4P_PAGED_DSV4=1). Tier 0 alone converts a
-                    // loud startup refusal into a server that allocates a pool NO GRAPH READS --
-                    // the silent-fallback state that produced 4.5 h of static-vs-static "parity"
-                    // on 2026-08-09. The board's rule is Tier 0+1+2 land together or nothing:
-                    // until the graph path (Tier 1) and the masked kernel (Tier 2) are in, the
-                    // DEFAULT --kv-paged on DSV4 must keep refusing, and this flag exists only so
-                    // the tiers can be developed against a scheduler that accepts the memory.
-                    static const bool paged_dsv4_dev = []() {
+                    // ★ DEV-GATE REMOVED 2026-08-12 (flag-flip): --kv-paged now pages DSV4 BY
+                    // DEFAULT, like every other arch. The bring-up gate (DS4P_PAGED_DSV4=1) existed
+                    // only while the tiers were incomplete -- Tier 0 alone allocates a pool no graph
+                    // reads (the 2026-08-09 silent static-vs-static "parity" trap). Tier 0+1+2 have
+                    // all landed: the paged graph path and the masked champion kernel serve DSV4
+                    // byte-identically to static at every ubatch and FASTER at >=128k, and #21
+                    // (paged decode non-determinism -- a Metal scheduling race on the champion's
+                    // untracked mask scratch, fixed by a barrier before the mask fill) is closed.
+                    // DS4P_PAGED_DSV4=0 stays as an explicit OPT-OUT escape hatch: a new shipping
+                    // default earns a kill switch, not the reverse. Unset or any non-zero = paged.
+                    static const bool paged_dsv4_optout = []() {
                         const char * s = getenv("DS4P_PAGED_DSV4");
-                        return s != nullptr && atoi(s) != 0;
+                        return s != nullptr && atoi(s) == 0;
                     }();
-                    if (cparams.kv_paged && paged_dsv4_dev) {
-                        LLAMA_LOG_INFO("%s: DS4P_PAGED_DSV4: constructing the DSV4 paged attention pool "
-                                "(Tier 0 bring-up; graph path and masked kernel pending)\n", __func__);
+                    if (cparams.kv_paged && !paged_dsv4_optout) {
+                        LLAMA_LOG_INFO("%s: DSV4 paged attention pool active (default under --kv-paged; "
+                                "set DS4P_PAGED_DSV4=0 to force the static path)\n", __func__);
 
                         const uint32_t pg_head_dim   = hparams.n_embd_head_v();
                         const uint32_t pg_n_head     = hparams.n_head_kv();
