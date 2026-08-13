@@ -2101,17 +2101,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_idx,
                         nullptr);
 
-                // ★ #19 Tier 0 (minimax-m3 MSA paging bring-up, DEV-GATED on DS4P_PAGED_MSA=1).
-                // Same shape and same all-or-nothing rule as the DSV4 gate above: Tier 0 attaches a
-                // pool so the scheduler stops refusing the memory, but NO graph reads it yet (Tier 1),
-                // so the DEFAULT --kv-paged on minimax-m3 must keep refusing until the tiers land.
+                // ★ #19 (minimax-m3 MSA paging, DEV-GATED on DS4P_PAGED_MSA=1).
+                // Store+gather are wired and bit-exact (CPU+Metal, tests/test-paged-msa-roundtrip.cpp).
+                // Still gated: the synth e2e gate is blind to MSA attn (~1e-8) so a real MiniMax-M3
+                // GGUF is the remaining verify, and that test is PARKED. Default --kv-paged keeps
+                // refusing until that run lands. Unset or 0 = no pool (loud refuse, not silent static).
                 static const bool paged_msa_dev = []() {
                     const char * s = getenv("DS4P_PAGED_MSA");
                     return s != nullptr && atoi(s) != 0;
                 }();
                 if (cparams.kv_paged && paged_msa_dev) {
                     LLAMA_LOG_INFO("%s: DS4P_PAGED_MSA: constructing the minimax-m3 paged attention "
-                            "pool (Tier 0 bring-up; graph path and eviction pending)\n", __func__);
+                            "pool (store+gather wired; real-model verify parked)\n", __func__);
 
                     const uint32_t pg_head_dim   = hparams.n_embd_head_v();
                     const uint32_t pg_n_head     = hparams.n_head_kv();
