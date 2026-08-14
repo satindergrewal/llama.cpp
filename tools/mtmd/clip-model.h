@@ -477,7 +477,6 @@ struct clip_flow_net {
     std::vector<time_embd> time;
     std::vector<block> blocks;
 };
-};
 
 // qwen3tts code2wav: RVQ codes -> raw PCM
 struct clip_code2wav {
