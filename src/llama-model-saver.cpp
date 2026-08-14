@@ -25,8 +25,6 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
         case LLM_ARCH_EXAONE_MOE:
         case LLM_ARCH_AFMOE:
         case LLM_ARCH_APERTUS:
-        case LLM_ARCH_MIMO2:
-        case LLM_ARCH_STEP35:
         case LLM_ARCH_MUSE_GLIMMER:
         case LLM_ARCH_MELLUM:
             return false;
@@ -38,6 +36,7 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
         // LLM_ARCH_INKLING supported for the explicit-KV path (test-llama-archs supplies its
         // six arch-specific keys); the save-from-model path does not re-emit loader-side
         // extra keys for any arch, so inkling is no worse off than the rest.
+        // MUSE_GLIMMER stays denylisted (upstream addition; no fixture path yet).
         default:
             return true;
     }
