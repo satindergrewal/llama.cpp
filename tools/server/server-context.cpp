@@ -540,7 +540,7 @@ struct server_slot {
         // and a still-bad drafter re-quenches within minev steps.
         if (quenched) {
             const auto & qc = ds4p_quench();
-            if (qc.probe <= 0 || n_decoded - quench_at < qc.probe) {
+            if (qc.probe <= 0 || (int) stats.n_gen - quench_at < qc.probe) {
                 return 0;
             }
             // re-arm with fresh state (const_cast: this choke point is the only place
@@ -551,7 +551,7 @@ struct server_slot {
             self->quench_debt      = 0.0f;
             self->stats.n_draft_verif_steps = 0;  // warmup grace applies to the retry too
             SLT_INF(*this, "yield-quench RE-ARMED after %d decoded tokens (fires=%d)\n",
-                    n_decoded - quench_at, quench_fires);
+                    (int) stats.n_gen - quench_at, quench_fires);
         }
 
         // determine the max draft that fits the current slot state
@@ -2143,19 +2143,15 @@ private:
                 SLT_ERR(slot, "%s", "paged scheduler rejected the request\n");
                 return false;
             }
-            slot.t_start_process_prompt = ggml_time_us();
-            // the scheduler owns prefill, so the classic DONE_PROMPT site that zeroes the
-            // generation counter never runs for paged slots; a reused slot would otherwise
-            // inherit the previous task's n_decoded and hit "stopped by limit" early
-            slot.n_decoded = 0;
-
-            // ...and the SAME site zeroes the prompt counter, which I missed. Measured: a
-            // 2,023-token request followed by a 4,023-token one reported prompt_n = 6,046,
-            // so every paged response after the first has been quoting a prompt-eval rate
-            // computed from a token count that includes previous tasks. Found because the
-            // P1-5 economics gate consumes this number and produced an estimate half the
-            // size it should have been.
-            slot.n_prompt_tokens_processed = 0;
+            // the scheduler owns prefill, so the classic SLOT_STATE_STARTED site that
+            // starts the prompt clock never runs for paged slots. reset() already
+            // zeroed stats; start the clock here and pin the two counters that a
+            // reused slot used to inherit (n_decoded / prompt_n).
+            if (!slot.stats.is_set()) {
+                slot.stats.update_prompt_start();
+            }
+            slot.stats.n_gen = 0;
+            slot.stats.n_prompt_processed = 0;
             SLT_INF(slot, "paged: request registered (%zu tokens)\n", toks.size());
         }
 
@@ -3395,7 +3391,7 @@ private:
                     add.push_back(ms->task->tokens[t]);
                 }
                 ms->prompt.tokens.insert(add);
-                ms->n_prompt_tokens_processed += want - have;
+                ms->stats.n_prompt_processed += want - have;
             }
         }
 
@@ -3521,32 +3517,30 @@ private:
             slot->prompt.tokens.push_back(id);
 
             const int64_t t_now = ggml_time_us();
-            slot->n_decoded += 1;
-            if (slot->n_decoded == 1) {
+            slot->stats.n_gen += 1;
+            if (slot->stats.n_gen == 1) {
                 // ★ Generation starts here. The drafter's statistics read #calls(b,g,a) = 0 0 0
                 // until this existed -- b is the BEGIN count, and I had not wired begin at all. The
                 // static path calls it in post_decode, a function this loop never enters.
                 if (spec && slot->can_speculate()) {
                     common_speculative_begin(spec.get(), slot->id, slot->prompt.tokens.get_text_tokens());
                 }
-                slot->t_start_generation   = t_now;
-                slot->t_print_last         = t_now;
-                slot->n_decoded_last       = 0;
-                slot->t_prompt_processing  = (slot->t_start_generation - slot->t_start_process_prompt) / 1e3;
+                slot->stats.update_prompt_last();
+                slot->t_print_last = t_now;
+                slot->n_gen_last   = 0;
                 // paged loop does not enter metrics_post_decode; record the prompt bucket here.
-                // t_prompt_processing is milliseconds (legacy slot field); add_prompt wants microseconds.
-                metrics.add_prompt((uint64_t) slot->n_prompt_tokens_processed,
-                                   (uint64_t) (slot->t_prompt_processing * 1e3));
+                metrics.add_prompt(slot->stats.n_prompt_processed,
+                                   (uint64_t) (slot->stats.t_prompt_ms() * 1e3));
 
                 // P1-5 economics: teach the bank what a prefill actually costs on THIS
                 // model, so it can decline restores that would cost more than recomputing.
                 // note_prefill ignores anything under 256 tokens, which is what keeps a
                 // warm request (1 token, in a window containing its own restore) from
                 // poisoning the estimate it is being judged against.
-                server_kv_bank::instance().note_prefill(slot->n_prompt_tokens_processed,
-                                                        slot->t_prompt_processing);
+                server_kv_bank::instance().note_prefill(slot->stats.n_prompt_processed,
+                                                        slot->stats.t_prompt_ms());
             }
-            slot->t_token_generation = std::max<int64_t>(1, t_now - slot->t_start_generation) / 1e3;
+            slot->stats.update_gen_last();
 
             completion_token_output result;
             result.tok          = id;
@@ -3689,7 +3683,7 @@ private:
                 // occurrence of it in the whole function was my own test. The static path sets it in
                 // post_decode, which this loop does not enter. n_decoded > 0 is the discriminator the
                 // paged loop actually maintains, and it is the same one set_draft() validates on.
-                if (!s.is_processing() || s.n_decoded == 0 || !s.can_speculate()) {
+                if (!s.is_processing() || s.stats.n_gen == 0 || !s.can_speculate()) {
                     continue;
                 }
                 const int32_t n_draft_max = s.get_n_draft_max();
@@ -5096,7 +5090,7 @@ private:
 
                 if (force || fire) {
                     slot.quenched   = true;
-                    slot.quench_at  = slot.n_decoded;
+                    slot.quench_at  = (int) slot.stats.n_gen;
                     slot.quench_fires++;
                     metrics.n_quench_seqs_total++;
                     SLT_INF(slot, "yield-quench FIRED%s: steps=%d ewma=%.3f guard=%.3f debt=%.3f budget=%.3f (quench_seqs=%llu)\n",

@@ -216,6 +216,10 @@ public:
 
     bool empty() const { return tokens.empty(); }
 
+    // media chunks occupy LLAMA_TOKEN_NULL slots; get_text_tokens() drops them.
+    // paged admission refuses rather than silently answering from the leftover text.
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     void clear() {
         map_idx_to_media.clear();
         tokens.clear();
