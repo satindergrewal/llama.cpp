@@ -138,7 +138,7 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                                __func__, group.request_id, n_past, group.n_prompt,
                                group.block_table.size(), group.n_prompt - n_past);
             }
-        } else {
+        } else if (group.block_table.empty()) {
             // ★ PREFIX SHARING across INDEPENDENT requests (the vLLM/SGLang gap).
             //
             // The scheduler already names three admission classes: WARM (prefix restored from a
@@ -152,10 +152,18 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
             // eviction, preemption and block recycling -- all of which this scheduler does, and
             // where a stale trie entry pointing at a recycled block is a silent-corruption bug.
             // Verify-at-use beats invalidate-on-change here. Index it later, once it is measured.
+            //
+            // ⚠ THIS BRANCH IS ONLY FOR AN EMPTY TABLE. queue_forked_request already called
+            // fork_blocks, restored logical_seq / n_prompt, then calls queue_request. The old
+            // else was "not warm", so a fork child re-entered this scan, fork_blocks ran a
+            // second time (refcount leak, no unshare) and clobbered n_prompt again. Measured
+            // 2026-08-14 on the independent-share path: admitted SHARED then
+            // GGML_ASSERT(remaining_prompt > 0). Same clobber. Do not scan a group that already
+            // holds blocks.
             uint32_t               best_n   = 0;
             llama_sequence_group * best_src = nullptr;
 
-            if (kv_cache_manager != nullptr && !group.logical_seq.empty()) {
+            if (!group.logical_seq.empty()) {
                 const uint32_t bs = kv_cache_manager->get_block_size();
                 // ⚠ SCAN BOTH SETS. queue_request ends with set_waiting(), so a request in flight is
                 // not necessarily in `running` when the NEXT one is admitted -- it is promoted on a
@@ -227,9 +235,19 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                 if (const auto * bl = kv_cache_manager->get_sequence_blocks(best_src->request_id)) {
                     src_view.block_table = *bl;
                 }
+                // ⚠ SAME CONTRACT AS queue_forked_request. fork_blocks trims dst.logical_seq
+                // to the inherited span and sets dst.n_prompt = n_inherited. That is the P1-6
+                // contract -- do not change fork_blocks. Without putting the full prompt back,
+                // remaining_prompt is 0 and populate_batch_from asserts (measured 2026-08-14:
+                // "64 of 64, 0 left to prefill" then abort). The log used to print the
+                // clobbered length; print the saved one.
+                const std::vector<llama_token> full_seq    = group.logical_seq;
+                const uint32_t                 full_prompt = group.n_prompt;
                 const uint32_t shared = kv_cache_manager->fork_blocks(src_view, group, best_n);
                 if (shared > 0) {
-                    group.n_past = shared;
+                    group.logical_seq = full_seq;
+                    group.n_prompt    = full_prompt;
+                    group.n_past      = shared;
                     LLAMA_LOG_INFO("%s: request %d admitted SHARED: %u of %u prompt tokens inherited "
                                    "from live request %d (%zu blocks), %u left to prefill\n",
                                    __func__, group.request_id, shared, group.n_prompt,
@@ -238,8 +256,11 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                 }
             }
 
-            // cold request (or a fork, which brings its own blocks): nothing may be left
-            // parked under this id or it pins pool blocks nobody is ever going to claim
+            // cold request: nothing may be left parked under this id or it pins pool
+            // blocks nobody is ever going to claim
+            kv_cache_manager->discard_restored(group.request_id);
+        } else {
+            // already inherited (P1-6 fork child). do not scan, do not fork_blocks again.
             kv_cache_manager->discard_restored(group.request_id);
         }
     }

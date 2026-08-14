@@ -388,6 +388,64 @@ TEST(test_scheduler_rejects_oversized_prompt) {
     EXPECT_TRUE(queued);
 }
 
+// Drive one prefill chunk so n_past crosses a block boundary. The share scan
+// skips sources with n_past==0; without this the independent-share abort is
+// invisible (every other scheduler test in this file queues and never updates).
+static void prefill_one_chunk(paged_test_fixture & fixture, llama_batch & batch) {
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+    EXPECT_TRUE(info != nullptr);
+    EXPECT_TRUE(info->n_seq >= 1);
+    std::vector<llama_token> toks((size_t) info->n_seq, /*dummy=*/1);
+    std::vector<int8_t>      stop((size_t) info->n_seq, 0);
+    fixture.sched->update(batch, toks, stop.data(), nullptr);
+}
+
+TEST(test_prefix_share_keeps_full_prompt) {
+    // Independent-share used to let fork_blocks clobber n_prompt to the inherited
+    // span. populate_batch_from then hit remaining_prompt==0 and aborted.
+    // Measured 2026-08-14: "admitted SHARED: 64 of 64 ... 0 left to prefill".
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/80)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    const llama_sequence_group * a = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(a != nullptr);
+    EXPECT_TRUE(a->n_past >= 64);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/1, /*n_prompt=*/80)));
+    const llama_sequence_group * b = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(b != nullptr);
+    EXPECT_TRUE(b->n_prompt == 80u);
+    EXPECT_TRUE(b->logical_seq.size() == 80u);
+    EXPECT_TRUE(b->n_past == 64u);
+    EXPECT_TRUE(!b->block_table.empty());
+
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+}
+
+TEST(test_fork_does_not_reshare) {
+    // queue_forked_request already fork_blocks + restores n_prompt, then calls
+    // queue_request. Scanning again would clobber n_prompt and leak a refcount.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/80)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0)->n_past >= 64);
+
+    EXPECT_TRUE(fixture.sched->queue_forked_request(make_group(/*id=*/1, /*n_prompt=*/80), /*parent=*/0));
+    const llama_sequence_group * b = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(b != nullptr);
+    EXPECT_TRUE(b->n_prompt == 80u);
+    EXPECT_TRUE(b->logical_seq.size() == 80u);
+    EXPECT_TRUE(b->n_past == 64u);
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     fprintf(stderr, "test-paged-kv: block_manager\n");
     RUN(test_block_manager_leak_simple);
@@ -411,6 +469,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_no_deadlock_on_empty);
     RUN(test_scheduler_deadlock_oversize_waiting_request);
     RUN(test_scheduler_rejects_oversized_prompt);
+    RUN(test_prefix_share_keeps_full_prompt);
+    RUN(test_fork_does_not_reshare);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");
     return 0;
