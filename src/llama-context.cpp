@@ -299,6 +299,24 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // ⚠ A DESIGNED REFUSAL, NOT AN ASSERT. `--kv-paged` is a USER-PASSED FLAG; n_batch != n_ubatch
+    // is a legitimate constraint (the paged scheduler has one batch budget), but delivering it as
+    // GGML_ASSERT aborted the process with a backtrace. Same class as the 2026-08-10
+    // "failed to init the paged scheduler" crash: the useful line scrolls past and the user
+    // reports a crash instead of a flag mismatch. Throw so llama_init_from_model returns null
+    // and the server/cli refuse to start. Never warn-and-continue: a paged flag that silently
+    // degrades to static is the 2026-08-09 4.5h trap.
+    //
+    // FIRST WALL, before create_memory, so hybrid / SWA / DSV4 / MSA cannot skip it. The two
+    // leftover asserts in llama-model.cpp / llama-paged-scheduler.cpp are converted to the
+    // same refuse (second wall) in case a caller builds a paged cache without going through here.
+    if (cparams.kv_paged && cparams.n_batch != cparams.n_ubatch) {
+        throw std::runtime_error(format(
+            "kv_paged requires n_batch == n_ubatch (got n_batch=%u n_ubatch=%u). "
+            "Pass -b N -ub N with the same N.",
+            cparams.n_batch, cparams.n_ubatch));
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
 
     cparams.op_offload = params.op_offload;

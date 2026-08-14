@@ -2741,7 +2741,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         GGML_ASSERT(!hparams.is_swa_any());
                         if (cparams.kv_paged) {
                             GGML_ASSERT(!cparams.kv_unified && "conflicting parameters: kv_unified cannot be used with kv_paged.");
-                            GGML_ASSERT(cparams.n_ubatch == cparams.n_batch && "kv_paged requires n_ubatch == n_batch.");
+                            // ⚠ DESIGNED REFUSAL, NOT AN ASSERT (second wall). The first wall is the
+                            // llama_context ctor, which throws the same text before create_memory so
+                            // every arch is covered. This site used to GGML_ASSERT and abort the
+                            // process -- a user-passed -b/-ub mismatch is not an internal invariant.
+                            // Throw, never fall through to the static llama_kv_cache below: a paged
+                            // flag that silently degrades is the 2026-08-09 4.5h trap.
+                            if (cparams.n_ubatch != cparams.n_batch) {
+                                throw std::runtime_error(format(
+                                    "kv_paged requires n_batch == n_ubatch (got n_batch=%u n_ubatch=%u). "
+                                    "Pass -b N -ub N with the same N.",
+                                    cparams.n_batch, cparams.n_ubatch));
+                            }
                             LLAMA_LOG_INFO("%s: Detected kv_paged=%d, creating llama_kv_cache_paged.\n", __func__, cparams.kv_paged);
                             const uint32_t head_dim   = hparams.n_embd_head_v();
                             const uint32_t n_head     = hparams.n_head_kv();

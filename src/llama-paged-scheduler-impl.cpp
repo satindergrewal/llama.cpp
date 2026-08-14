@@ -1260,8 +1260,9 @@ bool llama_paged_scheduler_impl::set_draft(int32_t request_id, const llama_token
         return false;
     }
 
-    // ⚠ CAP AGAINST THE BATCH BUDGET. paged asserts n_batch == n_ubatch (llama-model.cpp:2624), so an
-    // oversized draft surfaces later as a startup-abort-shaped failure far from its cause. The +1 is
+    // ⚠ CAP AGAINST THE BATCH BUDGET. paged requires n_batch == n_ubatch (refused at context
+    // construction; scheduler init is the second wall). An oversized draft used to surface later
+    // as a startup abort far from its cause. The +1 is
     // the last accepted token, which shares the row block with the draft.
     if (n_draft + 1 > n_batch) {
         LLAMA_LOG_ERROR("%s: request_id=%d draft of %d tokens (+1 verify row) exceeds n_batch=%d.\n",

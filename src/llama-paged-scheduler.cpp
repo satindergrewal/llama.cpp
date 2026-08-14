@@ -101,7 +101,17 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
     const uint32_t n_ctx    = ctx->n_ctx();
     const uint32_t block_sz = ctx->block_size();
     const uint32_t n_batch  = ctx->n_batch();
-    GGML_ASSERT(n_batch == ctx->n_ubatch() && "kv_paged requires n_batch == n_ubatch.");
+    // ⚠ DESIGNED REFUSAL, NOT AN ASSERT (second wall). The first wall is the llama_context ctor.
+    // This used to GGML_ASSERT after the cache was already built -- a user-passed -b/-ub
+    // mismatch aborted the process with a backtrace. Log + return null so the server's
+    // existing `if (!paged_sched) refuse` path fires. Never continue with a mismatched budget.
+    if (n_batch != ctx->n_ubatch()) {
+        LLAMA_LOG_ERROR(
+            "%s: kv_paged requires n_batch == n_ubatch (got n_batch=%u n_ubatch=%u). "
+            "Pass -b N -ub N with the same N.\n",
+            __func__, n_batch, ctx->n_ubatch());
+        return nullptr;
+    }
 
     try {
         auto * sched = new llama_paged_scheduler(n_ctx, block_sz, n_batch, paged_kv);
