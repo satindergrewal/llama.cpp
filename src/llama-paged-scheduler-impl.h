@@ -3,6 +3,8 @@
 #include "llama-kv-cache-paged.h"
 
 #include <clocale>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 enum class llama_scheduler_status {
@@ -31,6 +33,18 @@ class llama_paged_scheduler_impl {
     // P1-6: queue `group` as a COW fork of an existing request -- it inherits the parent's
     // prefix blocks by reference (fork_blocks) instead of prefilling them again.
     bool                   queue_forked_request(llama_sequence_group group, int32_t parent_request_id);
+
+    // Named session: a harness says "this request is the master". The name
+    // follows the live request, then the parked prefix after finish().
+    // Omitted session_id is a no-op -- existing callers stay unchanged.
+    bool                   bind_session(const std::string & session_id, int32_t request_id);
+    bool                   queue_forked_from_session(llama_sequence_group group, const std::string & session_id);
+    // Drop the session's extra hold refs. Shared prefix stays while children
+    // still hold refs. Unique suffix returns to the pool.
+    bool                   close_session(const std::string & session_id);
+    bool                   has_session(const std::string & session_id) const;
+    int32_t                session_request_id(const std::string & session_id) const;
+    size_t                 n_held_prefixes() const { return held_prefixes.size(); }
     // ★ STEP D of paged speculation (FINDINGS-paged-no-speculation.md).
     //
     // `n_accepted` is OPTIONAL and nullable. When null, every sequence accepts exactly ONE token --
@@ -104,6 +118,10 @@ class llama_paged_scheduler_impl {
     // Keep the finished request's full-block prefix so later independent
     // arrivals can still SHARED-admit (vLLM APC). Not a radix tree.
     void park_finished_prefix(llama_sequence_group & group);
+    // After park: point the session name at the hold, or drop it if
+    // nothing was parked (too short for a full block).
+    void rebind_session_after_finish(const llama_sequence_group & group);
+    llama_sequence_group * find_parent_group(int32_t parent_request_id) const;
     // Evict unique suffix of a parked prefix first. NEVER a block with
     // ref_cnt > 1 that children still hold.
     bool evict_held_prefix();
@@ -139,6 +157,11 @@ class llama_paged_scheduler_impl {
 
     // Used for fast lookups
     std::unordered_map<int32_t, llama_sequence_group *> id_to_group;
+
+    // session_id -> live request_id or parked hold id. Reverse map so
+    // finish() can retarget the name onto the hold without a scan.
+    std::unordered_map<std::string, int32_t> sessions;
+    std::unordered_map<int32_t, std::string> request_sessions;
 
     const uint32_t         n_seq_max_ctx;
     const uint32_t         block_size;

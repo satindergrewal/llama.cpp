@@ -31,6 +31,22 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("cache_prompt", params.cache_prompt))
         ->set_desc("Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests"));
 
+    add((new field_str("session_id"))
+        ->set_desc("Name this request as a paged-KV session master (or name a child). Omitted: unchanged")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.session_id = data.at("session_id").get<std::string>();
+        }));
+
+    add((new field_str("parent_session_id"))
+        ->set_desc("Fork this completion from a named session's live or parked prefix")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.parent_session_id = data.at("parent_session_id").get<std::string>();
+        }));
+
+    add((new field_num("parent_id", params.parent_id))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Fork this completion from a live request_id or parked hold id. -1 = omitted"));
+
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));
 

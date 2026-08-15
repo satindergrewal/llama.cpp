@@ -351,14 +351,22 @@ bool llama_paged_scheduler_impl::queue_forked_request(llama_sequence_group group
         return queue_request(std::move(group));
     }
 
-    auto it = id_to_group.find(parent_request_id);
-    if (it == id_to_group.end() || it->second == nullptr) {
+    llama_sequence_group * parent_ptr = find_parent_group(parent_request_id);
+    if (parent_ptr == nullptr) {
         LLAMA_LOG_ERROR("%s: parent request %d not found; queueing as a normal request\n",
                         __func__, parent_request_id);
         return queue_request(std::move(group));
     }
 
-    const llama_sequence_group & parent = *it->second;
+    // Live groups clear block_table after the cache copies it. Held
+    // prefixes keep theirs. Give fork_blocks a view with a real table.
+    llama_sequence_group parent_view = *parent_ptr;
+    if (parent_view.block_table.empty() && kv_cache_manager) {
+        if (const auto * bl = kv_cache_manager->get_sequence_blocks(parent_ptr->request_id)) {
+            parent_view.block_table = *bl;
+        }
+    }
+    const llama_sequence_group & parent = parent_view;
 
     // fork at the COMMON PREFIX: the parent's logical_seq grows with its own generated
     // tokens, so requiring a full prefix match would reject every live fork
@@ -458,6 +466,7 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
     // still SHARED-admits. Then free_blocks drops THIS request's refs;
     // the park keeps the prefix until eviction or teardown.
     park_finished_prefix(group);
+    rebind_session_after_finish(group);
     kv_cache_manager->free_blocks(group);
     group.status = llama_sequence_group_status::FINISHED;
     // erase only OUR mapping: a new request may already have reused this id (the server
@@ -1621,6 +1630,156 @@ bool llama_paged_scheduler_impl::set_draft(int32_t request_id, const llama_token
 void llama_paged_scheduler_impl::set_on_finish(llama_paged_on_finish_cb cb, void * user_data) {
     on_finish_cb        = cb;
     on_finish_user_data = user_data;
+}
+
+llama_sequence_group * llama_paged_scheduler_impl::find_parent_group(int32_t parent_request_id) const {
+    auto it = id_to_group.find(parent_request_id);
+    if (it != id_to_group.end() && it->second != nullptr) {
+        return it->second;
+    }
+    for (const auto & h : held_prefixes) {
+        if (h && h->request_id == parent_request_id) {
+            return h.get();
+        }
+    }
+    return nullptr;
+}
+
+void llama_paged_scheduler_impl::rebind_session_after_finish(const llama_sequence_group & group) {
+    auto rit = request_sessions.find(group.request_id);
+    if (rit == request_sessions.end()) {
+        return;
+    }
+    const std::string sid = rit->second;
+    request_sessions.erase(rit);
+
+    const uint32_t n_full = block_size ? (group.n_past / block_size) * block_size : 0;
+    int32_t        hold_id = 0;
+    if (n_full > 0 && group.logical_seq.size() >= n_full) {
+        for (const auto & h : held_prefixes) {
+            if (!h || h->logical_seq.size() < n_full) {
+                continue;
+            }
+            bool match = true;
+            for (uint32_t i = 0; i < n_full; ++i) {
+                if (h->logical_seq[i] != group.logical_seq[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                hold_id = h->request_id;
+                break;
+            }
+        }
+    }
+    if (hold_id != 0) {
+        sessions[sid] = hold_id;
+        request_sessions[hold_id] = sid;
+        LLAMA_LOG_INFO("%s: session '%s' now names held prefix %d\n",
+                       __func__, sid.c_str(), hold_id);
+    } else {
+        sessions.erase(sid);
+        LLAMA_LOG_INFO("%s: session '%s' dropped -- no full-block prefix to keep\n",
+                       __func__, sid.c_str());
+    }
+}
+
+bool llama_paged_scheduler_impl::bind_session(const std::string & session_id, int32_t request_id) {
+    if (session_id.empty()) {
+        return false;
+    }
+    llama_sequence_group * g = find_parent_group(request_id);
+    if (g == nullptr) {
+        LLAMA_LOG_ERROR("%s: request %d not found; cannot bind session '%s'\n",
+                        __func__, request_id, session_id.c_str());
+        return false;
+    }
+    auto sit = sessions.find(session_id);
+    if (sit != sessions.end() && sit->second != request_id) {
+        request_sessions.erase(sit->second);
+    }
+    auto rit = request_sessions.find(request_id);
+    if (rit != request_sessions.end() && rit->second != session_id) {
+        sessions.erase(rit->second);
+    }
+    sessions[session_id] = request_id;
+    request_sessions[request_id] = session_id;
+    LLAMA_LOG_INFO("%s: session '%s' bound to request %d\n",
+                   __func__, session_id.c_str(), request_id);
+    return true;
+}
+
+bool llama_paged_scheduler_impl::queue_forked_from_session(llama_sequence_group group,
+                                                          const std::string & session_id) {
+    auto it = sessions.find(session_id);
+    if (it == sessions.end()) {
+        LLAMA_LOG_WARN("%s: session '%s' not found; queueing as a normal request\n",
+                       __func__, session_id.c_str());
+        return queue_request(std::move(group));
+    }
+    return queue_forked_request(std::move(group), it->second);
+}
+
+bool llama_paged_scheduler_impl::close_session(const std::string & session_id) {
+    auto it = sessions.find(session_id);
+    if (it == sessions.end()) {
+        return false;
+    }
+    const int32_t id = it->second;
+    sessions.erase(it);
+    request_sessions.erase(id);
+
+    // Live master: just unbind. Its own refs stay until it finishes.
+    if (id_to_group.count(id)) {
+        LLAMA_LOG_INFO("%s: session '%s' unbound from live request %d\n",
+                       __func__, session_id.c_str(), id);
+        return true;
+    }
+
+    // Another session still names this hold -- drop only our name.
+    for (const auto & kv : sessions) {
+        if (kv.second == id) {
+            LLAMA_LOG_INFO("%s: session '%s' closed; hold %d still named by '%s'\n",
+                           __func__, session_id.c_str(), id, kv.first.c_str());
+            return true;
+        }
+    }
+
+    for (auto hit = held_prefixes.begin(); hit != held_prefixes.end(); ++hit) {
+        if (!(*hit) || (*hit)->request_id != id) {
+            continue;
+        }
+        llama_sequence_group * h = hit->get();
+        if (h->block_table.empty() && kv_cache_manager) {
+            if (const auto * bl = kv_cache_manager->get_sequence_blocks(h->request_id)) {
+                h->block_table = *bl;
+            }
+        }
+        // free_blocks decrements THIS hold's refs only. Children that
+        // inherited the prefix keep theirs. Unique suffix (ref_cnt==1)
+        // returns to the pool. Shared prefix stays.
+        if (kv_cache_manager && !h->block_table.empty()) {
+            kv_cache_manager->free_blocks(*h);
+        }
+        held_prefixes.erase(hit);
+        LLAMA_LOG_INFO("%s: session '%s' closed; dropped extra refs on hold %d\n",
+                       __func__, session_id.c_str(), id);
+        return true;
+    }
+
+    LLAMA_LOG_INFO("%s: session '%s' closed; hold %d already gone\n",
+                   __func__, session_id.c_str(), id);
+    return true;
+}
+
+bool llama_paged_scheduler_impl::has_session(const std::string & session_id) const {
+    return sessions.find(session_id) != sessions.end();
+}
+
+int32_t llama_paged_scheduler_impl::session_request_id(const std::string & session_id) const {
+    auto it = sessions.find(session_id);
+    return it == sessions.end() ? 0 : it->second;
 }
 
 llama_sequence_group * llama_paged_scheduler_impl::get_group_from_id(int32_t request_id) const {

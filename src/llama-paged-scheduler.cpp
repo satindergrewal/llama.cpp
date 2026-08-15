@@ -217,6 +217,45 @@ LLAMA_API bool llama_paged_scheduler_fork_request(struct llama_paged_scheduler *
     return sched->impl.queue_forked_request(group, parent_request_id);
 }
 
+LLAMA_API bool llama_paged_scheduler_bind_session(struct llama_paged_scheduler * sched,
+                                                  const char *                   session_id,
+                                                  int32_t                        request_id) {
+    if (!sched || !session_id || session_id[0] == '\0') {
+        return false;
+    }
+    return sched->impl.bind_session(session_id, request_id);
+}
+
+LLAMA_API bool llama_paged_scheduler_fork_from_session(struct llama_paged_scheduler * sched,
+                                                       const llama_token *            tokens,
+                                                       int32_t                        n_tokens,
+                                                       int32_t                        request_id,
+                                                       const char *                   session_id) {
+    if (!sched || !tokens || !session_id) {
+        return false;
+    }
+
+    llama_sequence_group group;
+    group.request_id = request_id;
+    group.n_prompt   = n_tokens;
+    group.n_decoded  = 0;
+    group.n_past     = 0;
+    for (int i = 0; i < n_tokens; ++i) {
+        group.logical_seq.push_back(tokens[i]);
+    }
+    group.t_arrival_time = ggml_time_us();
+
+    return sched->impl.queue_forked_from_session(std::move(group), session_id);
+}
+
+LLAMA_API bool llama_paged_scheduler_close_session(struct llama_paged_scheduler * sched,
+                                                   const char *                   session_id) {
+    if (!sched || !session_id || session_id[0] == '\0') {
+        return false;
+    }
+    return sched->impl.close_session(session_id);
+}
+
 LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
                                             struct llama_batch *           batch,
                                             const llama_token *            tokens,

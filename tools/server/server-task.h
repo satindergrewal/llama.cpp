@@ -27,6 +27,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_CLOSE_SESSION,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -93,6 +94,11 @@ struct task_params {
 
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
+
+    // Paged KV session / child API. Empty / -1 = omitted, behavior unchanged.
+    std::string session_id;
+    std::string parent_session_id;
+    int32_t     parent_id = -1;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)

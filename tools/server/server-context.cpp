@@ -2192,9 +2192,30 @@ private:
             // cold request and preserves exactly the restored prefix on a warm one.
             slot.prompt.tokens.keep_first((size_t) n_warm);
 
-            if (!llama_paged_scheduler_add_request(paged_sched, toks.data(), (int32_t) toks.size(), slot.id, n_warm)) {
+            bool queued = false;
+            if (!slot.task->params.parent_session_id.empty()) {
+                queued = llama_paged_scheduler_fork_from_session(
+                    paged_sched, toks.data(), (int32_t) toks.size(), slot.id,
+                    slot.task->params.parent_session_id.c_str());
+            } else if (slot.task->params.parent_id >= 0) {
+                queued = llama_paged_scheduler_fork_request(
+                    paged_sched, toks.data(), (int32_t) toks.size(), slot.id,
+                    slot.task->params.parent_id);
+            } else {
+                queued = llama_paged_scheduler_add_request(
+                    paged_sched, toks.data(), (int32_t) toks.size(), slot.id, n_warm);
+            }
+            if (!queued) {
                 SLT_ERR(slot, "%s", "paged scheduler rejected the request\n");
                 return false;
+            }
+            if (!slot.task->params.session_id.empty()) {
+                if (!llama_paged_scheduler_bind_session(paged_sched,
+                                                        slot.task->params.session_id.c_str(),
+                                                        slot.id)) {
+                    SLT_WRN(slot, "paged: session_id '%s' bind failed (request still queued)\n",
+                            slot.task->params.session_id.c_str());
+                }
             }
             // the scheduler owns prefill, so the classic SLOT_STATE_STARTED site that
             // starts the prompt clock never runs for paged slots. reset() already
@@ -3144,6 +3165,25 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_CLOSE_SESSION:
+                {
+                    auto res = std::make_unique<server_task_result_control>();
+                    res->id = task.id;
+                    if (!paged_sched) {
+                        res->success = false;
+                        res->message = "paged scheduler not enabled";
+                    } else if (task.params.session_id.empty()) {
+                        res->success = false;
+                        res->message = "session_id required";
+                    } else if (!llama_paged_scheduler_close_session(paged_sched,
+                                                                   task.params.session_id.c_str())) {
+                        res->success = false;
+                        res->message = "unknown session";
+                    } else {
+                        res->success = true;
+                    }
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -5996,6 +6036,53 @@ void server_routes::init_routes() {
             data,
             files,
             TASK_RESPONSE_TYPE_NONE); // infill is not OAI compatible
+    };
+
+    this->post_fork = [this](const server_http_req & req) {
+        auto res = create_response();
+        std::vector<raw_buffer> files;
+        json body = json::parse(req.body);
+        if (!body.contains("parent_session_id") && !body.contains("parent_id") &&
+            !body.contains("session_id")) {
+            res->error(format_error_response(
+                "POST /fork needs parent_session_id, parent_id, or session_id",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        return handle_completions_impl(
+            req,
+            SERVER_TASK_TYPE_COMPLETION,
+            body,
+            files,
+            TASK_RESPONSE_TYPE_NONE);
+    };
+
+    this->post_close_session = [this](const server_http_req & req) {
+        auto res = create_response();
+        json body = json::parse(req.body);
+        const std::string sid = json_value(body, "session_id", std::string());
+        if (sid.empty()) {
+            res->error(format_error_response("session_id required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_CLOSE_SESSION);
+            task.id = rd.get_new_id();
+            task.params.session_id = sid;
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
     };
 
     this->post_completions = [this](const server_http_req & req) {

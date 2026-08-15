@@ -1705,6 +1705,20 @@ extern "C" {
                                                      int32_t                        request_id,
                                                      int32_t                        parent_request_id);
 
+    // Named session: bind a live (or parked) request as the master, fork a
+    // child from that name, or drop the session's extra refs. close does
+    // not free a prefix children still hold.
+    LLAMA_API bool llama_paged_scheduler_bind_session(struct llama_paged_scheduler * sched,
+                                                      const char *                   session_id,
+                                                      int32_t                        request_id);
+    LLAMA_API bool llama_paged_scheduler_fork_from_session(struct llama_paged_scheduler * sched,
+                                                           const llama_token *            tokens,
+                                                           int32_t                        n_tokens,
+                                                           int32_t                        request_id,
+                                                           const char *                   session_id);
+    LLAMA_API bool llama_paged_scheduler_close_session(struct llama_paged_scheduler * sched,
+                                                       const char *                   session_id);
+
     // n_warm (P1-5): how many LEADING tokens of `tokens` are already resident in the paged
     // cache because an earlier llama_state_seq_set_data restored them for this request_id.
     // The caller owns this cap because the caller is what knows the restored record really

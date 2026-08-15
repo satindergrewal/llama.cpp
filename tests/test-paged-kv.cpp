@@ -581,6 +581,94 @@ TEST(test_finished_prefix_survives_for_children) {
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
 }
 
+TEST(test_session_fork_live_and_parked) {
+    // Harness: bind a master, fork a child while it is live, then after
+    // the master finishes fork another child from the parked prefix.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0)->n_past >= 32);
+
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/1, /*n_prompt=*/40),
+                                                         "master"));
+    const llama_sequence_group * live_child = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(live_child != nullptr);
+    EXPECT_TRUE(live_child->n_prompt == 40u);
+    EXPECT_TRUE(live_child->n_past == 32u);
+    EXPECT_TRUE(!live_child->block_table.empty());
+
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) == nullptr);
+    // Name follows the parked hold, not the reused slot id.
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+    EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
+
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/2, /*n_prompt=*/40),
+                                                         "master"));
+    const llama_sequence_group * parked_child = fixture.sched->get_group_from_id(2);
+    EXPECT_TRUE(parked_child != nullptr);
+    EXPECT_TRUE(parked_child->n_prompt == 40u);
+    EXPECT_TRUE(parked_child->n_past == 32u);
+    EXPECT_TRUE(!parked_child->block_table.empty());
+}
+
+TEST(test_session_close_keeps_child_refs) {
+    // close_session drops the session's extra hold refs. Children that
+    // inherited the prefix keep theirs. A later named fork misses.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->bind_session("master", 0));
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
+
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/1, /*n_prompt=*/40),
+                                                         "master"));
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/2, /*n_prompt=*/40),
+                                                         "master"));
+    const llama_sequence_group * c1 = fixture.sched->get_group_from_id(1);
+    const llama_sequence_group * c2 = fixture.sched->get_group_from_id(2);
+    EXPECT_TRUE(c1 != nullptr && c1->n_past == 32u && !c1->block_table.empty());
+    EXPECT_TRUE(c2 != nullptr && c2->n_past == 32u && !c2->block_table.empty());
+
+    EXPECT_TRUE(fixture.sched->close_session("master"));
+    EXPECT_FALSE(fixture.sched->has_session("master"));
+    EXPECT_FALSE(fixture.sched->close_session("master")); // second close is a miss
+    EXPECT_EQ(fixture.sched->n_held_prefixes(), 0u);
+
+    // Children still hold the inherited prefix.
+    c1 = fixture.sched->get_group_from_id(1);
+    c2 = fixture.sched->get_group_from_id(2);
+    EXPECT_TRUE(c1 != nullptr && c1->n_past == 32u && !c1->block_table.empty());
+    EXPECT_TRUE(c2 != nullptr && c2->n_past == 32u && !c2->block_table.empty());
+
+    // Named fork no longer resolves. Independent share from live children
+    // may still inherit -- that is APC, not the session pin.
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/3, /*n_prompt=*/40),
+                                                         "master"));
+    EXPECT_FALSE(fixture.sched->has_session("master"));
+}
+
+TEST(test_session_omitted_is_noop) {
+    // No session_id: bind/close miss, queue is the old path.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+    EXPECT_FALSE(fixture.sched->bind_session("", 0));
+    EXPECT_FALSE(fixture.sched->has_session("nope"));
+    EXPECT_FALSE(fixture.sched->close_session("nope"));
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) != nullptr);
+}
+
 TEST(test_batch_width_cap_does_not_reject) {
     // Cut 1: n_seq_max_batch is BATCH WIDTH, not an admission ceiling.
     // Three requests that all fit the pool must all queue. Each step emits
@@ -647,6 +735,9 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_fork_does_not_reshare);
     RUN(test_pool_full_children_wait_master_stays);
     RUN(test_finished_prefix_survives_for_children);
+    RUN(test_session_fork_live_and_parked);
+    RUN(test_session_close_keeps_child_refs);
+    RUN(test_session_omitted_is_noop);
     RUN(test_batch_width_cap_does_not_reject);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");
