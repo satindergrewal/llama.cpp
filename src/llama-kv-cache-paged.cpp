@@ -130,6 +130,29 @@ llama_kv_cache_paged::llama_kv_cache_paged(uint32_t head_dim,
     gpu_backend(nullptr),
     cpu_backend(nullptr) {}
 
+
+// ⚠ A DESIGNED REFUSAL, NOT AN ASSERT. common_fit_paged_kv_blocks sets n_gpu_blocks=0
+// when the request will not fit (and logs "Largest n_ctx that fits"). Delivering that
+// as GGML_ASSERT aborted the process (rc 134) -- measured 2026-08-16 DSV4 -c 32768.
+// Same class as the n_batch != n_ubatch refuse (08f85dbfc). Throw so llama_init_from_model
+// returns null and the server/cli refuse to start with a clear log.
+static void ds4p_refuse_zero_paged_blocks(uint32_t n_gpu_blocks, uint32_t n_cpu_blocks) {
+    if (n_gpu_blocks == 0) {
+        throw std::runtime_error(
+            "kv_paged: n_gpu_blocks=0. The request does not fit the memory budget. "
+            "Largest n_ctx that fits: see the fitter line above. "
+            "Options: lower -c, raise --margin, reduce LLAMA_PAGED_POOL_HEADROOM, "
+            "or pass --paged-pool-clamp to shrink automatically.");
+    }
+    if (n_cpu_blocks == 0) {
+        throw std::runtime_error(
+            "kv_paged: n_cpu_blocks=0. The CPU swap pool cannot be empty. "
+            "Largest n_ctx that fits: see the fitter line above. "
+            "Options: lower -c, raise --margin, reduce LLAMA_PAGED_POOL_HEADROOM, "
+            "or pass --paged-pool-clamp to shrink automatically.");
+    }
+}
+
 void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_backends,
                                       ggml_backend_t backend_cpu,
                                       enum ggml_type type,
@@ -138,8 +161,7 @@ void llama_kv_cache_paged::init_multi(const std::vector<ggml_backend_t> & layer_
                                       float          watermark) {
     GGML_ASSERT(backend_cpu && "backend_cpu is nullptr");
     GGML_ASSERT(layer_backends.size() == n_layers && "need one backend per layer");
-    GGML_ASSERT(n_gpu_blocks && "n_gpu_blocks need to be greater than 0.");
-    GGML_ASSERT(n_cpu_blocks && "n_cpu_blocks need to be greater than 0.");
+    ds4p_refuse_zero_paged_blocks(n_gpu_blocks, n_cpu_blocks);
 
     num_gpu_blocks = n_gpu_blocks;
     num_cpu_blocks = n_cpu_blocks;
@@ -260,8 +282,7 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
             __func__);
     }
 
-    GGML_ASSERT(n_gpu_blocks && "n_gpu_blocks need to be greater than 0.");
-    GGML_ASSERT(n_cpu_blocks && "n_cpu_blocks need to be greater than 0.");
+    ds4p_refuse_zero_paged_blocks(n_gpu_blocks, n_cpu_blocks);
 
     LLAMA_LOG_INFO(
         "%s: initializing paged KV cache. n_gpu_blocks=%d, n_cpu_blocks=%d, block_size=%d, watermark=%0.2f\n", __func__,

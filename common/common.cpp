@@ -1409,7 +1409,10 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
                 "free_vram=%.1f MiB <= margin=%.1f MiB. "
                 "Try reducing --margin or offloading fewer layers to GPU.\n",
                 __func__, free_vram / 1024.0f / 1024.0f, margin    / 1024.0f / 1024.0f);
-        return; // leave params.n_gpu_blocks at its existing value
+        // Zero is the designed refuse signal (paged init / context ctor throw, not GGML_ASSERT).
+        params.n_gpu_blocks = 0;
+        params.n_cpu_blocks = 0;
+        return;
     }
 
     const size_t available = (free_vram > margin) ? free_vram - margin : 0;
@@ -1418,6 +1421,8 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         LOG_ERR("%s: available VRAM (%.1f MiB) is less than one block (%.1f MiB). "
                 "Try increasing n_gpu_blocks manually or reducing block_size.\n",
                 __func__, available      / 1024.0f / 1024.0f, bytes_per_block / 1024.0f / 1024.0f);
+        params.n_gpu_blocks = 0;
+        params.n_cpu_blocks = 0;
         return;
     }
 
@@ -1483,8 +1488,10 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
                     fit_ctx, headroom);
             // Fail LOUDLY rather than half-fit. Leaving the previous value here let the
             // server start anyway on a request it had just declared impossible -- measured:
-            // -c 4000000 printed the refusal and then served. Zero trips the
-            // "n_gpu_blocks need to be greater than 0" assert in the paged cache init.
+            // -c 4000000 printed the refusal and then served. Zero is the designed refuse
+            // signal: paged KV init / the context ctor throw (not GGML_ASSERT, which used
+            // to abort 134 -- measured 2026-08-16 DSV4 -c 32768) so the server fails
+            // startup with this "Largest n_ctx that fits" message.
             params.n_gpu_blocks = 0;
             params.n_cpu_blocks = 0;
             return;

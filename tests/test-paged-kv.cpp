@@ -7,6 +7,8 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #define TEST(name) static void name()
@@ -347,6 +349,28 @@ static llama_sequence_group make_group(int32_t request_id, uint32_t n_prompt) {
     group.t_arrival_time = request_id;  // control ordering based on request_id
     group.logical_seq.assign(n_prompt, /*dummy token=*/1);
     return group;
+}
+
+TEST(test_init_zero_gpu_blocks_throws) {
+    // ⚠ DESIGNED REFUSE, NOT GGML_ASSERT. common_fit_paged_kv_blocks sets
+    // n_gpu_blocks=0 when the request will not fit; init used to abort 134.
+    // A throw / false here is the contract; abort is the bug.
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    EXPECT_TRUE(backend != nullptr);
+
+    llama_kv_cache_paged kv(/*head_dim=*/64, /*n_heads_kv=*/4, /*block_size=*/16,
+                            /*n_layers=*/2, /*n_ubatch=*/64, /*n_seq_max=*/4);
+    bool threw = false;
+    try {
+        kv.init(backend, backend, GGML_TYPE_F16, /*n_gpu_blocks=*/0, /*n_cpu_blocks=*/1, 0.0f);
+    } catch (const std::exception & e) {
+        threw = true;
+        const char * msg = e.what();
+        EXPECT_TRUE(std::strstr(msg, "n_gpu_blocks=0") != nullptr);
+        EXPECT_TRUE(std::strstr(msg, "Largest n_ctx that fits") != nullptr);
+    }
+    EXPECT_TRUE(threw);
+    ggml_backend_free(backend);
 }
 
 TEST(test_scheduler_no_deadlock_on_empty) {
@@ -978,6 +1002,7 @@ int main(int /*argc*/, char ** /*argv*/) {
 
     fprintf(stderr, "test-paged-kv: llama_kv_cache_paged free_blocks\n");
     RUN(test_free_blocks_releases_to_pool);
+    RUN(test_init_zero_gpu_blocks_throws);
 
     fprintf(stderr, "test-paged-kv: llama_kv_cache_paged scheduler\n");
     RUN(test_scheduler_no_deadlock_on_empty);

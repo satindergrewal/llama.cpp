@@ -348,6 +348,21 @@ llama_context::llama_context(
     cparams.n_cpu_blocks = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
 
+    // ⚠ A DESIGNED REFUSAL, NOT AN ASSERT. common_fit_paged_kv_blocks sets n_gpu_blocks=0
+    // when the request will not fit (and logs "Largest n_ctx that fits"). Delivering that
+    // as GGML_ASSERT in paged KV init aborted the process (rc 134) -- measured 2026-08-16
+    // DSV4 -c 32768. Same class as the n_batch != n_ubatch refuse (08f85dbfc).
+    // FIRST WALL, before create_memory, so hybrid / SWA / DSV4 / MSA cannot skip it.
+    // Init itself throws the same text (second wall) for direct callers / the unit test.
+    if (cparams.kv_paged && cparams.n_gpu_blocks == 0) {
+        throw std::runtime_error(format(
+            "kv_paged: n_gpu_blocks=0 (n_ctx=%u). The request does not fit the memory budget. "
+            "Largest n_ctx that fits: see the fitter line above. "
+            "Options: lower -c, raise --margin, reduce LLAMA_PAGED_POOL_HEADROOM, "
+            "or pass --paged-pool-clamp to shrink automatically.",
+            cparams.n_ctx));
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
 
