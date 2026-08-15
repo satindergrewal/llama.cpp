@@ -2197,6 +2197,12 @@ private:
                 queued = llama_paged_scheduler_fork_from_session(
                     paged_sched, toks.data(), (int32_t) toks.size(), slot.id,
                     slot.task->params.parent_session_id.c_str());
+                if (!queued) {
+                    send_error(slot,
+                               std::string("session not found: ") + slot.task->params.parent_session_id,
+                               ERROR_TYPE_NOT_FOUND);
+                    return false;
+                }
             } else if (slot.task->params.parent_id >= 0) {
                 queued = llama_paged_scheduler_fork_request(
                     paged_sched, toks.data(), (int32_t) toks.size(), slot.id,

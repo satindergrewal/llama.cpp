@@ -1714,9 +1714,14 @@ bool llama_paged_scheduler_impl::queue_forked_from_session(llama_sequence_group 
                                                           const std::string & session_id) {
     auto it = sessions.find(session_id);
     if (it == sessions.end()) {
-        LLAMA_LOG_WARN("%s: session '%s' not found; queueing as a normal request\n",
-                       __func__, session_id.c_str());
-        return queue_request(std::move(group));
+        LLAMA_LOG_ERROR("%s: session '%s' not found\n",
+                        __func__, session_id.c_str());
+        return false;
+    }
+    if (find_parent_group(it->second) == nullptr) {
+        LLAMA_LOG_ERROR("%s: session '%s' names request %d but parent group not found\n",
+                        __func__, session_id.c_str(), it->second);
+        return false;
     }
     return queue_forked_request(std::move(group), it->second);
 }

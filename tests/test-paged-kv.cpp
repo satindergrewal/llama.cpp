@@ -651,10 +651,10 @@ TEST(test_session_close_keeps_child_refs) {
     EXPECT_TRUE(c1 != nullptr && c1->n_past == 32u && !c1->block_table.empty());
     EXPECT_TRUE(c2 != nullptr && c2->n_past == 32u && !c2->block_table.empty());
 
-    // Named fork no longer resolves. Independent share from live children
-    // may still inherit -- that is APC, not the session pin.
-    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/3, /*n_prompt=*/40),
-                                                         "master"));
+    // Named fork no longer resolves. Must fail loud -- not admit as cold/APC.
+    EXPECT_FALSE(fixture.sched->queue_forked_from_session(make_group(/*id=*/3, /*n_prompt=*/40),
+                                                          "master"));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(3) == nullptr);
     EXPECT_FALSE(fixture.sched->has_session("master"));
 }
 
@@ -667,6 +667,24 @@ TEST(test_session_omitted_is_noop) {
     EXPECT_FALSE(fixture.sched->close_session("nope"));
     EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
     EXPECT_TRUE(fixture.sched->get_group_from_id(0) != nullptr);
+}
+
+TEST(test_unknown_session_does_not_admit_cold) {
+    // Unknown parent_session_id must fail loud. Falling back to queue_request
+    // would admit a cold/APC request and lie that the fork happened.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) != nullptr);
+
+    EXPECT_FALSE(fixture.sched->queue_forked_from_session(make_group(/*id=*/1, /*n_prompt=*/40),
+                                                          "no-such-session"));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(1) == nullptr);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) != nullptr);
+    EXPECT_FALSE(fixture.sched->has_session("no-such-session"));
 }
 
 TEST(test_batch_width_cap_does_not_reject) {
@@ -738,6 +756,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_session_fork_live_and_parked);
     RUN(test_session_close_keeps_child_refs);
     RUN(test_session_omitted_is_noop);
+    RUN(test_unknown_session_does_not_admit_cold);
     RUN(test_batch_width_cap_does_not_reject);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");
