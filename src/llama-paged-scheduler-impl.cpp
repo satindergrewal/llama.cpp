@@ -341,14 +341,17 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
 }
 
 bool llama_paged_scheduler_impl::queue_forked_request(llama_sequence_group group, int32_t parent_request_id) {
-    // hybrid archs: the recurrent members hold per-seq state that cannot be rewound to
-    // the fork point -- inherited attention KV without matching recurrent state is wrong
-    // (and measured as a segfault on the fixture). Degrade loudly to a full prefill.
-    if (is_hybrid) {
-        LLAMA_LOG_WARN("%s: request %d: fork unsupported on hybrid archs (recurrent state "
-                       "cannot rewind); queueing as a normal request\n",
-                       __func__, group.request_id);
-        return queue_request(std::move(group));
+    last_fork_used_blocks_ = false;
+
+    // Hybrid with rewindable RS (DSV4, Qwen3.5) or no RS (pure SWA, dense wrappers):
+    // take fork_blocks. Hybrid with non-rewindable RS (SSM): refuse loud.
+    // Do NOT degrade to queue_request -- that is a silent cold, or an APC share
+    // that pretends the fork happened (measured 2026-08-15 DSV4 Flash 8k e2e).
+    if (!can_fork()) {
+        LLAMA_LOG_ERROR("%s: request %d: fork unsupported -- hybrid arch has recurrent "
+                        "state that cannot rewind; refusing (not queueing as a normal request)\n",
+                        __func__, group.request_id);
+        return false;
     }
 
     llama_sequence_group * parent_ptr = find_parent_group(parent_request_id);
@@ -390,6 +393,7 @@ bool llama_paged_scheduler_impl::queue_forked_request(llama_sequence_group group
     const std::vector<llama_token> full_seq = group.logical_seq;
 
     const uint32_t n_inherited = kv_cache_manager->fork_blocks(parent, group, (uint32_t) n_shared);
+    last_fork_used_blocks_ = n_inherited > 0 || !group.block_table.empty();
 
     // logical_seq must stay the FULL prompt; fork_blocks trimmed it to the inherited span
     group.logical_seq = full_seq;

@@ -12,6 +12,16 @@ enum class llama_scheduler_status {
     DEADLOCK,  // cannot make progress
 };
 
+// Dense always forks. Hybrid forks only if RS can rewind, or there is no RS.
+// True non-rewindable hybrid (SSM) must refuse -- do not degrade to cold/APC.
+inline bool llama_paged_fork_allowed(bool is_hybrid, bool supports_rs_rollback,
+                                     bool has_recurrent_state) {
+    if (!is_hybrid) {
+        return true;
+    }
+    return supports_rs_rollback || !has_recurrent_state;
+}
+
 class llama_paged_scheduler_impl {
   public:
     // n_seq_max_batch: how many sequences may share ONE decode batch.
@@ -82,15 +92,27 @@ class llama_paged_scheduler_impl {
     llama_sequence_group *         get_group_from_id(int32_t request_id) const;
     const llama_paged_batch_info * get_curr_batch_info() const;
 
-    // hybrid archs keep recurrent state next to the paged pool; a fork cannot rewind
-    // that state to the fork point, so forking must degrade to a full-prefill request
+    // hybrid archs keep recurrent state next to the paged pool. Fork is allowed
+    // when that state can rewind (supports_rs_rollback) or there is none to rewind.
+    // True non-rewindable hybrid (SSM) must refuse -- do not degrade to cold/APC.
     void set_hybrid(bool v) { is_hybrid = v; }
+    void set_supports_rs_rollback(bool v) { supports_rs_rollback = v; }
+    void set_has_recurrent_state(bool v) { has_recurrent_state = v; }
+    bool can_fork() const {
+        return llama_paged_fork_allowed(is_hybrid, supports_rs_rollback, has_recurrent_state);
+    }
+    // True only when the last queue_forked_* actually called fork_blocks.
+    // Distinguishes a real fork from an APC share after a silent degrade.
+    bool last_fork_used_blocks() const { return last_fork_used_blocks_; }
 
     // DEBUG accessor for the fork-residual checksum API
     const llama_kv_cache_paged * kv_cache() const { return kv_cache_manager; }
 
   private:
-    bool is_hybrid = false;
+    bool is_hybrid             = false;
+    bool supports_rs_rollback  = false;
+    bool has_recurrent_state   = false;
+    bool last_fork_used_blocks_ = false;
 
     void insert_sorted_by_arrival_time(llama_sequence_group_ptr new_group, llama_sequence_group_list & list);
 

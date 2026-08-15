@@ -1,10 +1,12 @@
 #include "ggml.h"
+#include "llama-arch.h"
 #include "llama-context.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-impl.h"
+#include "llama-model.h"
 #include "llama-paged-scheduler-impl.h"
 
 struct llama_paged_scheduler {
@@ -122,6 +124,12 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
         auto * sched = new llama_paged_scheduler(n_ctx, block_sz, n_batch, paged_kv,
                                                  ctx->n_seq_max());
         sched->impl.set_hybrid(is_hybrid);
+        // Wrapper is_hybrid is "not a flat paged cache" (DSV4, ISWA, MSA, hybrid).
+        // Fork is still safe when the arch can rewind RS, or there is no RS.
+        const llama_model & model = ctx->get_model();
+        sched->impl.set_supports_rs_rollback(llm_arch_supports_rs_rollback(model.arch));
+        sched->impl.set_has_recurrent_state(
+            llama_model_is_hybrid(&model) || llama_model_is_recurrent(&model));
         return sched;
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: Error when creating llama_paged_scheduler: %s\n", __func__, e.what());

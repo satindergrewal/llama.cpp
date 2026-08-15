@@ -697,6 +697,89 @@ TEST(test_session_survives_short_prefix) {
     EXPECT_TRUE(fixture.sched->has_session("master"));
 }
 
+TEST(test_fork_predicate_hybrid_rollback) {
+    // Dense always. Hybrid+rollback (DSV4) and hybrid with no RS also.
+    // Only non-rewindable hybrid with RS must refuse.
+    EXPECT_TRUE(llama_paged_fork_allowed(/*hybrid=*/false, /*rollback=*/false, /*rs=*/false));
+    EXPECT_TRUE(llama_paged_fork_allowed(/*hybrid=*/false, /*rollback=*/false, /*rs=*/true));
+    EXPECT_TRUE(llama_paged_fork_allowed(/*hybrid=*/true,  /*rollback=*/true,  /*rs=*/true));
+    EXPECT_TRUE(llama_paged_fork_allowed(/*hybrid=*/true,  /*rollback=*/false, /*rs=*/false));
+    EXPECT_FALSE(llama_paged_fork_allowed(/*hybrid=*/true, /*rollback=*/false, /*rs=*/true));
+}
+
+TEST(test_session_fork_hybrid_rollback_inherits) {
+    // DSV4-class: is_hybrid but supports_rs_rollback. /fork must take
+    // fork_blocks, not degrade to queue_request (which APC may then share).
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+    fixture.sched->set_hybrid(true);
+    fixture.sched->set_has_recurrent_state(true);
+    fixture.sched->set_supports_rs_rollback(true);
+    EXPECT_TRUE(fixture.sched->can_fork());
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0)->n_past >= 32);
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/1, /*n_prompt=*/40),
+                                                         "master"));
+    EXPECT_TRUE(fixture.sched->last_fork_used_blocks());
+    const llama_sequence_group * child = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(child != nullptr);
+    EXPECT_TRUE(child->n_prompt == 40u);
+    EXPECT_TRUE(child->n_past == 32u);
+    EXPECT_TRUE(!child->block_table.empty());
+}
+
+TEST(test_session_fork_hybrid_norewind_refuses) {
+    // True non-rewindable hybrid (SSM): refuse loud. Do not silent-cold
+    // via queue_request / APC share.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+    fixture.sched->set_hybrid(true);
+    fixture.sched->set_has_recurrent_state(true);
+    fixture.sched->set_supports_rs_rollback(false);
+    EXPECT_FALSE(fixture.sched->can_fork());
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->bind_session("master", 0));
+
+    EXPECT_FALSE(fixture.sched->queue_forked_from_session(make_group(/*id=*/1, /*n_prompt=*/40),
+                                                          "master"));
+    EXPECT_FALSE(fixture.sched->last_fork_used_blocks());
+    EXPECT_TRUE(fixture.sched->get_group_from_id(1) == nullptr);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) != nullptr);
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+}
+
+TEST(test_session_fork_hybrid_no_rs_inherits) {
+    // Hybrid wrapper with no recurrent state (pure SWA / MSA): nothing to
+    // rewind, so /fork still takes fork_blocks.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+    fixture.sched->set_hybrid(true);
+    fixture.sched->set_has_recurrent_state(false);
+    fixture.sched->set_supports_rs_rollback(false);
+    EXPECT_TRUE(fixture.sched->can_fork());
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->bind_session("master", 0));
+
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/1, /*n_prompt=*/40),
+                                                         "master"));
+    EXPECT_TRUE(fixture.sched->last_fork_used_blocks());
+    const llama_sequence_group * child = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(child != nullptr);
+    EXPECT_TRUE(child->n_past == 32u);
+    EXPECT_TRUE(!child->block_table.empty());
+}
+
 TEST(test_unknown_session_does_not_admit_cold) {
     // Unknown parent_session_id must fail loud. Falling back to queue_request
     // would admit a cold/APC request and lie that the fork happened.
@@ -785,6 +868,10 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_session_close_keeps_child_refs);
     RUN(test_session_omitted_is_noop);
     RUN(test_session_survives_short_prefix);
+    RUN(test_fork_predicate_hybrid_rollback);
+    RUN(test_session_fork_hybrid_rollback_inherits);
+    RUN(test_session_fork_hybrid_norewind_refuses);
+    RUN(test_session_fork_hybrid_no_rs_inherits);
     RUN(test_unknown_session_does_not_admit_cold);
     RUN(test_batch_width_cap_does_not_reject);
 
