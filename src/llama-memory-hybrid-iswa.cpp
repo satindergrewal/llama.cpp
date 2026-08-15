@@ -146,6 +146,9 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                            ubatches.size());
         }
 
+        // Same decode attach as llama_memory_hybrid::init_batch: not pending.
+        // Warmup STATIC on interval-4 full-attn layers is reserve (no batch
+        // info), not a static-slab decode.
         if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
             paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches); // copy: hybrid ctx owns the originals
         }

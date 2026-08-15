@@ -184,6 +184,12 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                            ubatches.size());
         }
 
+        // This attach IS the hybrid decode path, not a pending gate. When the
+        // pool exists and the scheduler has set batch info, the graph reads
+        // get_attn_paged() and build_attn_paged_or_null emits ggml_paged_attn
+        // (Metal: ggml_metal_op_paged_attn). No batch info (warmup/reserve)
+        // leaves paged_ctx null -- that is the STATIC print on interval-4
+        // full-attn layers (3,7,11,...), not decode using a static slab.
         llama_memory_context_ptr paged_ctx;
         if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
             paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches); // copy: hybrid ctx owns the originals

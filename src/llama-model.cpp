@@ -2355,10 +2355,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // --kv-paged used to be silently ignored for hybrid archs, booting a
                     // full-n_ctx static attention cache the user explicitly asked to avoid
                     // (measured: inkling 4M ctx = 48 GiB actual vs 19.5 GiB pool estimate
-                    // -> OOM). Refuse loudly until paged hybrid support lands.
-                    // DS4P_PAGED_HYBRID=1 (3b development): allow construction of the paged
-                    // attention pool inside the hybrid-iswa wrapper; the graph path does not
-                    // exist yet, so this is for bring-up only.
+                    // -> OOM). Refuse loudly unless DS4P_PAGED_HYBRID=1.
+                    // DS4P_PAGED_HYBRID=1: construct the paged attention pool inside the
+                    // hybrid wrapper. The graph consumer (build_attn_paged_or_null) and
+                    // scheduler discovery are live; decode uses ggml_paged_attn ->
+                    // ggml_metal_op_paged_attn when the scheduler has set batch info.
+                    // Still env-gated -- not a default-on family flip. The static attn
+                    // child is still allocated (reserve/warmup). Warmup STATIC on
+                    // interval-4 full-attn layers (3,7,11,...) is that reserve graph,
+                    // not decode falling back to a full static slab.
                     static const bool paged_hybrid_dev = []() {
                         const char * s = getenv("DS4P_PAGED_HYBRID");
                         return s != nullptr && atoi(s) != 0;
@@ -2414,13 +2419,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
 
-                        // 3b bring-up: build + init the paged attention pool here, where the
-                        // backends are in scope (same shape as the flat-arch paged path), and
-                        // hand ownership to the wrapper. Pool spans all layers for now; the
-                        // attn-only filter refinement comes with the graph path.
+                        // Build + init the paged attention pool here, where the backends
+                        // are in scope (same shape as the flat-arch paged path), and hand
+                        // ownership to the wrapper. Recurrent layers are filtered out
+                        // (#2436); decode reads the pool via get_attn_paged().
                         if (cparams.kv_paged && paged_hybrid_dev) {
                             LLAMA_LOG_INFO("%s: DS4P_PAGED_HYBRID: constructing the hybrid paged attention pool "
-                                    "(graph branch + scheduler discovery landed 2026-08-04; hybrid DECODE gate pending)\n", __func__);
+                                    "(decode uses ggml_paged_attn when the scheduler has set batch info)\n", __func__);
 
                             const uint32_t pg_head_dim   = hparams.n_embd_head_v();
                             const uint32_t pg_n_head     = hparams.n_head_kv();
@@ -2481,14 +2486,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
 
-                        // NON-SWA twin of the ISWA bring-up above. Without this a hybrid that has
+                        // NON-SWA twin of the ISWA path above. Without this a hybrid that has
                         // no SWA (Ornith reports n_swa = 0) built no pool at all, and the
                         // scheduler then reported a missing paged cache while blaming SWA.
-                        // Pool spans all layers for now, matching the ISWA path; the attn-only
-                        // filter refinement comes with the graph path.
+                        // Recurrent layers are filtered out (#2436), matching the ISWA path.
                         if (cparams.kv_paged && paged_hybrid_dev) {
                             LLAMA_LOG_INFO("%s: DS4P_PAGED_HYBRID: constructing the paged attention pool "
-                                    "for a non-SWA hybrid (hybrid DECODE gate pending)\n", __func__);
+                                    "for a non-SWA hybrid (decode uses ggml_paged_attn when the scheduler has set batch info)\n", __func__);
 
                             const uint32_t pg_head_dim   = hparams.n_embd_head_v();
                             const uint32_t pg_n_head     = hparams.n_head_kv();

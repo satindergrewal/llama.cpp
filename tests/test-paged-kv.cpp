@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 #define TEST(name) static void name()
 #define RUN(name)                                   \
@@ -883,6 +884,82 @@ TEST(test_batch_width_cap_does_not_reject) {
                 fixture.sched->get_group_from_id(2) != nullptr);
 }
 
+TEST(test_hybrid_decode_attaches_paged_ctx) {
+    // The "hybrid DECODE gate pending" construction log was stale. Decode
+    // already takes ggml_paged_attn (-> ggml_metal_op_paged_attn) when the
+    // pool exists and the scheduler has set batch info. The hybrid wrapper
+    // calls init_batch_with_ubatches on that pool -- this test is that
+    // attach, without 27B weights.
+    //
+    // Qwen3.8 interval-4: (il+1) % 4 == 0 is full attention; the rest are
+    // recurrent and hold no paged KV. Warmup STATIC on 3,7,11 is the
+    // reserve graph (no batch info yet), not decode fallback.
+
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    EXPECT_TRUE(backend != nullptr);
+
+    const uint32_t n_layers   = 8;
+    const uint32_t block_size = 16;
+    llama_kv_cache_paged kv(/*head_dim=*/64, /*n_heads_kv=*/4, block_size, n_layers,
+                            /*n_ubatch=*/64, /*n_seq_max=*/8);
+
+    std::vector<uint8_t> has_kv(n_layers, 0);
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        // same formula as qwen35.cpp: is_recr = (il+1) % 4 != 0
+        has_kv[il] = ((il + 1) % 4 == 0) ? 1 : 0;
+    }
+    kv.set_layer_filter(std::move(has_kv));
+    kv.init(backend, backend, GGML_TYPE_F16, /*n_gpu_blocks=*/16, /*n_cpu_blocks=*/4, 0.0f);
+
+    // Recurrent layers have no tensor. Interval-4 attn layers 3 and 7 do.
+    EXPECT_TRUE(kv.get_kv_tensor(0) == nullptr);
+    EXPECT_TRUE(kv.get_kv_tensor(1) == nullptr);
+    EXPECT_TRUE(kv.get_kv_tensor(2) == nullptr);
+    EXPECT_TRUE(kv.get_kv_tensor(3) != nullptr);
+    EXPECT_TRUE(kv.get_kv_tensor(4) == nullptr);
+    EXPECT_TRUE(kv.get_kv_tensor(5) == nullptr);
+    EXPECT_TRUE(kv.get_kv_tensor(6) == nullptr);
+    EXPECT_TRUE(kv.get_kv_tensor(7) != nullptr);
+
+    // Warmup/reserve: no scheduler batch info -> hybrid wrapper cannot
+    // attach a paged child. That is the STATIC print on 3,7,11.
+    EXPECT_FALSE(kv.has_paged_batch_info());
+    {
+        llama_ubatch ub = {};
+        ub.n_tokens     = 1;
+        ub.n_seqs       = 1;
+        auto ctx        = kv.init_batch_with_ubatches({ub});
+        EXPECT_TRUE(ctx != nullptr);
+        EXPECT_TRUE(ctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS);
+    }
+
+    // Scheduler-driven decode: batch info present -> paged child exists
+    // and get_k is live on the interval-4 attention layers. This is the
+    // path qwen35.cpp feeds to build_attn_paged_or_null.
+    llama_paged_scheduler_impl sched(/*n_ctx=*/256, block_size, /*n_batch=*/64, &kv,
+                                     /*n_seq_max_batch=*/1);
+    EXPECT_TRUE(sched.queue_request(make_group(/*id=*/0, /*n_prompt=*/16)));
+    llama_batch batch = {};
+    EXPECT_TRUE(sched.step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(kv.has_paged_batch_info());
+
+    llama_ubatch ub = {};
+    ub.n_tokens     = 1;
+    ub.n_seqs       = 1;
+    auto ctx        = kv.init_batch_with_ubatches({ub});
+    EXPECT_TRUE(ctx != nullptr);
+    EXPECT_TRUE(ctx->get_status() == LLAMA_MEMORY_STATUS_SUCCESS);
+    const auto * paged = ctx->get_attn_paged();
+    EXPECT_TRUE(paged != nullptr);
+    EXPECT_TRUE(paged->get_k(3) != nullptr);
+    EXPECT_TRUE(paged->get_k(7) != nullptr);
+    EXPECT_TRUE(paged->get_k(0) == nullptr);
+    EXPECT_TRUE(paged->get_k(1) == nullptr);
+    EXPECT_TRUE(paged->get_k(2) == nullptr);
+
+    ggml_backend_free(backend);
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     fprintf(stderr, "test-paged-kv: block_manager\n");
     RUN(test_block_manager_leak_simple);
@@ -922,6 +999,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_dsv4_bookkeeping_id_space);
     RUN(test_two_named_children_batch_width_one);
     RUN(test_batch_width_cap_does_not_reject);
+    RUN(test_hybrid_decode_attaches_paged_ctx);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");
     return 0;
