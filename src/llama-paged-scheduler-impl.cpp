@@ -1099,6 +1099,14 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
             success = kv_cache_manager->allocate(1, *group);
         }
         if (!success) {
+            // evict() returned false or freed nothing usable: named/held
+            // master is not a victim. allocate() is GPU-only (see
+            // llama-kv-cache-paged.cpp). A shared-prefix child cannot
+            // swap_out its table (would rewrite the master's GPU ids).
+            // New unique blocks on CPU would mix devices in one table;
+            // paged attn writes a single GPU kv_cache. Stay queued --
+            // never 500. Resume when GPU unref blocks free (sibling
+            // leave or close_session).
             break;
         }
         candidates.push_back(group);

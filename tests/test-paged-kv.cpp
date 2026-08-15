@@ -716,6 +716,77 @@ TEST(test_named_master_not_eviction_victim) {
     EXPECT_TRUE(fixture.sched->has_session("master"));
 }
 
+TEST(test_named_master_full_gpu_children_wait_not_cpu_swap) {
+    // stories15M pool-full analog: 8 GPU + 4 CPU, block 16.
+    // Named parked master holds 7 GPU blocks (112 tokens). Children
+    // inherit 4 (64 tokens) and need unique GPU blocks. evict() will
+    // not shorten the named hold. allocate() is GPU-only, so the 4
+    // CPU blocks are unused. Children stay WAITING -- not SWAPPED,
+    // not take_terminated, not DEADLOCK -- until close_session drops
+    // the hold's unique suffix.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/8, /*n_cpu_blocks=*/4);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/112)));
+    llama_batch batch = {};
+    for (int i = 0; i < 4; ++i) {
+        const llama_sequence_group * m = fixture.sched->get_group_from_id(0);
+        if (!m || m->n_past >= 112) {
+            break;
+        }
+        prefill_one_chunk(fixture, batch);
+    }
+    const llama_sequence_group * master = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(master != nullptr);
+    EXPECT_TRUE(master->n_past >= 112);
+
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+    EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
+    const int32_t hold_id = fixture.sched->session_request_id("master");
+    const size_t  N       = fixture.sched->held_prefix_n_blocks(hold_id);
+    EXPECT_TRUE(N == 7u);
+
+    for (int id = 1; id <= 3; ++id) {
+        llama_sequence_group child = make_group(id, /*n_prompt=*/80);
+        // Tail must differ or LCP is 80 (all dummy 1s) and inherit is 5
+        // blocks -- then 1 free GPU is enough and the wait path is missed.
+        for (size_t i = 64; i < child.logical_seq.size(); ++i) {
+            child.logical_seq[i] = 2;
+        }
+        EXPECT_TRUE(fixture.sched->queue_forked_from_session(std::move(child), "master"));
+        const llama_sequence_group * c = fixture.sched->get_group_from_id(id);
+        EXPECT_TRUE(c != nullptr);
+        EXPECT_TRUE(c->n_past == 64u);
+    }
+
+    for (int step = 0; step < 12; ++step) {
+        EXPECT_TRUE(fixture.sched->step(batch) != llama_scheduler_status::DEADLOCK);
+        EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+        EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
+        for (int id = 1; id <= 3; ++id) {
+            const llama_sequence_group * c = fixture.sched->get_group_from_id(id);
+            EXPECT_TRUE(c != nullptr);
+            EXPECT_TRUE(c->status == llama_sequence_group_status::WAITING);
+            EXPECT_TRUE(c->status != llama_sequence_group_status::SWAPPED);
+        }
+    }
+
+    // GPU unique suffix returns on close. A waiter can admit. Never 500.
+    EXPECT_TRUE(fixture.sched->close_session("master"));
+    EXPECT_TRUE(fixture.sched->step(batch) != llama_scheduler_status::DEADLOCK);
+    EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+    int n_running = 0;
+    for (int id = 1; id <= 3; ++id) {
+        const llama_sequence_group * c = fixture.sched->get_group_from_id(id);
+        if (c && c->status == llama_sequence_group_status::RUNNING) {
+            n_running++;
+        }
+    }
+    EXPECT_TRUE(n_running >= 1);
+}
+
 TEST(test_session_close_keeps_child_refs) {
     // close_session drops the session's extra hold refs. Children that
     // inherited the prefix keep theirs. A later named fork misses.
@@ -1112,6 +1183,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_finished_prefix_survives_for_children);
     RUN(test_session_fork_live_and_parked);
     RUN(test_named_master_not_eviction_victim);
+    RUN(test_named_master_full_gpu_children_wait_not_cpu_swap);
     RUN(test_session_close_keeps_child_refs);
     RUN(test_session_omitted_is_noop);
     RUN(test_session_survives_short_prefix);
