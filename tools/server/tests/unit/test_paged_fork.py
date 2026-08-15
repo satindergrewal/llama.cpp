@@ -1,3 +1,4 @@
+import json
 import os
 import pytest
 
@@ -35,10 +36,13 @@ def create_server():
 
 
 def test_named_fork_child_reports_cache_n():
-    """A named /fork child must report timings.cache_n != 0.
+    """Named /fork child: cache_n is the inherited span, prompt_n is not.
 
-    The scheduler inherits whole physical blocks (logs: 'tokens inherited
-    by reference'). HTTP used to leave cache_n=0, so the fork looked fake.
+    The scheduler inherits whole physical blocks. HTTP must report that
+    as cache_n, and prompt_n must be only the tokens actually evaluated
+    after that prefix (prompt_n + cache_n == tokens_evaluated). Parent
+    cold stays cache_n=0. This is the HTTP proof; the C++ n_past test
+    does not touch HTTP.
     """
     global server
     server.start()
@@ -51,6 +55,15 @@ def test_named_fork_child_reports_cache_n():
     })
     assert parent.status_code == 200, parent.body
     assert "timings" in parent.body
+    parent_t = parent.body["timings"]
+    parent_n = parent.body["tokens_evaluated"]
+    assert parent_t["cache_n"] == 0, (
+        f"parent cold must stay cache_n=0; timings={parent_t}"
+    )
+    assert parent_t["prompt_n"] + parent_t["cache_n"] == parent_n, (
+        f"parent identity failed: prompt_n={parent_t['prompt_n']} "
+        f"cache_n={parent_t['cache_n']} n_prompt={parent_n}"
+    )
 
     child = server.make_request("POST", "/fork", data={
         "prompt": PREFIX + " and then she met a friend",
@@ -61,6 +74,13 @@ def test_named_fork_child_reports_cache_n():
     assert child.status_code == 200, child.body
     timings = child.body["timings"]
     cache_n = timings["cache_n"]
+    prompt_n = timings["prompt_n"]
+    n_prompt = child.body["tokens_evaluated"]
+    out = os.environ.get("DS4P_FORK_CHILD_JSON")
+    if out:
+        with open(out, "w") as f:
+            json.dump(child.body, f, indent=2)
+            f.write("\n")
     assert cache_n > 0, (
         f"named /fork child reported cache_n=0; inherited prefix is missing "
         f"from HTTP JSON. timings={timings}"
@@ -68,4 +88,14 @@ def test_named_fork_child_reports_cache_n():
     assert cache_n % 16 == 0, (
         f"cache_n={cache_n} is not a whole-block multiple; fork_blocks "
         f"inherits physical blocks only"
+    )
+    # prompt_n is only tokens actually evaluated after the inherited prefix.
+    # Billing the inherited span makes prompt_n + cache_n != n_prompt.
+    assert prompt_n + cache_n == n_prompt, (
+        f"child billed inherited tokens: prompt_n={prompt_n} cache_n={cache_n} "
+        f"n_prompt={n_prompt} timings={timings}"
+    )
+    assert prompt_n < n_prompt, (
+        f"child prompt_n={prompt_n} still equals full n_prompt={n_prompt}; "
+        f"inherited span was billed"
     )

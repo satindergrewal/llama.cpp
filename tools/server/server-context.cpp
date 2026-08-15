@@ -3530,7 +3530,15 @@ private:
                     add.push_back(ms->task->tokens[t]);
                 }
                 ms->prompt.tokens.insert(add);
-                ms->stats.n_prompt_processed += want - have;
+                // Named /fork already snapshotted the inherited span into
+                // cache_n. Keep those tokens in the mirror for prompt_save,
+                // but prompt_n is only tokens evaluated after that prefix.
+                // HTTP identity: prompt_n + cache_n == n_prompt.
+                const int32_t inherit     = (int32_t) ms->stats.n_prompt_cached;
+                const int32_t billed_from = std::max(have, inherit);
+                if (want > billed_from) {
+                    ms->stats.n_prompt_processed += (uint64_t) (want - billed_from);
+                }
             }
         }
 
