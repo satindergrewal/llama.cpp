@@ -108,6 +108,9 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     // Drop trailing ref_cnt==1 blocks (a child's unique tail). Shared prefix
     // blocks stay in the table. Returns how many physical blocks were released.
+    // Scheduler victim selection must not call this on a named session hold
+    // to admit a child -- that shortens the master. Child tails and
+    // non-session APC holds are the intended callers.
     uint32_t release_unref_suffix(llama_sequence_group & group);
 
     // DEBUG (fork-residual discriminator): additive checksum of the group's first

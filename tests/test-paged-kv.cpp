@@ -644,6 +644,78 @@ TEST(test_session_fork_live_and_parked) {
     EXPECT_TRUE(!parked_child->block_table.empty());
 }
 
+
+TEST(test_named_master_not_eviction_victim) {
+    // Named/held session prefix must not be shortened to admit a child.
+    // Victim selection prefers unref child tails / non-session holds.
+    // If the only reclaimable blocks are the named master's unique
+    // suffix, the child waits. After room frees, a later child inherits
+    // the original N blocks (or token count), not N-k.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/5, /*n_cpu_blocks=*/2);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/64)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    const llama_sequence_group * master = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(master != nullptr);
+    EXPECT_TRUE(master->n_past >= 64);
+
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+    EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
+
+    const int32_t hold_id = fixture.sched->session_request_id("master");
+    const size_t  N       = fixture.sched->held_prefix_n_blocks(hold_id);
+    EXPECT_TRUE(N == 4u);
+
+    // Occupy the leftover slack block with a *named* dummy so evict()
+    // cannot take an unref tail and must consider the parked master.
+    llama_sequence_group dummy = make_group(/*id=*/10, /*n_prompt=*/8);
+    dummy.logical_seq.assign(8, /*token=*/2);
+    EXPECT_TRUE(fixture.sched->queue_request(std::move(dummy)));
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->bind_session("other", /*request_id=*/10));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(10) != nullptr);
+
+    // Child shares 40 tokens -> inherits 32 (2 of N). Named hold still
+    // has a unique suffix. Pool is full. evict_held_prefix must NOT
+    // shorten the session; the child waits.
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/1, /*n_prompt=*/40),
+                                                         "master"));
+    const llama_sequence_group * child1 = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(child1 != nullptr);
+    EXPECT_TRUE(child1->n_past == 32u);
+
+    EXPECT_TRUE(fixture.sched->step(batch) != llama_scheduler_status::DEADLOCK);
+    EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+    EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
+    child1 = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(child1 != nullptr);
+    EXPECT_TRUE(child1->status == llama_sequence_group_status::WAITING);
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+
+    // Later child wants the full prefix. Must inherit N blocks / 64
+    // tokens, not N-k (the shortened 32 the old victim path left).
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/2, /*n_prompt=*/72),
+                                                         "master"));
+    const llama_sequence_group * child2 = fixture.sched->get_group_from_id(2);
+    EXPECT_TRUE(child2 != nullptr);
+    EXPECT_TRUE(child2->n_past == (uint32_t) (N * 16));
+    EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
+
+    // Room frees: dummy leaves. Master stay N; child 2 still inherited N.
+    EXPECT_TRUE(fixture.sched->abort_request(10));
+    EXPECT_TRUE(fixture.sched->step(batch) != llama_scheduler_status::DEADLOCK);
+    EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+    EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
+    child2 = fixture.sched->get_group_from_id(2);
+    EXPECT_TRUE(child2 != nullptr);
+    EXPECT_TRUE(child2->n_past == (uint32_t) (N * 16));
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+}
+
 TEST(test_session_close_keeps_child_refs) {
     // close_session drops the session's extra hold refs. Children that
     // inherited the prefix keep theirs. A later named fork misses.
@@ -1039,6 +1111,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_pool_full_children_wait_master_stays);
     RUN(test_finished_prefix_survives_for_children);
     RUN(test_session_fork_live_and_parked);
+    RUN(test_named_master_not_eviction_victim);
     RUN(test_session_close_keeps_child_refs);
     RUN(test_session_omitted_is_noop);
     RUN(test_session_survives_short_prefix);

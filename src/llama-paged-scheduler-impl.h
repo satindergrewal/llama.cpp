@@ -55,6 +55,9 @@ class llama_paged_scheduler_impl {
     bool                   has_session(const std::string & session_id) const;
     int32_t                session_request_id(const std::string & session_id) const;
     size_t                 n_held_prefixes() const { return held_prefixes.size(); }
+    // Held prefix length for a parked id (0 if unknown). Tests assert a
+    // named master stays at N, not N-k, across a tight-pool child wait.
+    size_t                 held_prefix_n_blocks(int32_t request_id) const;
     // ★ STEP D of paged speculation (FINDINGS-paged-no-speculation.md).
     //
     // `n_accepted` is OPTIONAL and nullable. When null, every sequence accepts exactly ONE token --
@@ -146,9 +149,12 @@ class llama_paged_scheduler_impl {
     // even if the hold has 0 full blocks. Drop only if nothing to name.
     void rebind_session_after_finish(const llama_sequence_group & group);
     llama_sequence_group * find_parent_group(int32_t parent_request_id) const;
-    // Evict unique suffix of a parked prefix first. NEVER a block with
-    // ref_cnt > 1 that children still hold.
+    // Evict unique suffix of a non-session parked prefix. NEVER a block
+    // with ref_cnt > 1 that children still hold. NEVER a named session
+    // hold -- shortening that to admit a child is how a parked master
+    // lost unique-suffix blocks and the next fork inherited N-k.
     bool evict_held_prefix();
+    bool is_named_session_id(int32_t request_id) const;
 
     int32_t get_curr_decode_tokens() const;
 

@@ -567,6 +567,36 @@ void llama_paged_scheduler_impl::park_finished_prefix(llama_sequence_group & gro
                    held_prefixes.back()->block_table.size());
 }
 
+bool llama_paged_scheduler_impl::is_named_session_id(int32_t request_id) const {
+    if (request_sessions.find(request_id) != request_sessions.end()) {
+        return true;
+    }
+    for (const auto & kv : sessions) {
+        if (kv.second == request_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t llama_paged_scheduler_impl::held_prefix_n_blocks(int32_t request_id) const {
+    for (const auto & h : held_prefixes) {
+        if (!h || h->request_id != request_id) {
+            continue;
+        }
+        if (!h->block_table.empty()) {
+            return h->block_table.size();
+        }
+        if (kv_cache_manager) {
+            if (const auto * bl = kv_cache_manager->get_sequence_blocks(request_id)) {
+                return bl->size();
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
 bool llama_paged_scheduler_impl::evict_held_prefix() {
     if (!kv_cache_manager) {
         return false;
@@ -575,9 +605,21 @@ bool llama_paged_scheduler_impl::evict_held_prefix() {
     // prefix is still shared (ref_cnt>1) keeps those blocks -- children
     // still need them. A hold with no children has ref_cnt==1 on every
     // block, so this frees the whole unused prefix and returns capacity.
+    //
+    // Named session holds are not victims. Shortening one to admit a
+    // child is how a parked master went 7 blocks / 112 tokens -> 4 and
+    // the next fork inherited 64 of 112. Product: one master stays
+    // resident; children leave without destroying it. If the only
+    // reclaimable blocks are that session's unique suffix, return false
+    // and leave the waiter queued.
     for (auto it = held_prefixes.begin(); it != held_prefixes.end(); ++it) {
         llama_sequence_group * h = it->get();
         if (!h) {
+            continue;
+        }
+        if (is_named_session_id(h->request_id)) {
+            LLAMA_LOG_DEBUG("%s: skip named session hold %d (master stays full).\n",
+                            __func__, h->request_id);
             continue;
         }
         if (h->block_table.empty()) {
@@ -837,6 +879,9 @@ bool llama_paged_scheduler_impl::evict() {
         if (!g || g == master) {
             continue;  // NEVER the highest-ref_cnt master prefix
         }
+        if (is_named_session_id(g->request_id)) {
+            continue;  // named live master stays resident
+        }
         const uint32_t unref = count_unref_blocks(*g);
         if (unref == 0) {
             continue;  // no unique tail to free
@@ -851,8 +896,8 @@ bool llama_paged_scheduler_impl::evict() {
     }
     if (best == running.end()) {
         LLAMA_LOG_DEBUG("%s: no unref-tail victim (master prefix stays).\n", __func__);
-        // Unique suffix of a parked prefix next -- never a ref_cnt>1
-        // master prefix children still need.
+        // Non-session parked unique suffix next. Named session holds
+        // are skipped inside evict_held_prefix -- queue the child.
         return evict_held_prefix();
     }
 
