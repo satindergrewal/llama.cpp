@@ -1430,10 +1430,12 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     // bought a pool 45x larger than the request.
     const uint32_t n_gpu_blocks_vram = (uint32_t)(available / bytes_per_block);
 
-    // Cap by what the requested context actually needs, with headroom for fragmentation and
-    // for the sharing/spill the paged cache exists to do. VRAM stays the hard ceiling.
+    // One shared pool: size for ONE max-length resident (the master) plus
+    // headroom for concurrent private tails. n_parallel is BATCH WIDTH, not
+    // how many n_ctx copies to allocate. Multiplying by n_parallel was the
+    // lane lie: -np 1 starved multi-agent, -np 4 oversized the pool / sliced
+    // context and killed the champion.
     const uint32_t blocks_per_seq = (params.n_ctx + block_size - 1) / block_size;
-    const uint32_t n_seqs         = params.n_parallel > 0 ? (uint32_t) params.n_parallel : 1u;
     // Headroom over the bare context. 1.5x by default; LLAMA_PAGED_POOL_HEADROOM overrides,
     // and setting it very large restores the old fill-all-VRAM behaviour for discrete GPUs.
     float headroom = 1.5f;
@@ -1441,7 +1443,7 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         const float v = (float) atof(e);
         if (v > 0.0f) { headroom = v; }
     }
-    const uint32_t blocks_needed  = (uint32_t)((float) blocks_per_seq * (float) n_seqs * headroom);
+    const uint32_t blocks_needed  = (uint32_t)((float) blocks_per_seq * headroom);
 
     // ---- ELASTICITY: refuse or clamp, never silently fill the machine -------------------
     // Capping by n_ctx stops gratuitous over-allocation for SMALL contexts, but a LARGE
@@ -1453,7 +1455,7 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
 
     if (n_gpu_blocks > n_gpu_blocks_vram) {
         // How much context DOES fit, so the message is actionable rather than just a refusal.
-        const uint32_t fit_blocks_per_seq = (uint32_t) ((double) n_gpu_blocks_vram / (headroom * (double) n_seqs));
+        const uint32_t fit_blocks_per_seq = (uint32_t) ((double) n_gpu_blocks_vram / (double) headroom);
         const uint32_t fit_ctx            = fit_blocks_per_seq * block_size;
 
         if (params.paged_pool_clamp) {
@@ -1469,12 +1471,12 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
             // no parser entry for --paged-pool-clamp while the error message advertised it.
             params.n_ctx = (int32_t) fit_ctx;
         } else {
-            LOG_ERR("%s: requested n_ctx=%d x %u seq needs %u KV blocks (%.1f GiB), but the "
+            LOG_ERR("%s: requested n_ctx=%d needs %u KV blocks (%.1f GiB), but the "
                     "memory budget allows %u (%.1f GiB).\n"
-                    "        Largest n_ctx that fits here: ~%u. Options: lower -c, lower -np, "
+                    "        Largest n_ctx that fits here: ~%u. Options: lower -c, "
                     "raise the budget with --margin, reduce LLAMA_PAGED_POOL_HEADROOM (now "
                     "%.2f), or pass --paged-pool-clamp to shrink automatically.\n",
-                    __func__, params.n_ctx, n_seqs, n_gpu_blocks,
+                    __func__, params.n_ctx, n_gpu_blocks,
                     n_gpu_blocks * (double) bytes_per_block / 1073741824.0,
                     n_gpu_blocks_vram,
                     n_gpu_blocks_vram * (double) bytes_per_block / 1073741824.0,
@@ -1492,9 +1494,11 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
 
     LOG_INF("%s: free_vram=%0.1f MiB, bytes_per_block=%ld, n_gpu_blocks=%d, n_cpu_blocks=%d\n",
             __func__, free_vram / 1024.0f / 1024.0f, bytes_per_block, n_gpu_blocks, n_cpu_blocks);
-    LOG_INF("%s: pool sized for n_ctx=%d x %d seq (%d blocks x %.2f headroom = %d); "
+    LOG_INF("%s: pool sized for n_ctx=%d (one master, %d blocks x %.2f headroom = %d); "
+            "n_parallel=%d is batch width, not a lane multiplier; "
             "VRAM would have allowed %d blocks (%.1f GiB)\n",
-            __func__, params.n_ctx, n_seqs, blocks_per_seq, headroom, blocks_needed,
+            __func__, params.n_ctx, blocks_per_seq, headroom, blocks_needed,
+            params.n_parallel,
             n_gpu_blocks_vram, (n_gpu_blocks_vram * (double) bytes_per_block) / (1024.0*1024.0*1024.0));
 
     params.n_gpu_blocks = n_gpu_blocks;
