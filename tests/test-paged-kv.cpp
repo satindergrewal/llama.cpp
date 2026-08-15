@@ -549,6 +549,38 @@ TEST(test_pool_full_children_wait_master_stays) {
     EXPECT_TRUE(sibling_live);
 }
 
+TEST(test_finished_prefix_survives_for_children) {
+    // Independent-share used to scan only running ∪ waiting. After the
+    // master finished, later children missed and full-prefilled. finish()
+    // now parks the full-block prefix; children that arrive after abort
+    // must admit SHARED (n_past covers the prefix), not cold from 0.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    const llama_sequence_group * master = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(master != nullptr);
+    EXPECT_TRUE(master->n_past >= 32);
+
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) == nullptr);
+
+    // Same prefix + short unique tail so remaining_prompt > 0 after inherit.
+    for (int id = 1; id <= 2; ++id) {
+        EXPECT_TRUE(fixture.sched->queue_request(make_group(id, /*n_prompt=*/40)));
+        const llama_sequence_group * c = fixture.sched->get_group_from_id(id);
+        EXPECT_TRUE(c != nullptr);
+        EXPECT_TRUE(c->n_prompt == 40u);
+        EXPECT_TRUE(c->logical_seq.size() == 40u);
+        EXPECT_TRUE(c->n_past == 32u);
+        EXPECT_TRUE(!c->block_table.empty());
+    }
+
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+}
+
 TEST(test_batch_width_cap_does_not_reject) {
     // Cut 1: n_seq_max_batch is BATCH WIDTH, not an admission ceiling.
     // Three requests that all fit the pool must all queue. Each step emits
@@ -614,6 +646,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_prefix_share_keeps_full_prompt);
     RUN(test_fork_does_not_reshare);
     RUN(test_pool_full_children_wait_master_stays);
+    RUN(test_finished_prefix_survives_for_children);
     RUN(test_batch_width_cap_does_not_reject);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");

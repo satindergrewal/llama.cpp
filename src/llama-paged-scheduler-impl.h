@@ -20,6 +20,7 @@ class llama_paged_scheduler_impl {
     // kill the champion / slice n_ctx. Do not do that.
     llama_paged_scheduler_impl(uint32_t n_ctx, uint32_t block_sz, int32_t n_batch,
                                llama_kv_cache_paged * kv_manager, uint32_t n_seq_max_batch = 0);
+    ~llama_paged_scheduler_impl();
 
     llama_scheduler_status step(llama_batch & batch);
 
@@ -100,6 +101,12 @@ class llama_paged_scheduler_impl {
     void set_waiting(llama_sequence_group_ptr group, bool prepend = false);
 
     void finish(llama_sequence_group & group);
+    // Keep the finished request's full-block prefix so later independent
+    // arrivals can still SHARED-admit (vLLM APC). Not a radix tree.
+    void park_finished_prefix(llama_sequence_group & group);
+    // Evict unique suffix of a parked prefix first. NEVER a block with
+    // ref_cnt > 1 that children still hold.
+    bool evict_held_prefix();
 
     int32_t get_curr_decode_tokens() const;
 
@@ -122,6 +129,13 @@ class llama_paged_scheduler_impl {
     llama_sequence_group_list running;
     llama_sequence_group_list swapped;
     llama_sequence_group_list waiting;
+
+    // Finished requests' full-block prefixes. Not in running/waiting --
+    // those are live. The share scan walks this too so a master that
+    // finished 2 seconds ago is still a hit. Negative request_ids so a
+    // reused slot id cannot collide with a hold.
+    llama_sequence_group_list held_prefixes;
+    int32_t                   next_hold_id = -2;
 
     // Used for fast lookups
     std::unordered_map<int32_t, llama_sequence_group *> id_to_group;

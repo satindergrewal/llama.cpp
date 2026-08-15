@@ -2,6 +2,8 @@
 
 #include "llama-impl.h"
 
+#include <memory>
+
 llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_ctx,
                                                        uint32_t               block_sz,
                                                        int32_t                n_batch,
@@ -12,6 +14,15 @@ llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_
     n_batch(n_batch),
     n_seq_max_batch(n_seq_max_batch),
     kv_cache_manager(kv_manager) {}
+
+llama_paged_scheduler_impl::~llama_paged_scheduler_impl() {
+    for (auto & h : held_prefixes) {
+        if (h && kv_cache_manager && !h->block_table.empty()) {
+            kv_cache_manager->free_blocks(*h);
+        }
+    }
+    held_prefixes.clear();
+}
 
 bool llama_paged_scheduler_impl::check_deadlock(uint32_t n_candidates, uint32_t n_swapped, uint32_t n_waiting) const {
     if (n_candidates > 0) {
@@ -226,6 +237,9 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                 std::vector<llama_sequence_group *> candidates;
                 for (auto & g : running) { if (g) { candidates.push_back(g.get()); } }
                 for (auto & g : waiting) { if (g) { candidates.push_back(g.get()); } }
+                // Finished masters stay shareable: a child that arrives after
+                // finish() must still hit. held_prefixes is the APC park.
+                for (auto & g : held_prefixes) { if (g) { candidates.push_back(g.get()); } }
                 for (auto * src_raw : candidates) {
                     auto & src_ptr = src_raw;
                     llama_sequence_group * src = src_ptr;
@@ -301,8 +315,9 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                     group.n_prompt    = full_prompt;
                     group.n_past      = shared;
                     LLAMA_LOG_INFO("%s: request %d admitted SHARED: %u of %u prompt tokens inherited "
-                                   "from live request %d (%zu blocks), %u left to prefill\n",
+                                   "from %s %d (%zu blocks), %u left to prefill\n",
                                    __func__, group.request_id, shared, group.n_prompt,
+                                   best_src->request_id < 0 ? "held prefix" : "live request",
                                    best_src->request_id, group.block_table.size(),
                                    group.n_prompt - shared);
                 }
@@ -438,6 +453,11 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
     } else {
         LLAMA_LOG_DEBUG("%s: Request: %d generated %d tokens.\n", __func__, group.request_id, group.n_decoded);
     }
+    // Keep the full-block prefix in held_prefixes (extra ref via
+    // fork_blocks) so a child that arrives after this request is gone
+    // still SHARED-admits. Then free_blocks drops THIS request's refs;
+    // the park keeps the prefix until eviction or teardown.
+    park_finished_prefix(group);
     kv_cache_manager->free_blocks(group);
     group.status = llama_sequence_group_status::FINISHED;
     // erase only OUR mapping: a new request may already have reused this id (the server
@@ -447,6 +467,98 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
     if (it != id_to_group.end() && it->second == &group) {
         id_to_group.erase(it);
     }
+}
+
+void llama_paged_scheduler_impl::park_finished_prefix(llama_sequence_group & group) {
+    if (!kv_cache_manager) {
+        return;
+    }
+    // group.block_table is a staging field -- a live prefilled sequence may
+    // show empty there while sequence_blocks still holds the real ids.
+    if (group.block_table.empty()) {
+        if (const auto * bl = kv_cache_manager->get_sequence_blocks(group.request_id)) {
+            group.block_table = *bl;
+        }
+    }
+    const uint32_t n_full = block_size ? (group.n_past / block_size) * block_size : 0;
+    if (n_full == 0 || group.block_table.empty() || group.logical_seq.size() < n_full) {
+        return;
+    }
+
+    // Already parked (a child finishing the same prefix, or a longer hold
+    // that already covers these tokens). Do not take a second ref.
+    for (const auto & h : held_prefixes) {
+        if (!h || h->logical_seq.size() < n_full) {
+            continue;
+        }
+        bool match = true;
+        for (uint32_t i = 0; i < n_full; ++i) {
+            if (h->logical_seq[i] != group.logical_seq[i]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return;
+        }
+    }
+
+    llama_sequence_group hold;
+    hold.request_id = next_hold_id--;
+    hold.status     = llama_sequence_group_status::FINISHED;
+    const uint32_t inherited = kv_cache_manager->fork_blocks(group, hold, n_full);
+    if (inherited == 0 || hold.block_table.empty()) {
+        return;
+    }
+    // fork_blocks trims logical_seq to the inherited span -- that is what
+    // we want. Do not put the hold in id_to_group: negative ids are not slots.
+    held_prefixes.push_back(std::make_unique<llama_sequence_group>(std::move(hold)));
+    LLAMA_LOG_INFO("%s: parked %u-token prefix from finished request %d "
+                   "(%zu blocks) for later share\n",
+                   __func__, inherited, group.request_id,
+                   held_prefixes.back()->block_table.size());
+}
+
+bool llama_paged_scheduler_impl::evict_held_prefix() {
+    if (!kv_cache_manager) {
+        return false;
+    }
+    // Unique suffix first: drop trailing ref_cnt==1 blocks. A hold whose
+    // prefix is still shared (ref_cnt>1) keeps those blocks -- children
+    // still need them. A hold with no children has ref_cnt==1 on every
+    // block, so this frees the whole unused prefix and returns capacity.
+    for (auto it = held_prefixes.begin(); it != held_prefixes.end(); ++it) {
+        llama_sequence_group * h = it->get();
+        if (!h) {
+            continue;
+        }
+        if (h->block_table.empty()) {
+            if (const auto * bl = kv_cache_manager->get_sequence_blocks(h->request_id)) {
+                h->block_table = *bl;
+            }
+        }
+        if (h->block_table.empty()) {
+            it = held_prefixes.erase(it);
+            return true;
+        }
+        const uint32_t dropped = kv_cache_manager->release_unref_suffix(*h);
+        if (dropped == 0) {
+            continue;
+        }
+        h->n_past = (uint32_t) h->block_table.size() * block_size;
+        if (h->logical_seq.size() > h->n_past) {
+            h->logical_seq.resize(h->n_past);
+        }
+        h->n_prompt = h->n_past;
+        LLAMA_LOG_DEBUG("%s: evicted %u unique-suffix block(s) from held prefix %d "
+                        "(%zu blocks remain)\n",
+                        __func__, dropped, h->request_id, h->block_table.size());
+        if (h->block_table.empty()) {
+            held_prefixes.erase(it);
+        }
+        return true;
+    }
+    return false;
 }
 
 bool llama_paged_scheduler_impl::abort_request(int32_t request_id) {
@@ -662,7 +774,8 @@ bool llama_paged_scheduler_impl::evict() {
     GGML_ASSERT(kv_cache_manager && "kv_cache_manager is nullptr.");
     LLAMA_LOG_DEBUG("%s: Eviction requested...\n", __func__);
     if (running.empty()) {
-        return false;
+        // Pool may be full of parked prefixes with no live runner.
+        return evict_held_prefix();
     }
 
     llama_sequence_group * master = find_master_prefix_group();
@@ -689,7 +802,9 @@ bool llama_paged_scheduler_impl::evict() {
     }
     if (best == running.end()) {
         LLAMA_LOG_DEBUG("%s: no unref-tail victim (master prefix stays).\n", __func__);
-        return false;
+        // Unique suffix of a parked prefix next -- never a ref_cnt>1
+        // master prefix children still need.
+        return evict_held_prefix();
     }
 
     llama_sequence_group_ptr victim = std::move(*best);
