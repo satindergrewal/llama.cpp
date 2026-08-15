@@ -8,6 +8,17 @@
 #include <unordered_map>
 #include <vector>
 
+// n_seq_max is BATCH WIDTH (champion = 1). Bookkeeping ids (slot.id after
+// grow_paged_slot) live in [0, LLAMA_MAX_SEQ). Same contract as
+// llama-context.cpp Cut 1: the allocr / id space is LLAMA_MAX_SEQ, not n_seq_max.
+static inline uint32_t llama_dsv4_seq_id_max() {
+    return LLAMA_MAX_SEQ;
+}
+
+static inline bool llama_dsv4_seq_id_ok(llama_seq_id seq_id) {
+    return seq_id >= 0 && (uint32_t) seq_id < LLAMA_MAX_SEQ;
+}
+
 class llama_dsv4_comp_state {
 public:
     using stream_copy_info = llama_kv_cache::stream_copy_info;
@@ -165,7 +176,7 @@ private:
     llama_hparams hparams_hca;
     llama_hparams hparams_lid;
 
-    const uint32_t n_seq_max;
+    const uint32_t n_seq_max; // batch width; id space is LLAMA_MAX_SEQ
     const uint32_t n_rs_seq;
 
     std::vector<uint32_t> rs_idx;

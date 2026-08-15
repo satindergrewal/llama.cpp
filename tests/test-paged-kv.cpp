@@ -1,5 +1,6 @@
 #include "ggml-backend.h"
 #include "llama-block-manager.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-paged.h"
 #include "llama-paged-scheduler-impl.h"
 
@@ -798,6 +799,51 @@ TEST(test_unknown_session_does_not_admit_cold) {
     EXPECT_FALSE(fixture.sched->has_session("no-such-session"));
 }
 
+TEST(test_dsv4_bookkeeping_id_space) {
+    // DSV4 cache cannot be constructed without weights. The helper is the
+    // contract: n_seq_max is batch width; after grow_paged_slot, ids 0 and 1
+    // must be legal. Id space is LLAMA_MAX_SEQ (256), not n_seq_max.
+    EXPECT_TRUE(llama_dsv4_seq_id_ok(0));
+    EXPECT_TRUE(llama_dsv4_seq_id_ok(1));
+    EXPECT_TRUE(llama_dsv4_seq_id_ok((llama_seq_id) (LLAMA_MAX_SEQ - 1)));
+    EXPECT_FALSE(llama_dsv4_seq_id_ok(-1));
+    EXPECT_FALSE(llama_dsv4_seq_id_ok((llama_seq_id) LLAMA_MAX_SEQ));
+    EXPECT_EQ(llama_dsv4_seq_id_max(), (uint32_t) LLAMA_MAX_SEQ);
+}
+
+TEST(test_two_named_children_batch_width_one) {
+    // Product: two concurrent children of one named session. Decode stays
+    // single-width (n_seq_max_batch=1). Both inherit the prefix by reference.
+    // Bookkeeping ids 1 and 2 must be accepted -- the DSV4 wrapper used to
+    // GGML_ASSERT seq_id < n_seq_max (1) on the second child.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8,
+                                /*n_seq_max_batch=*/1);
+    fixture.sched->set_hybrid(true);
+    fixture.sched->set_has_recurrent_state(true);
+    fixture.sched->set_supports_rs_rollback(true);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/1, /*n_prompt=*/40),
+                                                         "master"));
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/2, /*n_prompt=*/40),
+                                                         "master"));
+    const llama_sequence_group * c1 = fixture.sched->get_group_from_id(1);
+    const llama_sequence_group * c2 = fixture.sched->get_group_from_id(2);
+    EXPECT_TRUE(c1 != nullptr && c1->n_past == 32u && !c1->block_table.empty());
+    EXPECT_TRUE(c2 != nullptr && c2->n_past == 32u && !c2->block_table.empty());
+    EXPECT_TRUE(fixture.sched->last_fork_used_blocks());
+
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+    EXPECT_TRUE(info != nullptr);
+    EXPECT_EQ(info->n_seq, 1);
+}
+
 TEST(test_batch_width_cap_does_not_reject) {
     // Cut 1: n_seq_max_batch is BATCH WIDTH, not an admission ceiling.
     // Three requests that all fit the pool must all queue. Each step emits
@@ -873,6 +919,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_session_fork_hybrid_norewind_refuses);
     RUN(test_session_fork_hybrid_no_rs_inherits);
     RUN(test_unknown_session_does_not_admit_cold);
+    RUN(test_dsv4_bookkeeping_id_space);
+    RUN(test_two_named_children_batch_width_one);
     RUN(test_batch_width_cap_does_not_reject);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");

@@ -625,7 +625,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     if (n_rs_seq > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             const llama_seq_id seq_id = ubatch.seq_id_unq[s];
-            if (seq_id < 0 || (uint32_t) seq_id >= n_stream) {
+            if (!llama_dsv4_seq_id_ok(seq_id) || (n_stream > 1 && (uint32_t) seq_id >= n_stream)) {
                 continue;
             }
 
@@ -954,7 +954,12 @@ void llama_dsv4_comp_state::clear(llama_seq_id seq_id, bool data) {
     }
 
     if (seq_id >= 0) {
-        GGML_ASSERT((uint32_t) seq_id < n_stream);
+        GGML_ASSERT(llama_dsv4_seq_id_ok(seq_id));
+        // Logical ids past n_stream (batch width) have no private plane.
+        // Clearing them must not wipe the shared stream 0.
+        if ((uint32_t) seq_id >= n_stream) {
+            return;
+        }
 
         for (const auto & layer : layers) {
             for (uint32_t d = 0; d <= n_rs_seq; ++d) {
@@ -972,17 +977,24 @@ void llama_dsv4_comp_state::clear(llama_seq_id seq_id, bool data) {
 }
 
 void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
-    GGML_ASSERT(seq_id_src >= 0 && (uint32_t) seq_id_src < n_stream);
-    GGML_ASSERT(seq_id_dst >= 0 && (uint32_t) seq_id_dst < n_stream);
+    GGML_ASSERT(llama_dsv4_seq_id_ok(seq_id_src));
+    GGML_ASSERT(llama_dsv4_seq_id_ok(seq_id_dst));
 
     if (seq_id_src == seq_id_dst) {
         return;
     }
 
+    // n_stream is batch width. Extra bookkeeping ids share stream 0.
+    const uint32_t ssrc = n_stream > 1 ? (uint32_t) seq_id_src : 0;
+    const uint32_t sdst = n_stream > 1 ? (uint32_t) seq_id_dst : 0;
+    if (ssrc == sdst || ssrc >= n_stream || sdst >= n_stream) {
+        return;
+    }
+
     clear(seq_id_dst, true);
 
-    sc_info.ssrc.push_back((uint32_t) seq_id_src);
-    sc_info.sdst.push_back((uint32_t) seq_id_dst);
+    sc_info.ssrc.push_back(ssrc);
+    sc_info.sdst.push_back(sdst);
 }
 
 void llama_dsv4_comp_state::apply_copies(const stream_copy_info & sc_info) const {
@@ -1177,7 +1189,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid(model.hparams),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
-    rs_idx(n_seq_max, 0) {
+    rs_idx(LLAMA_MAX_SEQ, 0) {
+    GGML_ASSERT(n_seq_max >= 1 && n_seq_max <= LLAMA_MAX_SEQ);
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {
@@ -1429,7 +1442,7 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     }
 
     if (p0 > 0) {
-        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+        if (!llama_dsv4_seq_id_ok(seq_id)) {
             return false;
         }
 
@@ -1489,11 +1502,11 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
 }
 
 void llama_kv_cache_dsv4::seq_keep(llama_seq_id seq_id) {
-    GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < n_seq_max);
+    GGML_ASSERT(llama_dsv4_seq_id_ok(seq_id));
 
     kv_raw->seq_keep(seq_id);
 
-    for (llama_seq_id id = 0; id < (llama_seq_id) n_seq_max; ++id) {
+    for (llama_seq_id id = 0; id < (llama_seq_id) LLAMA_MAX_SEQ; ++id) {
         if (id == seq_id) {
             continue;
         }
@@ -1512,7 +1525,7 @@ void llama_kv_cache_dsv4::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
 }
 
 llama_pos llama_kv_cache_dsv4::seq_pos_min(llama_seq_id seq_id) const {
-    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+    if (!llama_dsv4_seq_id_ok(seq_id)) {
         return -1;
     }
 
@@ -1523,7 +1536,7 @@ llama_pos llama_kv_cache_dsv4::seq_pos_min(llama_seq_id seq_id) const {
 }
 
 llama_pos llama_kv_cache_dsv4::seq_pos_max(llama_seq_id seq_id) const {
-    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+    if (!llama_dsv4_seq_id_ok(seq_id)) {
         return -1;
     }
 
@@ -1629,7 +1642,7 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     lid_state->state_read(io, seq_id, flags);
 
     if (seq_id >= 0) {
-        GGML_ASSERT((uint32_t) seq_id < n_seq_max);
+        GGML_ASSERT(llama_dsv4_seq_id_ok(seq_id));
         rs_idx[seq_id] = 0;
     } else {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
@@ -1689,7 +1702,7 @@ void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubat
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
                 const llama_seq_id seq_id = ubatch.seq_id[i][s];
-                if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max) {
+                if (llama_dsv4_seq_id_ok(seq_id)) {
                     rs_idx[seq_id] = 0;
                 }
             }
@@ -1703,12 +1716,15 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
         kv_hca->clear(data);
         kv_lid->clear(data);
     } else {
-        GGML_ASSERT((uint32_t) seq_id < n_seq_max);
+        GGML_ASSERT(llama_dsv4_seq_id_ok(seq_id));
 
         const auto clear_seq = [seq_id, data](llama_kv_cache * kv) {
             kv->seq_rm(seq_id, -1, -1);
 
-            if (data) {
+            // Streams are n_seq_max (batch width) wide. A bookkeeping id past
+            // that shares stream 0; do not wipe the shared stream or index
+            // past ne[2] (the 2026-08-15 parallel /fork crash).
+            if (data && (uint32_t) seq_id < kv->get_n_stream()) {
                 for (uint32_t il : kv->get_layer_ids()) {
                     dsv4_clear_tensor_stream(kv->get_k_storage(il), (uint32_t) seq_id);
                 }
