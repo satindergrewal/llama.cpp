@@ -117,9 +117,11 @@ class llama_paged_scheduler_impl {
     void finish(llama_sequence_group & group);
     // Keep the finished request's full-block prefix so later independent
     // arrivals can still SHARED-admit (vLLM APC). Not a radix tree.
+    // A named session with n_past > 0 but n_full == 0 still parks a
+    // name-only hold (0 blocks) so children can resolve the name.
     void park_finished_prefix(llama_sequence_group & group);
-    // After park: point the session name at the hold, or drop it if
-    // nothing was parked (too short for a full block).
+    // After park: point the session name at the hold. Keep the name
+    // even if the hold has 0 full blocks. Drop only if nothing to name.
     void rebind_session_after_finish(const llama_sequence_group & group);
     llama_sequence_group * find_parent_group(int32_t parent_request_id) const;
     // Evict unique suffix of a parked prefix first. NEVER a block with
@@ -148,10 +150,10 @@ class llama_paged_scheduler_impl {
     llama_sequence_group_list swapped;
     llama_sequence_group_list waiting;
 
-    // Finished requests' full-block prefixes. Not in running/waiting --
-    // those are live. The share scan walks this too so a master that
-    // finished 2 seconds ago is still a hit. Negative request_ids so a
-    // reused slot id cannot collide with a hold.
+    // Finished requests' prefixes. Full-block holds carry extra refs
+    // for APC. Name-only holds (0 blocks) keep a session resolvable
+    // when n_past < block_size. Negative request_ids so a reused slot
+    // id cannot collide with a hold.
     llama_sequence_group_list held_prefixes;
     int32_t                   next_hold_id = -2;
 

@@ -669,6 +669,34 @@ TEST(test_session_omitted_is_noop) {
     EXPECT_TRUE(fixture.sched->get_group_from_id(0) != nullptr);
 }
 
+TEST(test_session_survives_short_prefix) {
+    // Named session must stay resolvable after finish even when n_past
+    // is below one block. Losing the NAME is the hole; children may
+    // inherit 0 full blocks and prefill the short prefix.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/13)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    const llama_sequence_group * master = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(master != nullptr);
+    EXPECT_TRUE(master->n_past > 0);
+    EXPECT_TRUE(master->n_past < 16);
+
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) == nullptr);
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/1, /*n_prompt=*/13),
+                                                         "master"));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(1) != nullptr);
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+}
+
 TEST(test_unknown_session_does_not_admit_cold) {
     // Unknown parent_session_id must fail loud. Falling back to queue_request
     // would admit a cold/APC request and lie that the fork happened.
@@ -756,6 +784,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_session_fork_live_and_parked);
     RUN(test_session_close_keeps_child_refs);
     RUN(test_session_omitted_is_noop);
+    RUN(test_session_survives_short_prefix);
     RUN(test_unknown_session_does_not_admit_cold);
     RUN(test_batch_width_cap_does_not_reject);
 

@@ -490,26 +490,60 @@ void llama_paged_scheduler_impl::park_finished_prefix(llama_sequence_group & gro
         }
     }
     const uint32_t n_full = block_size ? (group.n_past / block_size) * block_size : 0;
+    const uint32_t n_keep = std::min(group.n_past, (uint32_t) group.logical_seq.size());
+    const bool     named  = request_sessions.find(group.request_id) != request_sessions.end();
+
+    auto prefix_already_held = [&](uint32_t n_cmp) {
+        if (n_cmp == 0 || group.logical_seq.size() < n_cmp) {
+            return false;
+        }
+        for (const auto & h : held_prefixes) {
+            if (!h || h->logical_seq.size() < n_cmp) {
+                continue;
+            }
+            bool match = true;
+            for (uint32_t i = 0; i < n_cmp; ++i) {
+                if (h->logical_seq[i] != group.logical_seq[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Name-only hold: 0 full blocks, but the session name stays resolvable.
+    // Children inherit nothing and prefill the short prefix. That is OK.
+    // Losing the NAME is not.
+    auto park_name_only = [&]() {
+        if (!named || n_keep == 0 || prefix_already_held(n_keep)) {
+            return;
+        }
+        llama_sequence_group hold;
+        hold.request_id = next_hold_id--;
+        hold.status     = llama_sequence_group_status::FINISHED;
+        hold.logical_seq.assign(group.logical_seq.begin(),
+                                group.logical_seq.begin() + n_keep);
+        hold.n_past   = n_keep;
+        hold.n_prompt = n_keep;
+        held_prefixes.push_back(std::make_unique<llama_sequence_group>(std::move(hold)));
+        LLAMA_LOG_INFO("%s: parked name-only %u-token prefix from finished request %d "
+                       "(0 full blocks) so session stays resolvable\n",
+                       __func__, n_keep, group.request_id);
+    };
+
     if (n_full == 0 || group.block_table.empty() || group.logical_seq.size() < n_full) {
+        park_name_only();
         return;
     }
 
     // Already parked (a child finishing the same prefix, or a longer hold
     // that already covers these tokens). Do not take a second ref.
-    for (const auto & h : held_prefixes) {
-        if (!h || h->logical_seq.size() < n_full) {
-            continue;
-        }
-        bool match = true;
-        for (uint32_t i = 0; i < n_full; ++i) {
-            if (h->logical_seq[i] != group.logical_seq[i]) {
-                match = false;
-                break;
-            }
-        }
-        if (match) {
-            return;
-        }
+    if (prefix_already_held(n_full)) {
+        return;
     }
 
     llama_sequence_group hold;
@@ -517,6 +551,7 @@ void llama_paged_scheduler_impl::park_finished_prefix(llama_sequence_group & gro
     hold.status     = llama_sequence_group_status::FINISHED;
     const uint32_t inherited = kv_cache_manager->fork_blocks(group, hold, n_full);
     if (inherited == 0 || hold.block_table.empty()) {
+        park_name_only();
         return;
     }
     // fork_blocks trims logical_seq to the inherited span -- that is what
@@ -547,8 +582,9 @@ bool llama_paged_scheduler_impl::evict_held_prefix() {
             }
         }
         if (h->block_table.empty()) {
-            it = held_prefixes.erase(it);
-            return true;
+            // Name-only hold: no blocks to reclaim. close_session drops it.
+            // Evicting it frees nothing and would make the session unresolvable.
+            continue;
         }
         const uint32_t dropped = kv_cache_manager->release_unref_suffix(*h);
         if (dropped == 0) {
@@ -1654,14 +1690,16 @@ void llama_paged_scheduler_impl::rebind_session_after_finish(const llama_sequenc
     request_sessions.erase(rit);
 
     const uint32_t n_full = block_size ? (group.n_past / block_size) * block_size : 0;
+    const uint32_t n_keep = std::min(group.n_past, (uint32_t) group.logical_seq.size());
+    const uint32_t n_cmp  = n_full > 0 ? n_full : n_keep;
     int32_t        hold_id = 0;
-    if (n_full > 0 && group.logical_seq.size() >= n_full) {
+    if (n_cmp > 0 && group.logical_seq.size() >= n_cmp) {
         for (const auto & h : held_prefixes) {
-            if (!h || h->logical_seq.size() < n_full) {
+            if (!h || h->logical_seq.size() < n_cmp) {
                 continue;
             }
             bool match = true;
-            for (uint32_t i = 0; i < n_full; ++i) {
+            for (uint32_t i = 0; i < n_cmp; ++i) {
                 if (h->logical_seq[i] != group.logical_seq[i]) {
                     match = false;
                     break;
@@ -1680,7 +1718,7 @@ void llama_paged_scheduler_impl::rebind_session_after_finish(const llama_sequenc
                        __func__, sid.c_str(), hold_id);
     } else {
         sessions.erase(sid);
-        LLAMA_LOG_INFO("%s: session '%s' dropped -- no full-block prefix to keep\n",
+        LLAMA_LOG_INFO("%s: session '%s' dropped -- no prefix to keep\n",
                        __func__, sid.c_str());
     }
 }
