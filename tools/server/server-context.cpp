@@ -2235,6 +2235,23 @@ private:
             }
             slot.stats.n_gen = 0;
             slot.stats.n_prompt_processed = 0;
+            // Named /fork (parent_session_id or parent_id): the scheduler already
+            // set group.n_past to the whole-block inherited span. Snapshot it
+            // NOW into timings.cache_n. After decode, n_past includes generated
+            // tokens. The static path sets n_prompt_cached from APC n_past;
+            // this path never did, so a real fork still reported cache_n=0.
+            // Do not also do this for add_request (APC / prompt-cache warm):
+            // that is a different admission class.
+            if (!slot.task->params.parent_session_id.empty() ||
+                slot.task->params.parent_id >= 0) {
+                llama_paged_seq_state st{};
+                if (llama_paged_scheduler_get_seq_state(paged_sched, slot.id, &st) &&
+                    st.n_past > 0) {
+                    slot.stats.n_prompt_cached = (uint64_t) st.n_past;
+                    SLT_INF(slot, "paged: fork inherited %d tokens by reference (cache_n)\n",
+                            (int) st.n_past);
+                }
+            }
             SLT_INF(slot, "paged: request registered (%zu tokens)\n", toks.size());
         }
 

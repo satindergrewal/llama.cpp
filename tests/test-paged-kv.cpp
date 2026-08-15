@@ -824,6 +824,32 @@ TEST(test_unknown_session_does_not_admit_cold) {
     EXPECT_FALSE(fixture.sched->has_session("no-such-session"));
 }
 
+TEST(test_named_fork_n_past_is_http_cache_n) {
+    // HTTP timings.cache_n is slot.stats.n_prompt_cached. The server copies
+    // llama_paged_scheduler_get_seq_state().n_past immediately after a named
+    // /fork. That number is whole physical blocks inherited by reference --
+    // not the token LCP, not APC, not prompt-cache warm. A child that
+    // inherited 32 tokens must expose n_past=32 here or cache_n stays 0
+    // and the fork looks fake.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/1, /*n_prompt=*/40),
+                                                         "master"));
+    EXPECT_TRUE(fixture.sched->last_fork_used_blocks());
+    const llama_sequence_group * child = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(child != nullptr);
+    EXPECT_EQ(child->n_past, 32u);
+    EXPECT_TRUE(child->n_past > 0);
+    EXPECT_TRUE((child->n_past % 16u) == 0);
+    EXPECT_TRUE(!child->block_table.empty());
+}
+
 TEST(test_dsv4_bookkeeping_id_space) {
     // DSV4 cache cannot be constructed without weights. The helper is the
     // contract: n_seq_max is batch width; after grow_paged_slot, ids 0 and 1
@@ -1021,6 +1047,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_session_fork_hybrid_norewind_refuses);
     RUN(test_session_fork_hybrid_no_rs_inherits);
     RUN(test_unknown_session_does_not_admit_cold);
+    RUN(test_named_fork_n_past_is_http_cache_n);
     RUN(test_dsv4_bookkeeping_id_space);
     RUN(test_two_named_children_batch_width_one);
     RUN(test_batch_width_cap_does_not_reject);
