@@ -1578,7 +1578,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
     const int64_t n_vocab = model.vocab.n_tokens();
 
     // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+    // kv_paged: seq_id is the server bookkeeping id (slot.id), which can exceed
+    // cparams.n_seq_max. n_seq_max is BATCH WIDTH (champion contract), not the
+    // id space. Same as kv_unified: the allocr bitset is LLAMA_MAX_SEQ wide.
+    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd,
+                      (cparams.kv_unified || cparams.kv_paged) ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -1825,7 +1829,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool output_all   = cparams.embeddings;
     const bool has_samplers = !sampling.samplers.empty();
 
-    const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+    const uint32_t n_seq_max = (cparams.kv_unified || cparams.kv_paged) ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
     // embedding contexts output every token even when batch.logits is not set
     if (has_samplers && (output_all || batch_inp.logits)) {
@@ -3628,7 +3632,8 @@ void llama_context::opt_epoch_iter(
             batch.logits  [pos_batch]    = true;
         }
 
-        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(),
+                          (cparams.kv_unified || cparams.kv_paged) ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
             LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
             return;
         }

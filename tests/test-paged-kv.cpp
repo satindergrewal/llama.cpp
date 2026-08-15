@@ -312,11 +312,12 @@ struct paged_test_fixture {
     paged_test_fixture & operator=(const paged_test_fixture &) = delete;
 };
 
-static paged_test_fixture make_fixture(uint32_t n_ctx        = 128,
-                                       uint32_t block_size   = 16,
-                                       uint32_t n_batch      = 64,
-                                       uint32_t n_gpu_blocks = 4,
-                                       uint32_t n_cpu_blocks = 2) {
+static paged_test_fixture make_fixture(uint32_t n_ctx           = 128,
+                                       uint32_t block_size      = 16,
+                                       uint32_t n_batch         = 64,
+                                       uint32_t n_gpu_blocks    = 4,
+                                       uint32_t n_cpu_blocks    = 2,
+                                       uint32_t n_seq_max_batch = 0) {
     paged_test_fixture fixture;
     fixture.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     EXPECT_TRUE(fixture.backend != nullptr);
@@ -331,7 +332,7 @@ static paged_test_fixture make_fixture(uint32_t n_ctx        = 128,
     fixture.kv->init(fixture.backend, fixture.backend, GGML_TYPE_F16, n_gpu_blocks, n_cpu_blocks, /*watermark=*/0.0f);
 
     fixture.sched = std::unique_ptr<llama_paged_scheduler_impl>(
-        new llama_paged_scheduler_impl(n_ctx, block_size, n_batch, fixture.kv.get()));
+        new llama_paged_scheduler_impl(n_ctx, block_size, n_batch, fixture.kv.get(), n_seq_max_batch));
     return fixture;
 }
 
@@ -446,6 +447,45 @@ TEST(test_fork_does_not_reshare) {
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
 }
 
+TEST(test_batch_width_cap_does_not_reject) {
+    // Cut 1: n_seq_max_batch is BATCH WIDTH, not an admission ceiling.
+    // Three requests that all fit the pool must all queue. Each step emits
+    // at most one sequence. After the first finishes, the next is in the
+    // batch. A gate that still needs -np N as the concurrency ceiling
+    // does not close this.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8,
+                                /*n_seq_max_batch=*/1);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/16)));
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/1, /*n_prompt=*/16)));
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/2, /*n_prompt=*/16)));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) != nullptr);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(1) != nullptr);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(2) != nullptr);
+
+    llama_batch batch = {};
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+    EXPECT_TRUE(info != nullptr);
+    EXPECT_EQ(info->n_seq, 1);
+
+    // Do not use stop_flags here: a mid-prefill chunk ignores them and
+    // the first step of a 16-token prompt is a prefill. abort() is the
+    // admission-width probe -- group 0 leaves, 1 and 2 stay queued.
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) == nullptr);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(1) != nullptr);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(2) != nullptr);
+
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    info = fixture.sched->get_curr_batch_info();
+    EXPECT_TRUE(info != nullptr);
+    EXPECT_EQ(info->n_seq, 1);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(1) != nullptr ||
+                fixture.sched->get_group_from_id(2) != nullptr);
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     fprintf(stderr, "test-paged-kv: block_manager\n");
     RUN(test_block_manager_leak_simple);
@@ -471,6 +511,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_rejects_oversized_prompt);
     RUN(test_prefix_share_keeps_full_prompt);
     RUN(test_fork_does_not_reshare);
+    RUN(test_batch_width_cap_does_not_reject);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");
     return 0;

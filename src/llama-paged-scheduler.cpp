@@ -20,8 +20,9 @@ struct llama_paged_scheduler {
     // for a fact they can now simply ask for.
     bool last_deadlock = false;
 
-    llama_paged_scheduler(uint32_t n_ctx, uint32_t block_sz, uint32_t n_batch, llama_kv_cache_paged * kv_manager) :
-        impl(n_ctx, block_sz, n_batch, kv_manager) {}
+    llama_paged_scheduler(uint32_t n_ctx, uint32_t block_sz, uint32_t n_batch,
+                          llama_kv_cache_paged * kv_manager, uint32_t n_seq_max_batch) :
+        impl(n_ctx, block_sz, n_batch, kv_manager, n_seq_max_batch) {}
 };
 
 LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama_context * ctx) {
@@ -114,7 +115,12 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
     }
 
     try {
-        auto * sched = new llama_paged_scheduler(n_ctx, block_sz, n_batch, paged_kv);
+        // n_seq_max is BATCH WIDTH (how many sequences share one decode), not
+        // how many requests the pool may hold. The server grows bookkeeping
+        // independently. Passing 0 would let one step emit request_id as
+        // seq_id past n_seq_max and llama_decode would refuse the batch.
+        auto * sched = new llama_paged_scheduler(n_ctx, block_sz, n_batch, paged_kv,
+                                                 ctx->n_seq_max());
         sched->impl.set_hybrid(is_hybrid);
         return sched;
     } catch (const std::exception & e) {

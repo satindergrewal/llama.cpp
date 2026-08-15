@@ -40,6 +40,12 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Matches LLAMA_MAX_SEQ in llama-cparams.h. The paged allocr bitset and the
+// graph present[] arrays are this wide. Growing past it is a different cut.
+// This is a BOOKKEEPING cap, not a KV-lane cap: the pool still decides
+// whether a request can run.
+static constexpr int DS4P_PAGED_MAX_BOOKKEEPING = 256;
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -978,6 +984,7 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+    int32_t slot_n_ctx_init = 0;
 
     int trace = 0;
     int slots_debug = 0;
@@ -1392,10 +1399,24 @@ private:
         }
 
         // setup slots
-        SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
-                params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false");
+        SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s', kv_paged = '%s'\n",
+                params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false",
+                params_base.kv_paged ? "true" : "false");
+        if (params_base.kv_paged) {
+            SRV_INF("paged: -np=%d is batch width / initial bookkeeping, not the admission "
+                    "ceiling. Slots grow up to %d while the block pool has room. Do not raise "
+                    "-np to fake concurrency (that kills the champion and slices n_ctx).\n",
+                    params_base.n_parallel, DS4P_PAGED_MAX_BOOKKEEPING);
+        }
 
         // initialize slots
+        slot_n_ctx_init = n_ctx_slot;
+        // Paged grow emplace_back()s. Reserve the bookkeeping cap NOW so a
+        // later grow cannot reallocate and invalidate &slots[i] held by
+        // update_slots_paged or a parent pointer in process_single_task.
+        if (params_base.kv_paged) {
+            slots.reserve(DS4P_PAGED_MAX_BOOKKEEPING);
+        }
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
         }
@@ -1443,32 +1464,7 @@ private:
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
-            server_slot & slot = slots[i];
-
-            slot.id      = i;
-            slot.ctx_tgt = ctx_tgt;
-            slot.ctx_dft = ctx_dft;
-            slot.mem.init(ctx_tgt, ctx_dft);
-            slot.spec    = spec.get();
-            slot.n_ctx   = n_ctx_slot;
-
-            slot.mctx                   = mctx;
-            slot.prompt.tokens.has_mtmd = mctx != nullptr;
-
-            SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
-
-            slot.callback_on_release = [this](int id_slot) {
-                queue_tasks.pop_deferred_task(id_slot);
-            };
-
-            slot.callback_on_reset = [this](const server_slot & slot) {
-                // flush the generated token stats before reset()
-                if (slot.stats.n_gen > 0) {
-                    metrics_on_prediction(slot);
-                }
-            };
-
-            slot.reset();
+            setup_slot(slots[i], i);
         }
 
         {
@@ -1698,8 +1694,11 @@ private:
     }
 
     server_slot * get_slot_by_id(int id_slot) {
+        if (slots.empty()) {
+            return nullptr;
+        }
         // note: allow id_slot to be out of bounds (wrap around)
-        id_slot = id_slot % slots.size();
+        id_slot = id_slot % (int) slots.size();
 
         for (server_slot & slot : slots) {
             if (slot.id == id_slot) {
@@ -1722,6 +1721,55 @@ private:
         }
 
         return nullptr;
+    }
+
+    void setup_slot(server_slot & slot, int id) {
+        slot.id      = id;
+        slot.ctx_tgt = ctx_tgt;
+        slot.ctx_dft = ctx_dft;
+        slot.mem.init(ctx_tgt, ctx_dft);
+        slot.spec    = spec.get();
+        slot.n_ctx   = slot_n_ctx_init;
+
+        slot.mctx                   = mctx;
+        slot.prompt.tokens.has_mtmd = mctx != nullptr;
+
+        SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+
+        slot.callback_on_release = [this](int id_slot) {
+            queue_tasks.pop_deferred_task(id_slot);
+        };
+
+        slot.callback_on_reset = [this](const server_slot & slot) {
+            if (slot.stats.n_gen > 0) {
+                metrics_on_prediction(slot);
+            }
+        };
+
+        slot.reset();
+    }
+
+    // Grow one idle bookkeeping slot. ONLY when every existing slot is
+    // processing -- otherwise get_available_slot would have found one.
+    // That is the safety for "do not reallocate the vector while
+    // update_slots_paged holds &slots[i]".
+    //
+    // id == index. Compact remap is a later cut; seq_id stays slot.id, so
+    // the allocr must accept ids past n_seq_max (done: kv_paged uses
+    // LLAMA_MAX_SEQ). n_seq_max stays batch width.
+    server_slot * grow_paged_slot() {
+        if (!params_base.kv_paged) {
+            return nullptr;
+        }
+        if ((int) slots.size() >= DS4P_PAGED_MAX_BOOKKEEPING) {
+            return nullptr;
+        }
+        const int id = (int) slots.size();
+        slots.emplace_back();
+        setup_slot(slots.back(), id);
+        SRV_INF("paged: grew bookkeeping to %zu slots (id=%d); -np=%d is not the ceiling\n",
+                slots.size(), id, params_base.n_parallel);
+        return &slots.back();
     }
 
     server_slot * get_available_slot(const server_task & task) {
@@ -2097,11 +2145,16 @@ private:
             // ⚠ the SLOT overload, not the id one: send_error(id,...) defaults its token counts to
             // 0 and the EXCEED_CONTEXT_SIZE branch asserts both > 0 -- the 3-arg form would turn
             // this refusal into a server ABORT. Caught by reading the overload before compiling.
-            if ((int32_t) toks.size() >= slot.n_ctx) {
+            // Paged: one shared pool. The static path slices n_ctx / n_parallel
+            // into slot.n_ctx. That slice is not the pool. Refuse only when the
+            // prompt cannot fit the context the paged scheduler will accept
+            // (n_seq_max_ctx == llama_n_ctx).
+            const int32_t ctx_limit = params_base.kv_paged ? n_ctx : slot.n_ctx;
+            if ((int32_t) toks.size() >= ctx_limit) {
                 send_error(slot,
                     string_format("request (%d tokens) exceeds the available context size (%d "
                                   "tokens), try increasing it",
-                                  (int32_t) toks.size(), slot.n_ctx),
+                                  (int32_t) toks.size(), ctx_limit),
                     ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                 return false;
             }
@@ -2715,10 +2768,18 @@ private:
                     //
 
                     if (slot == nullptr) {
-                        // if no slot is available, we defer this task for processing later
-                        SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
-                        queue_tasks.defer(std::move(task));
-                        break;
+                        // Paged: grow bookkeeping instead of deferring on a full
+                        // -np array. The pool still decides whether the request
+                        // can run (queue_request / allocate). A pinned id_slot
+                        // that is busy still defers -- that is a named lane.
+                        if (params_base.kv_paged && task.id_slot == -1) {
+                            slot = grow_paged_slot();
+                        }
+                        if (slot == nullptr) {
+                            SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
                     }
 
                     if (slot->is_processing()) {
@@ -2732,6 +2793,15 @@ private:
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
                         std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
+                        if (params_base.kv_paged) {
+                            while (child_slots.size() < n_child_tasks) {
+                                server_slot * grown = grow_paged_slot();
+                                if (grown == nullptr) {
+                                    break;
+                                }
+                                child_slots.push_back(grown);
+                            }
+                        }
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));

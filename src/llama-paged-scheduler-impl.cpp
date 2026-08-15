@@ -5,10 +5,12 @@
 llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_ctx,
                                                        uint32_t               block_sz,
                                                        int32_t                n_batch,
-                                                       llama_kv_cache_paged * kv_manager) :
+                                                       llama_kv_cache_paged * kv_manager,
+                                                       uint32_t               n_seq_max_batch) :
     n_seq_max_ctx(n_ctx),
     block_size(block_sz),
     n_batch(n_batch),
+    n_seq_max_batch(n_seq_max_batch),
     kv_cache_manager(kv_manager) {}
 
 bool llama_paged_scheduler_impl::check_deadlock(uint32_t n_candidates, uint32_t n_swapped, uint32_t n_waiting) const {
@@ -56,8 +58,25 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
     process_running_list(candidates);
     process_swapped_list(candidates);
 
-    const int32_t remaining = n_batch - get_curr_decode_tokens();
-    process_waiting_list(candidates, remaining);
+    // Cap the live decode set at n_seq_max_batch. Running groups past the
+    // cap stay in `running` with their blocks and take the next step. That
+    // is the champion contract at -np 1: one sequence per decode, many
+    // sequences in the pool. Do NOT promote waiters once the cap is full --
+    // allocate() would take blocks they cannot use this step and can starve
+    // the group that is actually in the batch.
+    if (n_seq_max_batch > 0 && candidates.size() > (size_t) n_seq_max_batch) {
+        candidates.resize((size_t) n_seq_max_batch);
+    }
+
+    const bool room_for_waiters =
+        n_seq_max_batch == 0 || candidates.size() < (size_t) n_seq_max_batch;
+    if (room_for_waiters) {
+        const int32_t remaining = n_batch - (int32_t) candidates.size();
+        process_waiting_list(candidates, remaining);
+        if (n_seq_max_batch > 0 && candidates.size() > (size_t) n_seq_max_batch) {
+            candidates.resize((size_t) n_seq_max_batch);
+        }
+    }
 
     const uint32_t n_running    = running.size();
     const uint32_t n_swapped    = swapped.size();
@@ -670,6 +689,9 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
         // gate 2026-08-04.) Budget floor of 1 keeps candidate count <= n_batch so the
         // chunker can always give every candidate at least one token.
         if (remaining_token_budget < 1) {
+            break;
+        }
+        if (n_seq_max_batch > 0 && candidates.size() >= (size_t) n_seq_max_batch) {
             break;
         }
 

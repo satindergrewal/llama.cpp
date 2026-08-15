@@ -12,7 +12,14 @@ enum class llama_scheduler_status {
 
 class llama_paged_scheduler_impl {
   public:
-    llama_paged_scheduler_impl(uint32_t n_ctx, uint32_t block_sz, int32_t n_batch, llama_kv_cache_paged * kv_manager);
+    // n_seq_max_batch: how many sequences may share ONE decode batch.
+    // 0 = no extra cap (tests / examples that do not go through llama_decode).
+    // The server passes llama_n_seq_max(ctx). That is BATCH WIDTH, not an
+    // admission ceiling: queue_request still accepts every request the pool
+    // can hold. Raising -np to fake concurrency would also raise this and
+    // kill the champion / slice n_ctx. Do not do that.
+    llama_paged_scheduler_impl(uint32_t n_ctx, uint32_t block_sz, int32_t n_batch,
+                               llama_kv_cache_paged * kv_manager, uint32_t n_seq_max_batch = 0);
 
     llama_scheduler_status step(llama_batch & batch);
 
@@ -116,6 +123,7 @@ class llama_paged_scheduler_impl {
     const uint32_t         n_seq_max_ctx;
     const uint32_t         block_size;
     const int32_t          n_batch;
+    const uint32_t         n_seq_max_batch;
     llama_kv_cache_paged * kv_cache_manager = nullptr;
     llama_paged_batch_info curr_info;
 
