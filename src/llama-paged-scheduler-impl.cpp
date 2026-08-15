@@ -14,16 +14,49 @@ llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_
     kv_cache_manager(kv_manager) {}
 
 bool llama_paged_scheduler_impl::check_deadlock(uint32_t n_candidates, uint32_t n_swapped, uint32_t n_waiting) const {
-    if (n_candidates == 0 && (n_swapped > 0 || n_waiting > 0)) {
-        LLAMA_LOG_ERROR(
-            "%s: Scheduler deadlock detected. "
-            "%d sequence(s) are swapped out and %d are waiting, "
-            "but there are not enough free GPU blocks to make progress. "
-            "Hint: increase n_gpu_blocks (currently %d) or reduce n_sequences.\n",
-            __func__, n_swapped, n_waiting, kv_cache_manager->get_num_gpu_blocks());
-        return true;
+    if (n_candidates > 0) {
+        return false;
     }
-    return false;
+    if (n_swapped == 0 && n_waiting == 0) {
+        return false;
+    }
+    // A live running group still holds blocks (the shared master prefix, or a
+    // child that could not grow this tick). Waiters resume when a child leaves
+    // and frees its unref tail. That is vLLM "waiting", not a deadlock -- the
+    // server used to 500 everyone here.
+    if (!running.empty()) {
+        return false;
+    }
+    // Parked requests that would fit in the pool alone are waiting for a child
+    // to leave, not unsatisfiable. Only report deadlock when every parked
+    // request itself outgrew the entire pool.
+    const uint32_t usable = kv_cache_manager->get_usable_gpu_blocks();
+    auto fits = [&](const llama_sequence_group_ptr & g) {
+        if (!g) {
+            return false;
+        }
+        // Waiting admits from n_prompt; a forked child already holds n_past.
+        const uint32_t tokens = g->n_past > 0 ? g->n_past + 1 : g->n_prompt + 1;
+        const uint32_t blocks = (tokens + block_size - 1) / block_size;
+        return blocks <= usable;
+    };
+    for (const auto & g : waiting) {
+        if (fits(g)) {
+            return false;
+        }
+    }
+    for (const auto & g : swapped) {
+        if (fits(g)) {
+            return false;
+        }
+    }
+    LLAMA_LOG_ERROR(
+        "%s: Scheduler deadlock detected. "
+        "%d sequence(s) are swapped out and %d are waiting, "
+        "and every parked request outgrew the GPU block pool. "
+        "Hint: increase n_gpu_blocks (currently %d) or reduce n_sequences.\n",
+        __func__, n_swapped, n_waiting, kv_cache_manager->get_num_gpu_blocks());
+    return true;
 }
 
 bool llama_paged_scheduler_impl::check_livelock(uint32_t n_swapped, uint32_t prev_n_swapped) {
@@ -374,10 +407,16 @@ void llama_paged_scheduler_impl::set_swapped(llama_sequence_group_ptr group_ptr)
     insert_sorted_by_arrival_time(std::move(group_ptr), swapped);
 }
 
-void llama_paged_scheduler_impl::set_waiting(llama_sequence_group_ptr group_ptr) {
+void llama_paged_scheduler_impl::set_waiting(llama_sequence_group_ptr group_ptr, bool prepend) {
     GGML_ASSERT(group_ptr && group_ptr->status != llama_sequence_group_status::WAITING &&
                 "Request is already waiting.");
     group_ptr->status = llama_sequence_group_status::WAITING;
+    if (prepend) {
+        // vLLM PREEMPTED + prepend: resume this victim before later arrivals
+        // once a child frees blocks.
+        waiting.push_front(std::move(group_ptr));
+        return;
+    }
     insert_sorted_by_arrival_time(std::move(group_ptr), waiting);
 }
 
@@ -478,17 +517,54 @@ void llama_paged_scheduler_impl::swap_out_or_recompute(llama_sequence_group_ptr 
     // the same wall. Retrying forever is the wrong answer to an impossible request -- say so, with
     // the numbers.
     const uint64_t pool_tokens = (uint64_t) kv_cache_manager->get_usable_gpu_blocks() * block_size;
-    if ((uint64_t) group_ptr->n_past + 1 > pool_tokens) {
+    const uint32_t unref       = count_unref_blocks(*group_ptr);
+    const uint32_t table_n     = group_ptr->block_table.empty()
+        ? (blocks_of(*group_ptr) ? (uint32_t) blocks_of(*group_ptr)->size() : 0)
+        : (uint32_t) group_ptr->block_table.size();
+    const uint32_t shared_n    = table_n > unref ? table_n - unref : 0;
+    const uint32_t need_blocks = (group_ptr->n_past + 1 + block_size - 1) / block_size;
+    // Unsatisfiable only when THIS request's own table (shared prefix + its
+    // unique tail) exceeds the entire pool. A child whose unique tail would
+    // fit after a sibling leaves must not be take_terminated -- that was the
+    // 500. Shared prefix blocks do not count against the unique demand.
+    const bool alone_too_big = need_blocks > kv_cache_manager->get_usable_gpu_blocks();
+    // Lone request (no shared prefix) that outgrew the pool: the original
+    // livelock. A child with a shared prefix is NOT this -- its unique tail
+    // would fit after a sibling leaves.
+    if (alone_too_big && (unref == 0 || unref == table_n)) {
+        // No sibling tail to free, and the request itself is larger than the pool.
         LLAMA_LOG_ERROR("%s: request %d needs %llu tokens of KV but the GPU block pool holds at most "
                         "%llu (%u blocks x %u). No eviction or recompute can create capacity that "
                         "does not exist -- terminating the request instead of retrying forever.\n",
                         __func__, rid, (unsigned long long) (group_ptr->n_past + 1),
                         (unsigned long long) pool_tokens,
                         kv_cache_manager->get_usable_gpu_blocks(), block_size);
-        // finish() asserts the status first, then frees blocks and erases our id mapping.
-        terminated_ids.push_back(rid);   // dedicated channel: ONLY capacity kills
+        terminated_ids.push_back(rid);
         group_ptr->status = llama_sequence_group_status::FINISHED;
         finish(*group_ptr);
+        return;
+    }
+    (void) shared_n;
+
+    // A child with a shared prefix: drop only the unref tail, keep the prefix,
+    // prepend to waiting (vLLM PREEMPTED). Swapping the whole table would
+    // rewrite shared GPU ids to CPU ids while the master still holds GPU ids.
+    if (unref > 0 && table_n > unref) {
+        const uint32_t dropped = kv_cache_manager->release_unref_suffix(*group_ptr);
+        group_ptr->n_past   = (uint32_t) group_ptr->block_table.size() * block_size;
+        group_ptr->pending_draft.clear();
+        // Replay tokens after the prefix. If the unique tail was decode-only
+        // growth (n_prompt == inherited prefix), remaining_prompt would be 0
+        // and populate_batch_from asserts -- keep it a decode group.
+        group_ptr->n_decoded = 0;
+        group_ptr->n_prompt  = (uint32_t) group_ptr->logical_seq.size();
+        if (group_ptr->n_prompt <= group_ptr->n_past) {
+            group_ptr->n_decoded = 1;
+        }
+        LLAMA_LOG_DEBUG("%s: (preempt_tail) request_id=%d dropped %u unref blocks, "
+                        "prefix kept, prepended to waiting.\n",
+                        __func__, rid, dropped);
+        set_waiting(std::move(group_ptr), /*prepend=*/true);
         return;
     }
 
@@ -512,21 +588,115 @@ void llama_paged_scheduler_impl::swap_out_or_recompute(llama_sequence_group_ptr 
                                         // survive a replay from n_past=0
 
     LLAMA_LOG_DEBUG("%s: (recomputation) request_id=%d was sent for recomputation.\n", __func__, rid);
-    set_waiting(std::move(group_ptr));
+    set_waiting(std::move(group_ptr), /*prepend=*/true);
 }
 
-void llama_paged_scheduler_impl::evict() {
+const llama_block_ids * llama_paged_scheduler_impl::blocks_of(const llama_sequence_group & group) const {
+    if (!group.block_table.empty()) {
+        return &group.block_table;
+    }
+    return kv_cache_manager ? kv_cache_manager->get_sequence_blocks(group.request_id) : nullptr;
+}
+
+uint32_t llama_paged_scheduler_impl::count_unref_blocks(const llama_sequence_group & group) const {
+    const llama_block_ids * blocks = blocks_of(group);
+    if (!blocks || !kv_cache_manager) {
+        return 0;
+    }
+    uint32_t n = 0;
+    for (uint32_t id : *blocks) {
+        if (kv_cache_manager->get_block_ref_count(id) <= 1) {
+            n++;
+        }
+    }
+    return n;
+}
+
+llama_sequence_group * llama_paged_scheduler_impl::find_master_prefix_group() const {
+    if (!kv_cache_manager) {
+        return nullptr;
+    }
+    uint32_t max_ref = 1;
+    for (const auto & g : running) {
+        const llama_block_ids * blocks = g ? blocks_of(*g) : nullptr;
+        if (!blocks) {
+            continue;
+        }
+        for (uint32_t id : *blocks) {
+            const uint32_t rc = kv_cache_manager->get_block_ref_count(id);
+            if (rc > max_ref) {
+                max_ref = rc;
+            }
+        }
+    }
+    if (max_ref <= 1) {
+        return nullptr;  // no shared prefix in the running set
+    }
+    llama_sequence_group * master = nullptr;
+    for (const auto & g : running) {
+        if (!g) {
+            continue;
+        }
+        const llama_block_ids * blocks = blocks_of(*g);
+        if (!blocks) {
+            continue;
+        }
+        bool holds_max = false;
+        for (uint32_t id : *blocks) {
+            if (kv_cache_manager->get_block_ref_count(id) == max_ref) {
+                holds_max = true;
+                break;
+            }
+        }
+        if (!holds_max) {
+            continue;
+        }
+        if (!master || g->t_arrival_time < master->t_arrival_time) {
+            master = g.get();
+        }
+    }
+    return master;
+}
+
+bool llama_paged_scheduler_impl::evict() {
     GGML_ASSERT(kv_cache_manager && "kv_cache_manager is nullptr.");
     LLAMA_LOG_DEBUG("%s: Eviction requested...\n", __func__);
     if (running.empty()) {
-        return;
+        return false;
     }
 
-    llama_sequence_group_ptr most_recent_request = std::move(running.back());
-    running.pop_back();
-    GGML_ASSERT(most_recent_request && "request selected for eviction is nullptr.");
+    llama_sequence_group * master = find_master_prefix_group();
 
-    swap_out_or_recompute(std::move(most_recent_request));
+    llama_sequence_group_list::iterator best = running.end();
+    uint32_t best_unref = 0;
+    int64_t  best_arrival = -1;
+    for (auto it = running.begin(); it != running.end(); ++it) {
+        llama_sequence_group * g = it->get();
+        if (!g || g == master) {
+            continue;  // NEVER the highest-ref_cnt master prefix
+        }
+        const uint32_t unref = count_unref_blocks(*g);
+        if (unref == 0) {
+            continue;  // no unique tail to free
+        }
+        // Prefer the fattest unref tail; FCFS tie-break evicts the newest.
+        if (best == running.end() || unref > best_unref ||
+            (unref == best_unref && g->t_arrival_time > best_arrival)) {
+            best         = it;
+            best_unref   = unref;
+            best_arrival = g->t_arrival_time;
+        }
+    }
+    if (best == running.end()) {
+        LLAMA_LOG_DEBUG("%s: no unref-tail victim (master prefix stays).\n", __func__);
+        return false;
+    }
+
+    llama_sequence_group_ptr victim = std::move(*best);
+    running.erase(best);
+    GGML_ASSERT(victim && "request selected for eviction is nullptr.");
+    swap_out_or_recompute(std::move(victim));
+    return true;
 }
 
 void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_list & candidates) {
@@ -564,28 +734,38 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
                                   ? (required_capacity - have + block_size - 1) / block_size : 1;
             bool success = kv_cache_manager->allocate(needed, *group);  // decode phase
             if (!success) {
-                if (running.size() > 1) {
-                    const bool curr_is_back = (std::next(it) == running.end());
-                    // Evict pops the back of the list (most recent request)
-                    evict();
-
-                    // Evict might have removed the current group from running
-                    if (curr_is_back) {
-                        // Current group was evicted
-                        it = running.end();
-                        continue;
+                const int32_t cur_id = group->request_id;
+                // Swap/recompute an unref tail (never the shared master prefix).
+                evict();
+                // evict() may have removed US or someone else -- re-find current
+                it = running.end();
+                for (auto jt = running.begin(); jt != running.end(); ++jt) {
+                    if (jt->get() && jt->get()->request_id == cur_id) {
+                        it = jt;
+                        break;
                     }
-
-                    // Try allocating again after eviction
-                    success = kv_cache_manager->allocate(1, *group);
                 }
+                if (it == running.end()) {
+                    continue;  // we were the victim
+                }
+                group = it->get();
+                success = kv_cache_manager->allocate(needed, *group);
 
                 if (!success) {
-                    // If allocate failed, it means we must evict the current request
-                    llama_sequence_group_ptr self = std::move(*it);
-                    it                            = running.erase(it);
-
-                    swap_out_or_recompute(std::move(self));
+                    // Still no room. Self-preempt only if we have an unref tail
+                    // (a child). The master prefix stays running and retries
+                    // next tick; it is not a candidate this step (no block for
+                    // the next token -- batching it would OOB).
+                    if (count_unref_blocks(*group) > 0 && group != find_master_prefix_group()) {
+                        llama_sequence_group_ptr self = std::move(*it);
+                        it                            = running.erase(it);
+                        swap_out_or_recompute(std::move(self));
+                        continue;
+                    }
+                    LLAMA_LOG_DEBUG("%s: request %d stays running without a new block "
+                                    "(waiting for a child to free an unref tail).\n",
+                                    __func__, group->request_id);
+                    ++it;
                     continue;
                 }
             }
@@ -701,9 +881,15 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
         // DELTA only: passing tokens_needed (= n_prompt+1) double-counted the prompt and
         // demanded ~2x the blocks -- admission serialized every fat request (running=1
         // always in the starved walls) and eviction/recompute became unreachable.
-        const bool success = kv_cache_manager->allocate(1, *group);
+        bool success = kv_cache_manager->allocate(1, *group);
         if (!success) {
-            // We respect FCFS, so we stop here to prevent a younger waiting request from jumping ahead.
+            // vLLM PREEMPT: free an unref tail so this waiter can start. If the
+            // only occupant is the shared master prefix, leave the waiter in
+            // `waiting` -- do NOT 500 it. FCFS: do not skip to a younger waiter.
+            evict();
+            success = kv_cache_manager->allocate(1, *group);
+        }
+        if (!success) {
             break;
         }
         candidates.push_back(group);
@@ -773,7 +959,7 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         return;
     }
     // a candidate collected early in the sweep can be EVICTED by a later group's growth
-    // allocation (evict() pops running.back()): its table then holds CPU block ids and
+    // allocation (evict() takes an unref tail, never the master prefix): its table then holds CPU block ids and
     // batching it aborts on the id check ("block_table_id OOB", swap wall 2026-08-04).
     // Only groups still RUNNING may enter the batch.
     llama_sequence_group_raw_list live;

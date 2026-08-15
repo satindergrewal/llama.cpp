@@ -95,13 +95,19 @@ class llama_paged_scheduler_impl {
 
     void set_running(llama_sequence_group_ptr group);
     void set_swapped(llama_sequence_group_ptr group);
-    void set_waiting(llama_sequence_group_ptr group);
+    // prepend=true is vLLM PREEMPTED: the victim resumes before later arrivals
+    // once blocks free. New admits stay FCFS (prepend=false).
+    void set_waiting(llama_sequence_group_ptr group, bool prepend = false);
 
     void finish(llama_sequence_group & group);
 
     int32_t get_curr_decode_tokens() const;
 
-    void evict();
+    const llama_block_ids * blocks_of(const llama_sequence_group & group) const;
+    uint32_t                count_unref_blocks(const llama_sequence_group & group) const;
+    llama_sequence_group *  find_master_prefix_group() const;
+    bool                    evict();  // true if a victim was swapped/recomputed
+
     void process_running_list(llama_sequence_group_raw_list & candidates);
     void process_swapped_list(llama_sequence_group_raw_list & candidates);
     void process_waiting_list(llama_sequence_group_raw_list & candidates, int32_t remaining_token_bugdet);

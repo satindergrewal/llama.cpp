@@ -505,6 +505,36 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
     }
 }
 
+uint32_t llama_kv_cache_paged::release_unref_suffix(llama_sequence_group & group) {
+    if (group.block_table.empty()) {
+        return 0;
+    }
+
+    llama_block_ids drop_gpu;
+    llama_block_ids drop_cpu;
+    while (!group.block_table.empty()) {
+        const uint32_t id = group.block_table.back();
+        if (block_manager.get_ref_count(id) > 1) {
+            break;  // shared prefix -- never drop it
+        }
+        if (block_manager.is_gpu(id)) {
+            drop_gpu.push_back(id);
+        } else {
+            drop_cpu.push_back(id);
+        }
+        group.block_table.pop_back();
+    }
+
+    if (!drop_gpu.empty()) {
+        block_manager.release_gpu_blocks(drop_gpu);
+    }
+    if (!drop_cpu.empty()) {
+        block_manager.release_cpu_blocks(drop_cpu);
+    }
+    note_seq_blocks(group);
+    return (uint32_t) (drop_gpu.size() + drop_cpu.size());
+}
+
 void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
                                          const llama_block_ids & new_ids,
                                          bool                    to_gpu) {

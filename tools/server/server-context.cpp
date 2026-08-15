@@ -3309,6 +3309,9 @@ private:
         // return cannot distinguish "nothing admitted" from "cannot make progress, ever".
         // Ask, then act: fail the processing slots instead of spinning on them forever.
         if (!success && llama_paged_scheduler_last_was_deadlock(paged_sched)) {
+            // Deadlock is now only "every parked request outgrew the entire pool".
+            // A momentarily full pool (children waiting for an unref tail) is
+            // NOT this path -- those stay in waiting and resume when blocks free.
             // Rate-limited: 4M identical ERROR lines is itself a storm, the same shape as the
             // 880K-line decode-fail storm this file already carries a breaker for.
             SRV_ERR("%s", "paged: scheduler reports DEADLOCK -- failing in-flight requests\n");

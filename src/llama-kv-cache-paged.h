@@ -102,6 +102,14 @@ class llama_kv_cache_paged : public llama_memory_i {
     // Total minus the watermark reserve -- what a request can actually be given.
     uint32_t get_usable_gpu_blocks() const { return block_manager.get_usable_gpu_blocks(); }
 
+    uint32_t get_block_ref_count(uint32_t block_id) const {
+        return block_manager.get_ref_count(block_id);
+    }
+
+    // Drop trailing ref_cnt==1 blocks (a child's unique tail). Shared prefix
+    // blocks stay in the table. Returns how many physical blocks were released.
+    uint32_t release_unref_suffix(llama_sequence_group & group);
+
     // DEBUG (fork-residual discriminator): additive checksum of the group's first
     // n_tokens of KV per layer, read back through its block table. Returns layers written.
     int32_t debug_seq_kv_checksum(const llama_sequence_group & group, int32_t n_tokens,

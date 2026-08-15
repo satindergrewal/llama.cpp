@@ -447,6 +447,108 @@ TEST(test_fork_does_not_reshare) {
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
 }
 
+TEST(test_pool_full_children_wait_master_stays) {
+    // vLLM PREEMPTED + prepend: master + children that TOGETHER exceed the
+    // pool must not 500 / take_terminated. Children wait or swap (unref
+    // tails). The highest-ref_cnt master prefix stays. When a child leaves,
+    // a waiter resumes.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/4, /*n_cpu_blocks=*/4,
+                                /*n_seq_max_batch=*/0);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    const llama_sequence_group * master = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(master != nullptr);
+    EXPECT_TRUE(master->n_past >= 32);
+
+    // 40 = 32 inherited (2 shared blocks) + 8 unique. allocate() wants 1
+    // extra block per child. 2 shared + 3 unique = 5 > 4 GPU blocks.
+    // Do NOT use n_prompt==32: inherit would set n_past==n_prompt and
+    // populate_batch_from asserts remaining_prompt==0.
+    for (int id = 1; id <= 3; ++id) {
+        EXPECT_TRUE(fixture.sched->queue_forked_request(make_group(id, /*n_prompt=*/40),
+                                                       /*parent=*/0));
+        EXPECT_TRUE(fixture.sched->get_group_from_id(id) != nullptr);
+    }
+
+    int n_parked_seen = 0;
+    for (int step = 0; step < 8; ++step) {
+        const llama_scheduler_status st = fixture.sched->step(batch);
+        EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+        master = fixture.sched->get_group_from_id(0);
+        EXPECT_TRUE(master != nullptr);
+        EXPECT_TRUE(master->status != llama_sequence_group_status::FINISHED);
+
+        int n_parked = 0;
+        for (int id = 0; id <= 3; ++id) {
+            const llama_sequence_group * g = fixture.sched->get_group_from_id(id);
+            EXPECT_TRUE(g != nullptr);
+            EXPECT_TRUE(g->status != llama_sequence_group_status::FINISHED);
+            if (g->status == llama_sequence_group_status::WAITING ||
+                g->status == llama_sequence_group_status::SWAPPED) {
+                n_parked++;
+            }
+        }
+        if (n_parked > 0) {
+            n_parked_seen = n_parked;
+        }
+
+        if (st == llama_scheduler_status::OK && batch.n_tokens > 0) {
+            const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+            EXPECT_TRUE(info != nullptr);
+            std::vector<llama_token> toks((size_t) info->n_seq, /*dummy=*/1);
+            std::vector<int8_t>      stop((size_t) info->n_seq, 0);
+            fixture.sched->update(batch, toks, stop.data(), nullptr);
+        }
+        EXPECT_TRUE(st != llama_scheduler_status::DEADLOCK);
+    }
+
+    EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+    master = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(master != nullptr);
+    EXPECT_TRUE(master->status == llama_sequence_group_status::RUNNING ||
+                master->status == llama_sequence_group_status::WAITING);
+    EXPECT_TRUE(n_parked_seen >= 1);
+
+    // Free a child's unique tail. A parked sibling must be able to resume --
+    // the pool was only momentarily full.
+    int victim = -1;
+    for (int id = 1; id <= 3; ++id) {
+        const llama_sequence_group * g = fixture.sched->get_group_from_id(id);
+        if (g && g->status == llama_sequence_group_status::RUNNING) {
+            victim = id;
+            break;
+        }
+    }
+    if (victim < 0) {
+        for (int id = 1; id <= 3; ++id) {
+            if (fixture.sched->get_group_from_id(id)) {
+                victim = id;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(victim > 0);
+    EXPECT_TRUE(fixture.sched->abort_request(victim));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(victim) == nullptr);
+
+    EXPECT_TRUE(fixture.sched->step(batch) != llama_scheduler_status::DEADLOCK);
+    EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) != nullptr);
+    bool sibling_live = false;
+    for (int id = 1; id <= 3; ++id) {
+        if (id == victim) {
+            continue;
+        }
+        if (fixture.sched->get_group_from_id(id) != nullptr) {
+            sibling_live = true;
+        }
+    }
+    EXPECT_TRUE(sibling_live);
+}
+
 TEST(test_batch_width_cap_does_not_reject) {
     // Cut 1: n_seq_max_batch is BATCH WIDTH, not an admission ceiling.
     // Three requests that all fit the pool must all queue. Each step emits
@@ -511,6 +613,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_rejects_oversized_prompt);
     RUN(test_prefix_share_keeps_full_prompt);
     RUN(test_fork_does_not_reshare);
+    RUN(test_pool_full_children_wait_master_stays);
     RUN(test_batch_width_cap_does_not_reject);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");
