@@ -515,8 +515,8 @@ void llama_paged_scheduler_impl::requeue_mixed_overflow(llama_sequence_group * g
         }
         llama_sequence_group_ptr ptr = std::move(*it);
         running.erase(it);
-        // Arrival-sorted, not prepend: a younger sibling can run and RELEASE.
-        set_waiting(std::move(ptr), /*prepend=*/false);
+        // vLLM PREEMPTED: resume this waiter before later arrivals once leftover grows.
+        set_waiting(std::move(ptr), /*prepend=*/true);
         return;
     }
 }
