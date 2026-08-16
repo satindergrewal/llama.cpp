@@ -294,6 +294,20 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                                best_src ? best_src->request_id : -1, group.n_prompt);
             }
 
+            // Exact-prefix grow (second /completion on a named session with the
+            // same prompt). Inheriting n_prompt tokens leaves remaining_prompt=0
+            // and n_decoded=0; populate_batch_from then asserts (measured
+            // 2026-08-16 Qwen 8k named session). Same contract as WARM
+            // (toks.size()-1): leave at least one token so the last chunk can
+            // emit logits. Whole-block share then leaves the last block
+            // unshared -- safe to write, and remaining_prompt > 0.
+            if (best_n > 0 && best_src != nullptr &&
+                group.n_prompt > 0 && best_n >= group.n_prompt) {
+                const uint32_t bs_leave = kv_cache_manager->get_block_size();
+                const uint32_t leave    = group.n_prompt - 1;
+                best_n = bs_leave ? (leave / bs_leave) * bs_leave : 0;
+            }
+
             if (best_n > 0 && best_src != nullptr) {
                 // fork_blocks reads src.block_table, which is empty on a live group. Give it a
                 // source view whose table is the cache's authoritative copy.

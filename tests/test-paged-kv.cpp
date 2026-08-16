@@ -657,6 +657,40 @@ TEST(test_session_fork_live_and_parked) {
     EXPECT_TRUE(!parked_child->block_table.empty());
 }
 
+TEST(test_named_session_grow_same_prefix) {
+    // Cheap bookkeeping only -- not the Qwen 8k HTTP proof.
+    // First request parks a named prefix. Second queue_request with the
+    // SAME prompt (named-session grow) must inherit some blocks, keep a
+    // prompt remainder (not a zero-remainder prefill), and step without
+    // asserting. n_past must increase.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0)->n_past >= 32);
+    EXPECT_TRUE(fixture.sched->bind_session("grow", /*request_id=*/0));
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) == nullptr);
+    EXPECT_TRUE(fixture.sched->has_session("grow"));
+    EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/1, /*n_prompt=*/32)));
+    EXPECT_TRUE(fixture.sched->bind_session("grow", /*request_id=*/1));
+    const llama_sequence_group * g = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(g != nullptr);
+    EXPECT_TRUE(g->n_prompt == 32u);
+    EXPECT_TRUE(g->n_past > 0);
+    EXPECT_TRUE(g->n_past < g->n_prompt);
+    EXPECT_TRUE(!g->block_table.empty());
+    const uint32_t past_before = g->n_past;
+
+    prefill_one_chunk(fixture, batch);
+    g = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(g != nullptr);
+    EXPECT_TRUE(g->n_past > past_before);
+}
 
 TEST(test_named_master_not_eviction_victim) {
     // Named/held session prefix must not be shortened to admit a child.
@@ -1378,6 +1412,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_pool_full_children_wait_master_stays);
     RUN(test_finished_prefix_survives_for_children);
     RUN(test_session_fork_live_and_parked);
+    RUN(test_named_session_grow_same_prefix);
     RUN(test_named_master_not_eviction_victim);
     RUN(test_named_master_full_gpu_children_wait_not_cpu_swap);
     RUN(test_mixed_table_child_admits_when_gpu_full);
