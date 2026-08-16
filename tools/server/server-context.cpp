@@ -1765,6 +1765,22 @@ private:
             return nullptr;
         }
         const int id = (int) slots.size();
+        // Hybrid RS (Qwen3.8, DSV4) is sized to n_seq_max == -np (batch
+        // width). Growing a bookkeeping slot past that makes
+        // prompt_clear -> mem.seq_rm(id, -1, -1) abort: recurrent
+        // seq_rm returns false for seq_id >= size. Measured 2026-08-16
+        // Qwen3.8 27B two overlapping /fork from one named 16k master,
+        // -np 1: child1 inherited 16384, child2 grew slot 1, SIGABRT.
+        // Dense paged (PART) can grow -- paged seq_rm accepts any id.
+        // Hybrid children still inherit the same named master; they
+        // just wait for the live slot.
+        if (ctx_tgt && id >= (int) llama_n_seq_max(ctx_tgt) &&
+            ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            SRV_INF("paged: not growing slot id=%d past n_seq_max=%u "
+                    "(seq_rm_type=%d); deferring the waiter\n",
+                    id, llama_n_seq_max(ctx_tgt), (int) ctx_tgt_seq_rm_type);
+            return nullptr;
+        }
         slots.emplace_back();
         setup_slot(slots.back(), id);
         SRV_INF("paged: grew bookkeeping to %zu slots (id=%d); -np=%d is not the ceiling\n",

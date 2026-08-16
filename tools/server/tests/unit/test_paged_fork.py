@@ -99,3 +99,61 @@ def test_named_fork_child_reports_cache_n():
         f"child prompt_n={prompt_n} still equals full n_prompt={n_prompt}; "
         f"inherited span was billed"
     )
+
+
+def test_two_named_fork_children_same_master():
+    """Two /fork children inherit the same named master by reference.
+
+    Serial is the -np 1 contract (hybrid RS cannot grow a second slot).
+    Overlapping HTTP must queue, not abort the master. Both children
+    report cache_n on a whole-block inherited span; unknown session 400s.
+    """
+    global server
+    server.start()
+
+    parent = server.make_request("POST", "/completion", data={
+        "prompt": PREFIX,
+        "n_predict": 4,
+        "session_id": "master",
+        "temperature": 0.0,
+    })
+    assert parent.status_code == 200, parent.body
+    parent_n = parent.body["tokens_evaluated"]
+
+    child1 = server.make_request("POST", "/fork", data={
+        "prompt": PREFIX + " and then she met a friend",
+        "n_predict": 4,
+        "parent_session_id": "master",
+        "temperature": 0.0,
+    })
+    assert child1.status_code == 200, child1.body
+    t1 = child1.body["timings"]
+    n1 = child1.body["tokens_evaluated"]
+    assert t1["cache_n"] > 0, f"child1 cache_n=0; timings={t1}"
+    assert t1["cache_n"] % 16 == 0
+    assert t1["prompt_n"] + t1["cache_n"] == n1
+
+    child2 = server.make_request("POST", "/fork", data={
+        "prompt": PREFIX + " and then she found a river",
+        "n_predict": 4,
+        "parent_session_id": "master",
+        "temperature": 0.0,
+    })
+    assert child2.status_code == 200, child2.body
+    t2 = child2.body["timings"]
+    n2 = child2.body["tokens_evaluated"]
+    assert t2["cache_n"] > 0, f"child2 cache_n=0; timings={t2}"
+    assert t2["cache_n"] % 16 == 0
+    assert t2["prompt_n"] + t2["cache_n"] == n2
+    assert t1["cache_n"] == t2["cache_n"]
+
+    unknown = server.make_request("POST", "/fork", data={
+        "prompt": PREFIX + " and then",
+        "n_predict": 2,
+        "parent_session_id": "does-not-exist",
+        "temperature": 0.0,
+    })
+    assert unknown.status_code == 400, unknown.body
+    msg = unknown.body.get("error", unknown.body) if isinstance(unknown.body, dict) else unknown.body
+    assert "does-not-exist" in str(msg) or "session not found" in str(msg).lower()
+    _ = parent_n

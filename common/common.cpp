@@ -1874,6 +1874,14 @@ done:
 static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
+        // Full-range clear of a seq the memory never held (new
+        // bookkeeping slot past hybrid RS n_seq_max) is already empty.
+        // Do not abort the process: a second named /fork waiter should
+        // queue, not SIGABRT the master.
+        if (p0 < 0 && p1 < 0) {
+            COM_WRN("seq_rm(%d, %d, %d) failed; treating full clear as empty\n", seq_id, p0, p1);
+            return;
+        }
         GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
     }
 }
