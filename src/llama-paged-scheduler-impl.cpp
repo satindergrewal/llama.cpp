@@ -352,8 +352,22 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
     // already ahead (running or waiting), reserve this group's unique
     // tail on CPU now. Do not take GPU leftover from the runner.
     // If CPU leftover cannot hold it, stay waiting -- do not 500.
+    //
+    // Finished groups are already held. They may still sit in `running`
+    // until the next step() sweep. They are not live runners -- a
+    // same-session grow after HTTP 200 must take GPU leftover, not
+    // enqueue-cpu-unique. Other-session /fork waiters behind a RUNNING
+    // decode still reserve (2holdd / 2h21h).
+    auto has_live_ahead = [](const llama_sequence_group_list & q) {
+        for (const auto & g : q) {
+            if (g && g->status != llama_sequence_group_status::FINISHED) {
+                return true;
+            }
+        }
+        return false;
+    };
     if (kv_cache_manager != nullptr && !group.block_table.empty() &&
-        (!running.empty() || !waiting.empty())) {
+        (has_live_ahead(running) || has_live_ahead(waiting))) {
         if (!kv_cache_manager->reserve_unique_cpu(group)) {
             LLAMA_LOG_ERROR("%s: DS4P-QUEUE request %d unique CPU leftover short; "
                            "waiter stays live (no GPU steal)\n",
@@ -1848,9 +1862,17 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
             // running-list sweep leaves a one-step window where the server relaunches on
             // this id, queue_request overwrites the map entry, and the late sweep then
             // erased the NEW request's mapping -- orphaning it mid-flight (the storm's
-            // injection point). finish() is idempotent; the sweep still removes the
-            // group from the running list.
+            // injection point). finish() is idempotent.
             finish(*group);
+            // Named/finished session is held, not a live runner. Drop it
+            // from `running` now so a same-session grow after HTTP 200
+            // does not reserve_unique_cpu. The step() sweep is too late.
+            for (auto rit = running.begin(); rit != running.end(); ++rit) {
+                if (rit->get() == group) {
+                    running.erase(rit);
+                    break;
+                }
+            }
         }
     }
 }

@@ -693,6 +693,51 @@ TEST(test_named_session_grow_same_prefix) {
     EXPECT_TRUE(g->n_past > past_before);
 }
 
+TEST(test_named_grow_after_finish_skips_cpu_reserve) {
+    // swap2 hole: HTTP 200 path is update()+stop, not abort. abort already
+    // removes from running. finish() used to leave the named group in
+    // `running` until the next step() sweep, so an immediate same-session
+    // grow reserved unique on CPU (enqueue-cpu-unique) instead of GPU
+    // leftover. No step() between finish and grow -- that idle wait is
+    // harness, not product.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8,
+                                /*n_seq_max_batch=*/1);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0)->n_past >= 32);
+    EXPECT_TRUE(fixture.sched->bind_session("grow", /*request_id=*/0));
+
+    bool stopped = false;
+    for (int step = 0; step < 8 && !stopped; ++step) {
+        EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+        const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+        EXPECT_TRUE(info != nullptr && info->n_seq >= 1);
+        std::vector<llama_token> toks((size_t) info->n_seq, 1);
+        std::vector<int8_t>      stop((size_t) info->n_seq, 1);
+        fixture.sched->update(batch, toks, stop.data(), nullptr);
+        stopped = true;
+    }
+    EXPECT_TRUE(stopped);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) == nullptr);
+    EXPECT_TRUE(fixture.sched->has_session("grow"));
+    EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
+
+    llama_sequence_group grow = make_group(/*id=*/1, /*n_prompt=*/48);
+    for (size_t i = 32; i < grow.logical_seq.size(); ++i) {
+        grow.logical_seq[i] = 2;
+    }
+    EXPECT_TRUE(fixture.sched->queue_request(std::move(grow)));
+    EXPECT_TRUE(fixture.sched->bind_session("grow", /*request_id=*/1));
+    const llama_sequence_group * g = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(g != nullptr);
+    EXPECT_TRUE(g->n_past > 0);
+    EXPECT_TRUE(!g->block_table.empty());
+    EXPECT_TRUE(fixture.kv->count_cpu_unique(*g) == 0);
+}
+
 TEST(test_named_session_grow_finish_stays_resolvable) {
     // 8q3 hole: grow a named prefix, finish/RELEASE, session must still
     // resolve. A child must inherit the parked prefix (not session-not-found).
@@ -1853,6 +1898,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_finished_prefix_survives_for_children);
     RUN(test_session_fork_live_and_parked);
     RUN(test_named_session_grow_same_prefix);
+    RUN(test_named_grow_after_finish_skips_cpu_reserve);
     RUN(test_named_session_grow_finish_stays_resolvable);
     RUN(test_named_master_not_eviction_victim);
     RUN(test_named_master_full_gpu_children_wait_not_cpu_swap);
