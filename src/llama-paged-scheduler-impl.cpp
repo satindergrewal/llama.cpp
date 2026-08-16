@@ -355,7 +355,7 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
     if (kv_cache_manager != nullptr && !group.block_table.empty() &&
         (!running.empty() || !waiting.empty())) {
         if (!kv_cache_manager->reserve_unique_cpu(group)) {
-            LLAMA_LOG_INFO("%s: DS4P-QUEUE request %d unique CPU leftover short; "
+            LLAMA_LOG_ERROR("%s: DS4P-QUEUE request %d unique CPU leftover short; "
                            "waiter stays live (no GPU steal)\n",
                            __func__, group.request_id);
         }
@@ -519,7 +519,7 @@ void llama_paged_scheduler_impl::requeue_mixed_overflow(llama_sequence_group * g
     // Overflow after unique-suffix swap: leftover still cannot admit.
     // Keep HTTP live. A sibling RELEASE (or a later swap) grows leftover.
     // Do not touch the named master prefix. Do not 500.
-    LLAMA_LOG_INFO("%s: DS4P-QUEUE mixed remap leftover short; waiter stays live (request %d)\n",
+    LLAMA_LOG_ERROR("%s: DS4P-QUEUE mixed remap leftover short; waiter stays live (request %d)\n",
                    __func__, group->request_id);
     if (group->status == llama_sequence_group_status::WAITING) {
         return;
@@ -1183,7 +1183,7 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
                 }
             }
             if (still_short()) {
-                LLAMA_LOG_INFO("%s: DS4P-QUEUE request %d unique=%u cpu_u=%u scratch=%u; "
+                LLAMA_LOG_ERROR("%s: DS4P-QUEUE request %d unique=%u cpu_u=%u scratch=%u; "
                                "sibling may run (no fail_mixed)\n",
                                __func__, group->request_id, need, cpu_u,
                                kv_cache_manager->n_scratch_gpu_blocks());
