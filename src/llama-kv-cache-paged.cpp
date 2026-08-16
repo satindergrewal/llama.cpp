@@ -391,16 +391,91 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
         return true;
     }
 
-    if (!block_manager.has_free_gpu_blocks(num_requested_blocks)) {
-        LLAMA_LOG_DEBUG("%s: insufficient GPU blocks. Requested: %d.\n", __func__, num_requested_blocks);
-        return false;
+    if (block_manager.has_free_gpu_blocks(num_requested_blocks)) {
+        llama_block_ids new_ids = block_manager.checkout_gpu_blocks(num_requested_blocks, "allocate");
+        concat_block_ids(group.block_table, new_ids);
+        note_seq_blocks(group);
+        LLAMA_LOG_DEBUG("%s: successfully allocated %d.\n", __func__, num_requested_blocks);
+        return true;
     }
 
-    llama_block_ids new_ids = block_manager.checkout_gpu_blocks(num_requested_blocks, "allocate");
-    concat_block_ids(group.block_table, new_ids);
-    note_seq_blocks(group);
-    LLAMA_LOG_DEBUG("%s: successfully allocated %d.\n", __func__, num_requested_blocks);
+    // Mixed table: inherited GPU prefix stays; unique suffix may live on CPU.
+    // Do NOT whole-table swap_out (that would rewrite shared prefix ids).
+    const bool has_gpu_prefix = !group.block_table.empty() &&
+                                block_manager.is_gpu(group.block_table[0]);
+    if (has_gpu_prefix && block_manager.has_free_cpu_blocks(num_requested_blocks)) {
+        llama_block_ids new_ids = block_manager.checkout_cpu_blocks(num_requested_blocks);
+        if (new_ids.size() == (size_t) num_requested_blocks) {
+            concat_block_ids(group.block_table, new_ids);
+            note_seq_blocks(group);
+            LLAMA_LOG_INFO("%s: DS4P-MIXED unique suffix on CPU: %u block(s) "
+                           "(gpu full, prefix stays, table=%zu)\n",
+                           __func__, num_requested_blocks, group.block_table.size());
+            return true;
+        }
+    }
+
+    LLAMA_LOG_DEBUG("%s: insufficient GPU blocks. Requested: %d.\n", __func__, num_requested_blocks);
+    return false;
+}
+
+uint32_t llama_kv_cache_paged::count_cpu_unique(const llama_sequence_group & group) const {
+    uint32_t n = 0;
+    for (uint32_t id : group.block_table) {
+        if (!block_manager.is_gpu(id)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+uint32_t llama_kv_cache_paged::n_scratch_gpu_blocks() const {
+    return block_manager.num_free_gpu_blocks();
+}
+
+bool llama_kv_cache_paged::prepare_mixed_decode(const llama_sequence_group & group,
+                                                llama_block_ids & out_gpu_table) {
+    out_gpu_table.clear();
+    out_gpu_table.reserve(group.block_table.size());
+    llama_block_ids cpu_ids;
+    llama_block_ids sc_ids;
+    for (uint32_t id : group.block_table) {
+        if (block_manager.is_gpu(id)) {
+            out_gpu_table.push_back(id);
+            continue;
+        }
+        llama_block_ids one = block_manager.checkout_gpu_blocks(1, "mixed-scratch");
+        if (one.size() != 1) {
+            if (!sc_ids.empty()) {
+                block_manager.release_gpu_blocks(sc_ids);
+            }
+            out_gpu_table.clear();
+            LLAMA_LOG_ERROR("%s: DS4P-MIXED remap needs more GPU than can be freed without touching the master prefix (free=%u)\n",
+                            __func__, block_manager.num_free_gpu_blocks());
+            return false;
+        }
+        out_gpu_table.push_back(one[0]);
+        cpu_ids.push_back(id);
+        sc_ids.push_back(one[0]);
+    }
+    if (!cpu_ids.empty()) {
+        const size_t n_unique = cpu_ids.size();
+        do_block_copy(cpu_ids, sc_ids, /*to_gpu=*/true);
+        mixed_leases.push_back({std::move(cpu_ids), std::move(sc_ids)});
+        LLAMA_LOG_INFO("%s: DS4P-MIXED remap unique suffix on CPU -> GPU scratch (%zu block(s))\n",
+                       __func__, n_unique);
+    }
     return true;
+}
+
+void llama_kv_cache_paged::finish_mixed_decode() {
+    for (auto & lease : mixed_leases) {
+        if (!lease.cpu_ids.empty() && !lease.scratch_ids.empty()) {
+            do_block_copy(lease.scratch_ids, lease.cpu_ids, /*to_gpu=*/false);
+            block_manager.release_gpu_blocks(lease.scratch_ids);
+        }
+    }
+    mixed_leases.clear();
 }
 
 uint32_t llama_kv_cache_paged::fork_blocks(const llama_sequence_group & src, llama_sequence_group & dst,
@@ -419,15 +494,15 @@ uint32_t llama_kv_cache_paged::fork_blocks(const llama_sequence_group & src, lla
         n_full_blocks = (uint32_t) src.block_table.size();
     }
 
-    // Inherited refs must stay GPU. A CPU id in the child's table is a mixed
-    // table; paged attn reads a single GPU kv_cache (get_kv_tensor ->
-    // kv_gpu_layers only). Re-prefill from the first CPU block.
+    // Shared prefix is the leading GPU run only. Do not inherit CPU unique
+    // from the parent -- that suffix is not shared. Child unique is allocated
+    // later (GPU if free, else CPU mixed-table).
     uint32_t n_gpu_run = 0;
     while (n_gpu_run < n_full_blocks && block_manager.is_gpu(src.block_table[n_gpu_run])) {
         n_gpu_run++;
     }
     if (n_gpu_run < n_full_blocks) {
-        LLAMA_LOG_INFO("%s: stopping inherit at first CPU block (%u of %u) so the child stays all-GPU\n",
+        LLAMA_LOG_INFO("%s: stopping inherit at first CPU block (%u of %u); shared prefix is GPU-only\n",
                        __func__, n_gpu_run, n_full_blocks);
         n_full_blocks = n_gpu_run;
     }

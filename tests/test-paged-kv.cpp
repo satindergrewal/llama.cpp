@@ -284,11 +284,13 @@ TEST(test_free_blocks_releases_to_pool) {
 
     llama_sequence_group group_full;
     group_full.request_id = 99;
-    group_full.n_prompt   = n_gpu_blocks * 16;  // exactly n_gpu_blocks worth
+    const uint32_t n_usable = kv.get_usable_gpu_blocks();
+    EXPECT_TRUE(n_usable > 0 && n_usable <= n_gpu_blocks);
+    group_full.n_prompt   = n_usable * 16;
     group_full.n_decoded  = 0;
     success               = kv.allocate(0, group_full);
     EXPECT_TRUE(success);
-    EXPECT_EQ(group_full.block_table.size(), 16u);
+    EXPECT_EQ(group_full.block_table.size(), (size_t) n_usable);
     kv.free_blocks(group_full);
 
     ggml_backend_free(backend);
@@ -476,11 +478,10 @@ TEST(test_fork_does_not_reshare) {
 
 TEST(test_pool_full_children_wait_master_stays) {
     // vLLM PREEMPTED + prepend: master + children that TOGETHER exceed the
-    // pool must not 500 / take_terminated. Children wait or swap (unref
-    // tails). The highest-ref_cnt master prefix stays. When a child leaves,
-    // a waiter resumes.
+    // pool must not 500 / take_terminated. Children wait, swap, or admit
+    // unique on CPU (mixed table). The highest-ref_cnt master prefix stays.
     auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
-                                /*n_gpu_blocks=*/4, /*n_cpu_blocks=*/4,
+                                /*n_gpu_blocks=*/6, /*n_cpu_blocks=*/4,
                                 /*n_seq_max_batch=*/0);
 
     EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
@@ -537,7 +538,17 @@ TEST(test_pool_full_children_wait_master_stays) {
     EXPECT_TRUE(master != nullptr);
     EXPECT_TRUE(master->status == llama_sequence_group_status::RUNNING ||
                 master->status == llama_sequence_group_status::WAITING);
-    EXPECT_TRUE(n_parked_seen >= 1);
+    // Mixed-table children may ADMIT unique on CPU instead of parking.
+    if (n_parked_seen < 1) {
+        int n_child_running = 0;
+        for (int id = 1; id <= 3; ++id) {
+            const llama_sequence_group * g = fixture.sched->get_group_from_id(id);
+            if (g && g->status == llama_sequence_group_status::RUNNING) {
+                n_child_running++;
+            }
+        }
+        EXPECT_TRUE(n_child_running >= 1);
+    }
 
     // Free a child's unique tail. A parked sibling must be able to resume --
     // the pool was only momentarily full.
@@ -649,11 +660,10 @@ TEST(test_session_fork_live_and_parked) {
 TEST(test_named_master_not_eviction_victim) {
     // Named/held session prefix must not be shortened to admit a child.
     // Victim selection prefers unref child tails / non-session holds.
-    // If the only reclaimable blocks are the named master's unique
-    // suffix, the child waits. After room frees, a later child inherits
-    // the original N blocks (or token count), not N-k.
+    // Unique suffix may move to CPU or the child may ADMIT mixed-table.
+    // After room frees, a later child inherits the original N blocks, not N-k.
     auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
-                                /*n_gpu_blocks=*/5, /*n_cpu_blocks=*/2);
+                                /*n_gpu_blocks=*/7, /*n_cpu_blocks=*/2);
 
     EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/64)));
     llama_batch batch = {};
@@ -694,7 +704,9 @@ TEST(test_named_master_not_eviction_victim) {
     EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
     child1 = fixture.sched->get_group_from_id(1);
     EXPECT_TRUE(child1 != nullptr);
-    EXPECT_TRUE(child1->status == llama_sequence_group_status::WAITING);
+    EXPECT_TRUE(child1->status == llama_sequence_group_status::WAITING ||
+                child1->status == llama_sequence_group_status::RUNNING);
+    EXPECT_TRUE(child1->status != llama_sequence_group_status::SWAPPED);
     EXPECT_TRUE(fixture.sched->has_session("master"));
 
     // Later child wants the full prefix. Must inherit N blocks / 64
@@ -718,15 +730,14 @@ TEST(test_named_master_not_eviction_victim) {
 }
 
 TEST(test_named_master_full_gpu_children_wait_not_cpu_swap) {
-    // stories15M pool-full analog: 8 GPU + 4 CPU, block 16.
+    // stories15M pool-full analog: 8 GPU + 8 CPU, block 16.
     // Named parked master holds 7 GPU blocks (112 tokens). Children
-    // inherit 4 (64 tokens) and need unique GPU blocks. evict() will
-    // not shorten the named hold. allocate() is GPU-only, so the 4
-    // CPU blocks are unused. Children stay WAITING -- not SWAPPED,
-    // not take_terminated, not DEADLOCK -- until close_session drops
-    // the hold's unique suffix.
+    // inherit 4 (64 tokens) and need unique. GPU is prefix-full
+    // (1 leftover < 2 unique). allocate() admits unique on CPU
+    // (mixed table) without rewriting master prefix GPU ids and
+    // without close_session / whole-table swap. 2 of 10 GPU are reserved scratch so remap works when the pool is full.
     auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
-                                /*n_gpu_blocks=*/8, /*n_cpu_blocks=*/4);
+                                /*n_gpu_blocks=*/10, /*n_cpu_blocks=*/8);
 
     EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/112)));
     llama_batch batch = {};
@@ -762,30 +773,154 @@ TEST(test_named_master_full_gpu_children_wait_not_cpu_swap) {
         EXPECT_TRUE(c->n_past == 64u);
     }
 
+    const llama_block_ids * hold_bl = fixture.kv->get_sequence_blocks(hold_id);
+    EXPECT_TRUE(hold_bl != nullptr && hold_bl->size() >= 4);
+    std::vector<uint32_t> prefix_before(hold_bl->begin(), hold_bl->begin() + 4);
+    for (uint32_t id : prefix_before) {
+        EXPECT_TRUE(fixture.kv->is_gpu_block(id));
+    }
+
+    int n_running = 0;
     for (int step = 0; step < 12; ++step) {
         EXPECT_TRUE(fixture.sched->step(batch) != llama_scheduler_status::DEADLOCK);
         EXPECT_TRUE(fixture.sched->terminated_ids.empty());
         EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
+        n_running = 0;
         for (int id = 1; id <= 3; ++id) {
             const llama_sequence_group * c = fixture.sched->get_group_from_id(id);
             EXPECT_TRUE(c != nullptr);
-            EXPECT_TRUE(c->status == llama_sequence_group_status::WAITING);
             EXPECT_TRUE(c->status != llama_sequence_group_status::SWAPPED);
+            if (c->status == llama_sequence_group_status::RUNNING) {
+                n_running++;
+            }
         }
-    }
-
-    // GPU unique suffix returns on close. A waiter can admit. Never 500.
-    EXPECT_TRUE(fixture.sched->close_session("master"));
-    EXPECT_TRUE(fixture.sched->step(batch) != llama_scheduler_status::DEADLOCK);
-    EXPECT_TRUE(fixture.sched->terminated_ids.empty());
-    int n_running = 0;
-    for (int id = 1; id <= 3; ++id) {
-        const llama_sequence_group * c = fixture.sched->get_group_from_id(id);
-        if (c && c->status == llama_sequence_group_status::RUNNING) {
-            n_running++;
+        if (n_running >= 1) {
+            break;
+        }
+        if (batch.n_tokens > 0) {
+            const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+            if (info && info->n_seq >= 1) {
+                std::vector<llama_token> toks((size_t) info->n_seq, 1);
+                std::vector<int8_t>      stop((size_t) info->n_seq, 0);
+                fixture.sched->update(batch, toks, stop.data(), nullptr);
+            }
         }
     }
     EXPECT_TRUE(n_running >= 1);
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+
+    hold_bl = fixture.kv->get_sequence_blocks(hold_id);
+    EXPECT_TRUE(hold_bl != nullptr && hold_bl->size() >= 4);
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_TRUE((*hold_bl)[i] == prefix_before[i]);
+    }
+}
+
+TEST(test_mixed_table_child_admits_when_gpu_full) {
+    // Child inherits 64 tokens / 4 GPU blocks and needs unique. GPU is prefix-full after the parked master (usable 8 after 2 scratch). Child must ADMIT without
+    // close_session. Unique suffix lives on CPU (mixed stored table).
+    // Shared prefix GPU ids stay. Decode remap makes the batch table
+    // all-GPU so get_kv_tensor stays GPU-only.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/10, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/112)));
+    llama_batch batch = {};
+    for (int i = 0; i < 4; ++i) {
+        const llama_sequence_group * m = fixture.sched->get_group_from_id(0);
+        if (!m || m->n_past >= 112) {
+            break;
+        }
+        prefill_one_chunk(fixture, batch);
+    }
+    const llama_sequence_group * master = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(master != nullptr);
+    EXPECT_TRUE(master->n_past >= 112);
+
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+    const int32_t hold_id = fixture.sched->session_request_id("master");
+    const size_t  N       = fixture.sched->held_prefix_n_blocks(hold_id);
+    EXPECT_TRUE(N == 7u);
+
+    llama_sequence_group child = make_group(/*id=*/1, /*n_prompt=*/80);
+    for (size_t i = 64; i < child.logical_seq.size(); ++i) {
+        child.logical_seq[i] = 2;
+    }
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(std::move(child), "master"));
+    const llama_sequence_group * c0 = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(c0 != nullptr);
+    EXPECT_TRUE(c0->n_past == 64u);
+    EXPECT_TRUE(c0->block_table.size() == 4u);
+
+    const llama_block_ids * hold_bl = fixture.kv->get_sequence_blocks(hold_id);
+    EXPECT_TRUE(hold_bl != nullptr && hold_bl->size() >= 4);
+    std::vector<uint32_t> prefix_before(hold_bl->begin(), hold_bl->begin() + 4);
+    for (uint32_t id : prefix_before) {
+        EXPECT_TRUE(fixture.kv->is_gpu_block(id));
+    }
+
+    bool admitted = false;
+    for (int step = 0; step < 12; ++step) {
+        const llama_scheduler_status st = fixture.sched->step(batch);
+        EXPECT_TRUE(st != llama_scheduler_status::DEADLOCK);
+        EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+        EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
+
+        const llama_sequence_group * c = fixture.sched->get_group_from_id(1);
+        EXPECT_TRUE(c != nullptr);
+        EXPECT_TRUE(c->status != llama_sequence_group_status::SWAPPED);
+        if (c->status == llama_sequence_group_status::RUNNING) {
+            admitted = true;
+            const uint32_t n_gpu = fixture.kv->get_num_gpu_blocks();
+            bool has_cpu = false;
+            bool has_gpu = false;
+            for (uint32_t id : c->block_table) {
+                if (id >= n_gpu) {
+                    has_cpu = true;
+                } else {
+                    has_gpu = true;
+                }
+            }
+            EXPECT_TRUE(has_gpu);
+            EXPECT_TRUE(has_cpu || fixture.kv->count_cpu_unique(*c) > 0);
+
+            const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+            if (info && info->block_table && info->n_seq >= 1) {
+                for (int i = 0; i < info->n_seq * info->n_blocks_per_seq; ++i) {
+                    const int32_t bid = info->block_table[i];
+                    if (bid >= 0) {
+                        EXPECT_TRUE((uint32_t) bid < n_gpu);
+                    }
+                }
+            }
+            break;
+        }
+        if (batch.n_tokens > 0) {
+            const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+            if (info && info->n_seq >= 1) {
+                std::vector<llama_token> toks((size_t) info->n_seq, 1);
+                std::vector<int8_t>      stop((size_t) info->n_seq, 0);
+                fixture.sched->update(batch, toks, stop.data(), nullptr);
+            }
+        }
+    }
+    EXPECT_TRUE(admitted);
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+    // Do NOT require close_session for the child to admit.
+
+    hold_bl = fixture.kv->get_sequence_blocks(hold_id);
+    EXPECT_TRUE(hold_bl != nullptr && hold_bl->size() >= 4);
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_TRUE((*hold_bl)[i] == prefix_before[i]);
+    }
+    const llama_sequence_group * c = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(c != nullptr);
+    EXPECT_TRUE(c->block_table.size() >= 4);
+    for (size_t i = 0; i < 4 && i < c->block_table.size(); ++i) {
+        EXPECT_TRUE(c->block_table[i] == prefix_before[i]);
+    }
 }
 
 TEST(test_session_close_keeps_child_refs) {
@@ -1198,6 +1333,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_session_fork_live_and_parked);
     RUN(test_named_master_not_eviction_victim);
     RUN(test_named_master_full_gpu_children_wait_not_cpu_swap);
+    RUN(test_mixed_table_child_admits_when_gpu_full);
     RUN(test_session_close_keeps_child_refs);
     RUN(test_session_omitted_is_noop);
     RUN(test_session_survives_short_prefix);

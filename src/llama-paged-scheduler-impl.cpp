@@ -893,6 +893,9 @@ bool llama_paged_scheduler_impl::evict() {
         if (is_named_session_id(g->request_id)) {
             continue;  // named live master stays resident
         }
+        if (kv_cache_manager->count_cpu_unique(*g) > 0) {
+            continue;  // mixed stored table: do not whole-table swap_out
+        }
         const uint32_t unref = count_unref_blocks(*g);
         if (unref == 0) {
             continue;  // no unique tail to free
@@ -1110,14 +1113,12 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
             success = kv_cache_manager->allocate(1, *group);
         }
         if (!success) {
-            // evict() returned false or freed nothing usable. allocate()
-            // is GPU-only (llama-kv-cache-paged.cpp). A shared-prefix
-            // child cannot whole-table swap_out (would rewrite the
-            // master's GPU ids). New unique blocks on CPU would mix
-            // devices in one table; paged attn writes a single GPU
-            // kv_cache (get_kv_tensor -> kv_gpu_layers only). Named
-            // holds now swap their unref suffix to CPU first; if that
-            // still cannot free GPU, stay queued -- never 500.
+            // evict() freed nothing usable. allocate() now admits a
+            // child with a GPU prefix by checking out CPU unique
+            // (mixed stored table; remap onto scratch before the
+            // kernel). Whole-table swap_out is still forbidden -- it
+            // would rewrite master GPU ids. If CPU unique also cannot
+            // fit, stay queued -- never 500.
             break;
         }
         candidates.push_back(group);
@@ -1158,6 +1159,9 @@ int32_t llama_paged_scheduler_impl::calculate_global_slot_index(int32_t         
 
 void llama_paged_scheduler_impl::clear_batch(llama_batch & batch) {
     LLAMA_LOG_DEBUG("%s: clearing batch.", __func__);
+    // Copy scratch -> CPU unique so the stored table stays mixed.
+    // Prefix GPU ids never change. Safe no-op if nothing was remapped.
+    kv_cache_manager->finish_mixed_decode();
     // Invalidate last scheduled batch info before freeing the arrays
     // (MUST be called before the delete[]).
     kv_cache_manager->set_paged_batch_info(nullptr);
@@ -1205,6 +1209,43 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         LLAMA_LOG_DEBUG("%s: all candidates evicted mid-sweep.\n", __func__);
         batch.n_tokens = 0;
         return;
+    }
+
+    // Mixed-table: only as many CPU-unique blocks as currently-free GPU
+    // (watermark leftovers + already-swapped unique). Not a reserved slice.
+    // Others stay RUNNING and retry next step. Do not whole-table swap.
+    {
+        uint32_t max_need = 0;
+        for (auto * g : candidates) {
+            const uint32_t need = kv_cache_manager->count_cpu_unique(*g);
+            if (need > max_need) {
+                max_need = need;
+            }
+        }
+        if (max_need > kv_cache_manager->n_scratch_gpu_blocks()) {
+            evict_held_prefix();
+        }
+        llama_sequence_group_raw_list fitted;
+        fitted.reserve(candidates.size());
+        uint32_t scratch_acc = 0;
+        const uint32_t scratch_cap = kv_cache_manager->n_scratch_gpu_blocks();
+        for (auto * g : candidates) {
+            const uint32_t need = kv_cache_manager->count_cpu_unique(*g);
+            if (need > 0 && scratch_acc + need > scratch_cap) {
+                LLAMA_LOG_DEBUG("%s: request %d deferred (mixed unique %u, scratch left %u)\n",
+                                __func__, g->request_id, need,
+                                scratch_cap > scratch_acc ? scratch_cap - scratch_acc : 0);
+                continue;
+            }
+            scratch_acc += need;
+            fitted.push_back(g);
+        }
+        candidates.swap(fitted);
+        if (candidates.empty()) {
+            LLAMA_LOG_ERROR("%s: DS4P-MIXED remap needs more GPU than can be freed without touching the master prefix\n", __func__);
+            batch.n_tokens = 0;
+            return;
+        }
     }
 
     int32_t total_tokens = 0;
@@ -1456,6 +1497,16 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
             GGML_ASSERT(!group->logical_seq.empty() && "logical_seq empty during decode");
         }
 
+        // Kernel sees all-GPU ids. Stored table may stay mixed.
+        llama_block_ids kernel_table;
+        if (!kv_cache_manager->prepare_mixed_decode(*group, kernel_table)) {
+            evict_held_prefix();
+            if (!kv_cache_manager->prepare_mixed_decode(*group, kernel_table)) {
+                LLAMA_LOG_ERROR("%s: DS4P-MIXED remap needs more GPU than can be freed without touching the master prefix\n", __func__);
+                GGML_ASSERT(false && "mixed-table remap needs more GPU than can be freed without touching the master prefix");
+            }
+        }
+
         for (int token_idx = 0; token_idx < new_tokens; ++token_idx) {
             int32_t batch_start_id = token_offset + token_idx;
 
@@ -1483,7 +1534,7 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
                            : true;
 
             int32_t token_pos                     = group->n_past + token_idx;
-            curr_info.write_slots[batch_start_id] = calculate_global_slot_index(token_pos, group->block_table);
+            curr_info.write_slots[batch_start_id] = calculate_global_slot_index(token_pos, kernel_table);
             LLAMA_LOG_DEBUG("%s: llama_batch seq_id: %d (req_id %d) token %d: pos: %d, global_slot_idx=%d\n", __func__,
                             seq_id, group->request_id, token_idx, token_pos, curr_info.write_slots[batch_start_id]);
             if (getenv("DS4P_EMIT_PROBE")) {
@@ -1495,11 +1546,12 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         }
 
         // Populate block table (1D): [batch_size * max_blocks]
-        const int32_t curr_block_table_size = group->block_table.size();
+        // kernel_table is the remapped all-GPU view; stored group table may be mixed.
+        const int32_t curr_block_table_size = (int32_t) kernel_table.size();
         for (int block = 0; block < max_blocks; ++block) {
             int  flattened_id                   = (seq_id * max_blocks) + block;  // row-major
             bool need_padding                   = block >= curr_block_table_size;
-            curr_info.block_table[flattened_id] = need_padding ? -1 : group->block_table[block];
+            curr_info.block_table[flattened_id] = need_padding ? -1 : (int32_t) kernel_table[block];
         }
 
         curr_info.context_lens[seq_id]    = group->n_past + new_tokens;
@@ -1537,6 +1589,9 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
                                         const int32_t *                  n_accepted) {
     GGML_ASSERT((int32_t) new_tokens.size() >= curr_info.n_seq && "new_tokens size does not match with batch size.");
     GGML_ASSERT(stop_flags != nullptr && "stop_flags can't be null");
+    // Kernel has consumed the remapped all-GPU view. Write scratch back so
+    // the stored table stays mixed (prefix GPU ids unchanged).
+    kv_cache_manager->finish_mixed_decode();
 
     for (int i = 0; i < curr_info.n_seq; ++i) {
         int32_t token_offset = curr_info.batch_offsets[i];

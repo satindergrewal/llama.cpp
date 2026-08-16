@@ -116,9 +116,19 @@ class llama_kv_cache_paged : public llama_memory_i {
     // Move trailing ref_cnt==1 GPU blocks to the CPU pool. Shared prefix
     // GPU ids stay. n_past / logical_seq stay -- this is swap, not evict.
     // Returns how many GPU blocks were freed. A parked named master does
-    // not decode, so its table may become mixed. A running child's table
-    // must stay all-GPU (get_kv_tensor returns kv_gpu_layers only).
+    // not decode, so its table may become mixed. A running child may also
+    // store unique suffix on CPU; prepare_mixed_decode remaps that suffix
+    // onto GPU scratch so get_kv_tensor stays GPU-only.
     uint32_t swap_out_unref_suffix(llama_sequence_group & group);
+
+    bool     is_gpu_block(uint32_t id) const { return block_manager.is_gpu(id); }
+    uint32_t n_scratch_gpu_blocks() const;
+    uint32_t count_cpu_unique(const llama_sequence_group & group) const;
+
+    // Remap CPU unique onto free GPU scratch for one decode/prefill
+    // step. Prefix GPU ids never change. Stored table stays mixed.
+    bool prepare_mixed_decode(const llama_sequence_group & group, llama_block_ids & out_gpu_table);
+    void finish_mixed_decode();
 
     // DEBUG (fork-residual discriminator): additive checksum of the group's first
     // n_tokens of KV per layer, read back through its block table. Returns layers written.
@@ -318,6 +328,15 @@ class llama_kv_cache_paged : public llama_memory_i {
     };
 
     std::unordered_map<llama_seq_id, restored_seq> restored_seqs;
+
+    // Per-decode remap leases. Scratch ids are checked out from the free
+    // GPU list for one step and released in finish_mixed_decode(). Not a
+    // private arena held out of allocate().
+    struct mixed_lease {
+        llama_block_ids cpu_ids;
+        llama_block_ids scratch_ids;
+    };
+    std::vector<mixed_lease> mixed_leases;
 };
 
 class llama_kv_cache_paged_context : public llama_memory_context_i {
