@@ -149,10 +149,10 @@ class llama_paged_scheduler_impl {
     // even if the hold has 0 full blocks. Drop only if nothing to name.
     void rebind_session_after_finish(const llama_sequence_group & group);
     llama_sequence_group * find_parent_group(int32_t parent_request_id) const;
-    // Evict unique suffix of a non-session parked prefix. NEVER a block
-    // with ref_cnt > 1 that children still hold. NEVER a named session
-    // hold -- shortening that to admit a child is how a parked master
-    // lost unique-suffix blocks and the next fork inherited N-k.
+    // Reclaim GPU from a parked prefix. Non-session holds: drop unref
+    // suffix (release). Named session holds: swap unref suffix to CPU
+    // without shortening n_past / logical_seq. NEVER a block with
+    // ref_cnt > 1 (would rewrite a child's inherited GPU ids).
     bool evict_held_prefix();
     bool is_named_session_id(int32_t request_id) const;
 

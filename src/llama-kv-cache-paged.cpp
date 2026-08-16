@@ -419,6 +419,19 @@ uint32_t llama_kv_cache_paged::fork_blocks(const llama_sequence_group & src, lla
         n_full_blocks = (uint32_t) src.block_table.size();
     }
 
+    // Inherited refs must stay GPU. A CPU id in the child's table is a mixed
+    // table; paged attn reads a single GPU kv_cache (get_kv_tensor ->
+    // kv_gpu_layers only). Re-prefill from the first CPU block.
+    uint32_t n_gpu_run = 0;
+    while (n_gpu_run < n_full_blocks && block_manager.is_gpu(src.block_table[n_gpu_run])) {
+        n_gpu_run++;
+    }
+    if (n_gpu_run < n_full_blocks) {
+        LLAMA_LOG_INFO("%s: stopping inherit at first CPU block (%u of %u) so the child stays all-GPU\n",
+                       __func__, n_gpu_run, n_full_blocks);
+        n_full_blocks = n_gpu_run;
+    }
+
     dst.block_table.clear();
     dst.block_table.insert(dst.block_table.end(), src.block_table.begin(),
                            src.block_table.begin() + n_full_blocks);
@@ -554,6 +567,58 @@ uint32_t llama_kv_cache_paged::release_unref_suffix(llama_sequence_group & group
     }
     note_seq_blocks(group);
     return (uint32_t) (drop_gpu.size() + drop_cpu.size());
+}
+
+uint32_t llama_kv_cache_paged::swap_out_unref_suffix(llama_sequence_group & group) {
+    if (group.block_table.empty()) {
+        return 0;
+    }
+
+    // Trailing ref_cnt==1 run. Shared prefix (ref_cnt>1) is never touched.
+    size_t suffix_start = group.block_table.size();
+    while (suffix_start > 0) {
+        const uint32_t id = group.block_table[suffix_start - 1];
+        if (block_manager.get_ref_count(id) > 1) {
+            break;
+        }
+        suffix_start--;
+    }
+
+    llama_block_ids gpu_src;
+    std::vector<size_t> idx;
+    for (size_t i = suffix_start; i < group.block_table.size(); ++i) {
+        const uint32_t id = group.block_table[i];
+        if (block_manager.is_gpu(id)) {
+            gpu_src.push_back(id);
+            idx.push_back(i);
+        }
+    }
+    if (gpu_src.empty()) {
+        return 0;
+    }
+    if (!block_manager.has_free_cpu_blocks((uint32_t) gpu_src.size())) {
+        LLAMA_LOG_DEBUG("%s: no CPU room for %zu unique-suffix GPU block(s)\n",
+                        __func__, gpu_src.size());
+        return 0;
+    }
+
+    llama_block_ids cpu_ids = block_manager.checkout_cpu_blocks((uint32_t) gpu_src.size());
+    if (cpu_ids.size() != gpu_src.size()) {
+        return 0;
+    }
+
+    do_block_copy(gpu_src, cpu_ids, /*to_gpu=*/false);
+
+    for (size_t k = 0; k < idx.size(); ++k) {
+        group.block_table[idx[k]] = cpu_ids[k];
+    }
+    block_manager.release_gpu_blocks(gpu_src);
+    note_seq_blocks(group);
+
+    LLAMA_LOG_INFO("%s: DS4P-SWAP unique-suffix GPU->CPU: %zu blocks "
+                   "(session not shortened, n_past=%u table=%zu)\n",
+                   __func__, gpu_src.size(), group.n_past, group.block_table.size());
+    return (uint32_t) gpu_src.size();
 }
 
 void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,

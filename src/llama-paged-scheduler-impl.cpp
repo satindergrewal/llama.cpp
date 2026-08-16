@@ -606,21 +606,32 @@ bool llama_paged_scheduler_impl::evict_held_prefix() {
     // still need them. A hold with no children has ref_cnt==1 on every
     // block, so this frees the whole unused prefix and returns capacity.
     //
-    // Named session holds are not victims. Shortening one to admit a
+    // Named session holds are not DESTROYED. Shortening one to admit a
     // child is how a parked master went 7 blocks / 112 tokens -> 4 and
-    // the next fork inherited 64 of 112. Product: one master stays
-    // resident; children leave without destroying it. If the only
-    // reclaimable blocks are that session's unique suffix, return false
-    // and leave the waiter queued.
+    // the next fork inherited 64 of 112 (257458bdd). Product: swap the
+    // unique suffix to CPU so GPU frees and the session stays whole.
+    // Shared prefix GPU ids are not rewritten (ref_cnt>1 is never swapped).
     for (auto it = held_prefixes.begin(); it != held_prefixes.end(); ++it) {
         llama_sequence_group * h = it->get();
         if (!h) {
             continue;
         }
         if (is_named_session_id(h->request_id)) {
-            LLAMA_LOG_DEBUG("%s: skip named session hold %d (master stays full).\n",
-                            __func__, h->request_id);
-            continue;
+            if (h->block_table.empty()) {
+                if (const auto * bl = kv_cache_manager->get_sequence_blocks(h->request_id)) {
+                    h->block_table = *bl;
+                }
+            }
+            const uint32_t swapped = kv_cache_manager->swap_out_unref_suffix(*h);
+            if (swapped == 0) {
+                LLAMA_LOG_DEBUG("%s: named session hold %d has no unref GPU suffix to swap.\n",
+                                __func__, h->request_id);
+                continue;
+            }
+            LLAMA_LOG_INFO("%s: swapped %u unique-suffix block(s) of named hold %d to CPU "
+                           "(%zu blocks remain, n_past=%u, session not shortened)\n",
+                           __func__, swapped, h->request_id, h->block_table.size(), h->n_past);
+            return true;
         }
         if (h->block_table.empty()) {
             if (const auto * bl = kv_cache_manager->get_sequence_blocks(h->request_id)) {
@@ -1099,14 +1110,14 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
             success = kv_cache_manager->allocate(1, *group);
         }
         if (!success) {
-            // evict() returned false or freed nothing usable: named/held
-            // master is not a victim. allocate() is GPU-only (see
-            // llama-kv-cache-paged.cpp). A shared-prefix child cannot
-            // swap_out its table (would rewrite the master's GPU ids).
-            // New unique blocks on CPU would mix devices in one table;
-            // paged attn writes a single GPU kv_cache. Stay queued --
-            // never 500. Resume when GPU unref blocks free (sibling
-            // leave or close_session).
+            // evict() returned false or freed nothing usable. allocate()
+            // is GPU-only (llama-kv-cache-paged.cpp). A shared-prefix
+            // child cannot whole-table swap_out (would rewrite the
+            // master's GPU ids). New unique blocks on CPU would mix
+            // devices in one table; paged attn writes a single GPU
+            // kv_cache (get_kv_tensor -> kv_gpu_layers only). Named
+            // holds now swap their unref suffix to CPU first; if that
+            // still cannot free GPU, stay queued -- never 500.
             break;
         }
         candidates.push_back(group);

@@ -1387,7 +1387,11 @@ private:
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
-        if (n_ctx_slot > n_ctx_train) {
+        // Paged: the block pool is n_ctx / n_gpu_blocks, not n_ctx_train.
+        // Capping the slot to the train window (stories15M=128) makes an
+        // 8k/16k paged request look like it does not fit. Static path keeps
+        // the cap -- that slice is still n_ctx/n_parallel.
+        if (n_ctx_slot > n_ctx_train && !params_base.kv_paged) {
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
             n_ctx_slot = n_ctx_train;
         }

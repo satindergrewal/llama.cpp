@@ -113,6 +113,13 @@ class llama_kv_cache_paged : public llama_memory_i {
     // non-session APC holds are the intended callers.
     uint32_t release_unref_suffix(llama_sequence_group & group);
 
+    // Move trailing ref_cnt==1 GPU blocks to the CPU pool. Shared prefix
+    // GPU ids stay. n_past / logical_seq stay -- this is swap, not evict.
+    // Returns how many GPU blocks were freed. A parked named master does
+    // not decode, so its table may become mixed. A running child's table
+    // must stay all-GPU (get_kv_tensor returns kv_gpu_layers only).
+    uint32_t swap_out_unref_suffix(llama_sequence_group & group);
+
     // DEBUG (fork-residual discriminator): additive checksum of the group's first
     // n_tokens of KV per layer, read back through its block table. Returns layers written.
     int32_t debug_seq_kv_checksum(const llama_sequence_group & group, int32_t n_tokens,
