@@ -1518,14 +1518,16 @@ TEST(test_named_fork_n_past_is_http_cache_n) {
 }
 
 TEST(test_hybrid_rs_few_live_cells) {
-    // 24 cells, not 256. Sequential check-in reuses a freed cell.
+    // 40 cells, not 256. Sequential check-in reuses a freed cell.
     // Last cell is the named-prefix hold. Mid-work occupancy can pass 3.
+    // Contract: max(n_seq_max, 40) when paged.
     EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/1, /*kv_paged=*/false), 1u);
-    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/1, /*kv_paged=*/true), 24u);
-    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/2, /*kv_paged=*/true), 24u);
-    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/8, /*kv_paged=*/true), 24u);
-    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/32, /*kv_paged=*/true), 32u);
-    EXPECT_TRUE(LLAMA_HYBRID_RS_CELLS_PAGED == 24);
+    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/1, /*kv_paged=*/true), 40u);
+    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/2, /*kv_paged=*/true), 40u);
+    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/8, /*kv_paged=*/true), 40u);
+    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/32, /*kv_paged=*/true), 40u);
+    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/64, /*kv_paged=*/true), 64u);
+    EXPECT_TRUE(LLAMA_HYBRID_RS_CELLS_PAGED == 40);
     EXPECT_TRUE(LLAMA_HYBRID_RS_CELLS_PAGED < LLAMA_MAX_SEQ);
 }
 
