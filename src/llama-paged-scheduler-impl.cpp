@@ -995,11 +995,9 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
         if (required_capacity >= current_capacity) {
             LLAMA_LOG_DEBUG("%s: (running_pending) request_id=%d: requires a new block to decode.\n", __func__,
                             group->request_id);
-            // blocks needed to cover n_past .. n_past + n_rows_wanted - 1
-            const uint32_t have   = (uint32_t) group->block_table.size() * block_size;
-            const uint32_t needed = required_capacity > have
-                                  ? (required_capacity - have + block_size - 1) / block_size : 1;
-            bool success = kv_cache_manager->allocate(needed, *group);  // decode phase
+            // TOKEN delta, not a block count. allocate() recomputes
+            // ceil((n_prompt+n_decoded+delta)/block_size) - table.size().
+            bool success = kv_cache_manager->allocate(1, *group);  // decode phase
             if (!success) {
                 const int32_t cur_id = group->request_id;
                 // Swap/recompute an unref tail (never the shared master prefix).
@@ -1016,7 +1014,7 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
                     continue;  // we were the victim
                 }
                 group = it->get();
-                success = kv_cache_manager->allocate(needed, *group);
+                success = kv_cache_manager->allocate(1, *group);
 
                 if (!success) {
                     // Still no room. Self-preempt only if we have an unref tail
@@ -1789,8 +1787,18 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
         const int32_t n_sub = n_sub_e;
         if (n_accepted == nullptr || n_accepted[i] < 0) {
             const uint32_t np_before = group->n_past;
-            group->n_past    += n_sub;
-            group->n_decoded += n_sub;
+            const bool was_prefill = (group->n_decoded == 0);
+            group->n_past += n_sub;
+            // allocate() sizes the next CHECKOUT from n_prompt + n_decoded + delta.
+            // The unique prefill is already in n_prompt. Adding n_sub (137 on the
+            // 8q2 child) to n_decoded double-counts those tokens, so the 8th
+            // generated token asks for ~9 GPU blocks instead of 1 (145 > 9*16)
+            // and the admitted child hangs. Flip is_prefill off with 1.
+            if (was_prefill) {
+                group->n_decoded = 1;
+            } else {
+                group->n_decoded += n_sub;
+            }
             group->logical_seq.push_back(n_accepted == nullptr ? new_tokens[i]
                                                                : new_tokens[token_offset]);  // ONE
             if (getenv("DS4P_NPAST_PROBE")) {

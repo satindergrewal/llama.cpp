@@ -3493,7 +3493,20 @@ private:
             llama_set_embeddings(ctx_tgt, need_embd);
         }
 
-        if (llama_decode(ctx_tgt, pbatch) != 0) {
+        // Extra live /fork HTTP waiters must not run decode on start_loop.
+        // Static path already yields llama_decode onto the queue worker;
+        // process_single_task declines non-METRICS while is_yielding.
+        // Paged decoded on start_loop: 8q admitted one child, populated
+        // 8137/8137, then 30s silence (4q with the same unique finished).
+        // Do not hide that by raising -np, 512, RS, or n_threads_http.
+        int decode_ret = 0;
+        queue_tasks.yield_to_queue([&]() {
+            decode_ret = llama_decode(ctx_tgt, pbatch);
+            if (decode_ret == 0) {
+                llama_synchronize(ctx_tgt);
+            }
+        });
+        if (decode_ret != 0) {
             // storm breaker: returning here leaves the scheduler un-updated, so the next
             // tick rebuilds the IDENTICAL failing batch -- one bad batch became an
             // infinite decode-fail loop (880K+ log lines) that also ballooned the CUDA
@@ -3536,8 +3549,7 @@ private:
         // The actual lever was the attention kernel (--kv-block-size 64 engaging the champion).
         const llama_paged_batch_info * info = llama_paged_scheduler_get_batch_info(paged_sched);
         GGML_ASSERT(info != nullptr);
-
-        llama_synchronize(ctx_tgt);
+        // synchronized inside yield_to_queue with llama_decode
 
         std::vector<llama_token> sampled;
         std::vector<int8_t>      stops;

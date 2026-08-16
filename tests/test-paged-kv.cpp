@@ -325,7 +325,8 @@ static paged_test_fixture make_fixture(uint32_t n_ctx           = 128,
                                        uint32_t n_gpu_blocks    = 4,
                                        uint32_t n_cpu_blocks    = 2,
                                        uint32_t n_seq_max_batch = 0,
-                                       float    watermark       = 0.0f) {
+                                       float    watermark       = 0.0f,
+                                       uint32_t n_seq_max       = 16) {
     paged_test_fixture fixture;
     fixture.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     EXPECT_TRUE(fixture.backend != nullptr);
@@ -336,7 +337,7 @@ static paged_test_fixture make_fixture(uint32_t n_ctx           = 128,
         /*block_size=*/block_size,
         /*n_layers=*/2u,
         /*n_ubatch=*/n_batch,
-        /*n_seq_max=*/8u));
+        /*n_seq_max=*/n_seq_max));
     fixture.kv->init(fixture.backend, fixture.backend, GGML_TYPE_F16, n_gpu_blocks, n_cpu_blocks, watermark);
 
     fixture.sched = std::unique_ptr<llama_paged_scheduler_impl>(
@@ -1527,6 +1528,121 @@ TEST(test_batch_width_cap_does_not_reject) {
                 fixture.sched->get_group_from_id(2) != nullptr);
 }
 
+TEST(test_eight_named_waiters_first_admitted_completes) {
+    // 8q hole: eight live named-fork children at batch width 1. Extra
+    // waiters stay queued. The one that CHECKOUTs must finish; then a
+    // waiter is admitted. Do not require -np 8.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/16,
+                                /*n_seq_max_batch=*/1);
+    fixture.sched->set_hybrid(true);
+    fixture.sched->set_has_recurrent_state(true);
+    fixture.sched->set_supports_rs_rollback(true);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+
+    for (int32_t id = 1; id <= 8; ++id) {
+        llama_sequence_group child = make_group(id, /*n_prompt=*/40);
+        for (size_t i = 32; i < child.logical_seq.size(); ++i) {
+            child.logical_seq[i] = (llama_token) (10 + id);
+        }
+        EXPECT_TRUE(fixture.sched->queue_forked_from_session(std::move(child), "master"));
+        EXPECT_TRUE(fixture.sched->get_group_from_id(id) != nullptr);
+    }
+
+    int32_t first_id = -1;
+    bool    first_done = false;
+    for (int step = 0; step < 32 && !first_done; ++step) {
+        EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+        const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+        EXPECT_TRUE(info != nullptr);
+        EXPECT_EQ(info->n_seq, 1);
+        const int32_t rid = batch.seq_id[info->batch_offsets[0]][0];
+        if (first_id < 0) {
+            first_id = rid;
+        }
+        EXPECT_EQ(rid, first_id);
+        std::vector<llama_token> toks((size_t) info->n_seq, /*dummy=*/1);
+        const bool last_prefill = info->prefill_pending && !info->prefill_pending[0];
+        const llama_sequence_group * g = fixture.sched->get_group_from_id(first_id);
+        const bool decoding = g && g->n_decoded > 0;
+        std::vector<int8_t> stop((size_t) info->n_seq, (last_prefill || decoding) ? 1 : 0);
+        fixture.sched->update(batch, toks, stop.data(), nullptr);
+        if (fixture.sched->get_group_from_id(first_id) == nullptr) {
+            first_done = true;
+        }
+    }
+    EXPECT_TRUE(first_done);
+    EXPECT_TRUE(first_id >= 1 && first_id <= 8);
+
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+    EXPECT_TRUE(info != nullptr);
+    EXPECT_EQ(info->n_seq, 1);
+    const int32_t next_id = batch.seq_id[info->batch_offsets[0]][0];
+    EXPECT_TRUE(next_id != first_id);
+    EXPECT_TRUE(next_id >= 1 && next_id <= 8);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(next_id) != nullptr);
+}
+
+TEST(test_unique_partial_block_grows_for_eighth_token) {
+    // 8q2 measured: 137 unique (9 blocks) + n_predict=8 needs a 10th
+    // block (145 > 9*16). n_predict=7 fits and returns. Same shape,
+    // cheap: prefix 32 + unique 9; 9+7=16 fits one unique block, the
+    // 8th generated token must CHECKOUT one more. Do not raise -np.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/16, /*n_cpu_blocks=*/8,
+                                /*n_seq_max_batch=*/1);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+
+    llama_sequence_group child = make_group(/*id=*/1, /*n_prompt=*/41);
+    for (size_t i = 32; i < child.logical_seq.size(); ++i) {
+        child.logical_seq[i] = (llama_token) 7;
+    }
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(std::move(child), "master"));
+
+    // unique prefill (9 tokens, one chunk)
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    {
+        const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+        EXPECT_TRUE(info != nullptr);
+        std::vector<llama_token> toks((size_t) info->n_seq, /*dummy=*/1);
+        std::vector<int8_t>      stop((size_t) info->n_seq, 0);
+        fixture.sched->update(batch, toks, stop.data(), nullptr);
+    }
+    const llama_sequence_group * g0 = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(g0 != nullptr);
+    EXPECT_EQ(g0->n_past, 41u);
+    EXPECT_EQ(g0->n_decoded, 1u);
+    EXPECT_EQ(g0->block_table.size(), (size_t) 3);
+
+    for (int gen = 0; gen < 8; ++gen) {
+        EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+        const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+        EXPECT_TRUE(info != nullptr);
+        EXPECT_EQ(info->n_seq, 1);
+        EXPECT_TRUE(info->n_tokens >= 1);
+        std::vector<llama_token> toks((size_t) info->n_seq, /*dummy=*/1);
+        std::vector<int8_t>      stop((size_t) info->n_seq, 0);
+        fixture.sched->update(batch, toks, stop.data(), nullptr);
+        const llama_sequence_group * g = fixture.sched->get_group_from_id(1);
+        EXPECT_TRUE(g != nullptr);
+    }
+    const llama_sequence_group * g1 = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(g1 != nullptr);
+    EXPECT_EQ(g1->n_past, 49u);
+    EXPECT_EQ(g1->block_table.size(), (size_t) 4);
+}
+
 TEST(test_hybrid_decode_attaches_paged_ctx) {
     // The "hybrid DECODE gate pending" construction log was stale. Decode
     // already takes ggml_paged_attn (-> ggml_metal_op_paged_attn) when the
@@ -1653,6 +1769,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_dsv4_bookkeeping_id_space);
     RUN(test_two_named_children_batch_width_one);
     RUN(test_batch_width_cap_does_not_reject);
+    RUN(test_eight_named_waiters_first_admitted_completes);
+    RUN(test_unique_partial_block_grows_for_eighth_token);
     RUN(test_hybrid_decode_attaches_paged_ctx);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");

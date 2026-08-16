@@ -313,6 +313,9 @@ bool server_http_context::init(const common_params & params) {
         // +4 threads for monitoring, health and some threads reserved for MCP and other tasks in the future
         n_threads_http = std::max(params.n_parallel + 4, static_cast<int32_t>(std::thread::hardware_concurrency() - 1));
     }
+    // Not the product fix for 8 live /fork waiters starving the admitted
+    // child's tick. Decode must run on the queue worker (yield_to_queue),
+    // independent of how many HTTP handlers are blocked in recv.
     SRV_TRC("using %d threads for HTTP server\n", n_threads_http);
     srv->new_task_queue = [n_threads_http] {
         // spawn n_threads_http fixed thread (always alive), while allow up to 1024 max possible additional threads
