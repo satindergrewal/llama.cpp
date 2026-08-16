@@ -2355,22 +2355,36 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // --kv-paged used to be silently ignored for hybrid archs, booting a
                     // full-n_ctx static attention cache the user explicitly asked to avoid
                     // (measured: inkling 4M ctx = 48 GiB actual vs 19.5 GiB pool estimate
-                    // -> OOM). Refuse loudly unless DS4P_PAGED_HYBRID=1.
-                    // DS4P_PAGED_HYBRID=1: construct the paged attention pool inside the
-                    // hybrid wrapper. The graph consumer (build_attn_paged_or_null) and
-                    // scheduler discovery are live; decode uses ggml_paged_attn ->
-                    // ggml_metal_op_paged_attn when the scheduler has set batch info.
-                    // Still env-gated -- not a default-on family flip. The static attn
-                    // child is still allocated (reserve/warmup). Warmup STATIC on
-                    // interval-4 full-attn layers (3,7,11,...) is that reserve graph,
-                    // not decode falling back to a full static slab.
-                    static const bool paged_hybrid_dev = []() {
-                        const char * s = getenv("DS4P_PAGED_HYBRID");
-                        return s != nullptr && atoi(s) != 0;
-                    }();
+                    // -> OOM). Refuse loudly unless the paged pool will actually be built.
+                    //
+                    // Qwen3.5 / Qwen3.8 (LLM_ARCH_QWEN35 / QWEN35MOE): --kv-paged now
+                    // implies the hybrid paged pool. These are rewind-capable and have a
+                    // live graph consumer (build_attn_paged_or_null). Daily Qwen3.8 27B
+                    // should not need DS4P_PAGED_HYBRID=1.
+                    //
+                    // Not a family-wide default. Other hybrids (Jamba, Falcon-H1, Inkling,
+                    // Qwen3-Next, Nemotron-H, ...) have no paged consumer here -- turning
+                    // the env on for them would allocate a pool the graph never reads
+                    // (silent static). They still need DS4P_PAGED_HYBRID=1.
+                    // SWA (DS4P_PAGED_SWA) and MSA (DS4P_PAGED_MSA) gates are untouched.
+                    // DS4P_PAGED_HYBRID=0 keeps the loud refuse (no silent static).
+                    // The static attn child is still allocated (reserve/warmup). Warmup
+                    // STATIC on interval-4 full-attn layers (3,7,11,...) is that reserve
+                    // graph, not decode falling back to a full static slab.
+                    const char * paged_hybrid_env = getenv("DS4P_PAGED_HYBRID");
+                    const bool paged_hybrid_env_on =
+                        paged_hybrid_env != nullptr && atoi(paged_hybrid_env) != 0;
+                    const bool paged_hybrid_env_off =
+                        paged_hybrid_env != nullptr && atoi(paged_hybrid_env) == 0;
+                    const bool paged_hybrid_qwen_default =
+                        cparams.kv_paged &&
+                        !paged_hybrid_env_off &&
+                        (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+                    const bool paged_hybrid_dev = paged_hybrid_env_on || paged_hybrid_qwen_default;
                     if (cparams.kv_paged && !paged_hybrid_dev) {
-                        LLAMA_LOG_ERROR("%s: kv_paged is not yet supported for hybrid architectures; "
-                                "the attention cache would be a full-context static allocation, not a paged one\n", __func__);
+                        LLAMA_LOG_ERROR("%s: kv_paged is not yet supported for this hybrid architecture; "
+                                "the attention cache would be a full-context static allocation, not a paged one. "
+                                "Qwen3.5/3.8 pages by default under --kv-paged; other hybrids need DS4P_PAGED_HYBRID=1\n", __func__);
                     }
                     GGML_ASSERT((!cparams.kv_paged || paged_hybrid_dev) && "kv_paged is not yet supported for hybrid architectures");
 

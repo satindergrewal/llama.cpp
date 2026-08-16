@@ -94,8 +94,8 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
         LLAMA_LOG_ERROR(
             "%s: context does not have a paged KV cache: found %s. "
             "Pass --kv-paged (-kvp); if you did, this model's memory was built without a paged "
-            "attention pool (hybrid bring-up requires DS4P_PAGED_HYBRID=1; SWA archs such as "
-            "gemma3/llama4 are not wired yet).\n",
+            "attention pool (Qwen3.5/3.8 pages by default under --kv-paged; other hybrids need "
+            "DS4P_PAGED_HYBRID=1; SWA archs such as gemma3/llama4 need DS4P_PAGED_SWA=1).\n",
             __func__, kind);
         return nullptr;
     }

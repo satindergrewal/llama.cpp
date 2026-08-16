@@ -334,7 +334,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Qwen3.8-27B (64 layers, interval-4): full-attn at 3,7,11,...; the rest are
     // recurrent and never reach this function. Warmup STATIC on those attn
     // layers is the reserve graph (no paged batch info yet). Real decode with
-    // DS4P_PAGED_HYBRID=1 takes this paged op, not a full static attn slab.
+    // --kv-paged (Qwen3.5/3.8 default) takes this paged op, not a full static attn slab.
     cur = build_attn_paged_or_null(paged_ctx, Qcur, Kcur, Vcur, kq_scale, il);
     if (cur != nullptr) {
         cb(cur, "attn_pregate_paged", il);
