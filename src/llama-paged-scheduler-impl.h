@@ -140,9 +140,10 @@ class llama_paged_scheduler_impl {
     void set_waiting(llama_sequence_group_ptr group, bool prepend = false);
 
     void finish(llama_sequence_group & group);
-    // Mixed remap cannot get GPU without touching the master prefix:
-    // fail THIS child once (terminated_ids + FINISHED + finish).
-    // Do not GGML_ASSERT. Do not leave it RUNNING for the next tick.
+    // Mixed remap leftover still short after unique-suffix swap:
+    // requeue the waiter (HTTP live). Do not terminate / 500.
+    // fail_mixed_remap_once is a compatibility wrapper that queues.
+    void requeue_mixed_overflow(llama_sequence_group * group);
     void fail_mixed_remap_once(llama_sequence_group * group);
     // Keep the finished request's full-block prefix so later independent
     // arrivals can still SHARED-admit (vLLM APC). Not a radix tree.

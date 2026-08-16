@@ -497,15 +497,33 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
 }
 
 
-void llama_paged_scheduler_impl::fail_mixed_remap_once(llama_sequence_group * group) {
+void llama_paged_scheduler_impl::requeue_mixed_overflow(llama_sequence_group * group) {
     if (!group || group->status == llama_sequence_group_status::FINISHED) {
         return;
     }
-    LLAMA_LOG_ERROR("%s: DS4P-MIXED remap needs more GPU than can be freed without touching the master prefix (request %d)\n",
-                    __func__, group->request_id);
-    terminated_ids.push_back(group->request_id);
-    group->status = llama_sequence_group_status::FINISHED;
-    finish(*group);
+    // Overflow after unique-suffix swap: leftover still cannot admit.
+    // Keep HTTP live. A sibling RELEASE (or a later swap) grows leftover.
+    // Do not touch the named master prefix. Do not 500.
+    LLAMA_LOG_INFO("%s: DS4P-QUEUE mixed remap leftover short; waiter stays live (request %d)\n",
+                   __func__, group->request_id);
+    if (group->status == llama_sequence_group_status::WAITING) {
+        return;
+    }
+    for (auto it = running.begin(); it != running.end(); ++it) {
+        if (it->get() != group) {
+            continue;
+        }
+        llama_sequence_group_ptr ptr = std::move(*it);
+        running.erase(it);
+        // Arrival-sorted, not prepend: a younger sibling can run and RELEASE.
+        set_waiting(std::move(ptr), /*prepend=*/false);
+        return;
+    }
+}
+
+void llama_paged_scheduler_impl::fail_mixed_remap_once(llama_sequence_group * group) {
+    // 16c: overflow queues. A 500 here was the 16b hole (child05).
+    requeue_mixed_overflow(group);
 }
 
 void llama_paged_scheduler_impl::park_finished_prefix(llama_sequence_group & group) {
@@ -1131,18 +1149,33 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
         // demanded ~2x the blocks -- admission serialized every fat request (running=1
         // always in the starved walls) and eviction/recompute became unreachable.
         //
-        // Leftover GPU < this waiter's unique: swap the parked named hold's
-        // unref suffix first. Mixed allocate would succeed on CPU and then
-        // fail_mixed_remap when scratch < unique. Swap frees GPU without
-        // rewriting the master prefix or shortening the session.
+        // Leftover GPU < this waiter's unique: swap parked unref suffixes
+        // until leftover can admit, or nothing left to swap. If still short,
+        // leave this waiter queued and try a sibling -- do NOT fail_mixed / 500.
+        // Named master prefix is never rewritten (ref_cnt>1 is not swapped).
         {
             const uint32_t curr  = (uint32_t) group->block_table.size();
             const uint32_t total = group->n_prompt + group->n_decoded + 1;
             const uint32_t need  = block_size
                 ? (uint32_t) std::ceil((float) total / (float) block_size) - curr
                 : 0;
-            if (need > kv_cache_manager->n_scratch_gpu_blocks()) {
-                evict_held_prefix();
+            const uint32_t cpu_u = kv_cache_manager->count_cpu_unique(*group);
+            auto still_short = [&]() {
+                const uint32_t scratch = kv_cache_manager->n_scratch_gpu_blocks();
+                return (need > scratch) || (cpu_u > scratch);
+            };
+            while (still_short()) {
+                if (!evict_held_prefix()) {
+                    break;
+                }
+            }
+            if (still_short()) {
+                LLAMA_LOG_INFO("%s: DS4P-QUEUE request %d unique=%u cpu_u=%u scratch=%u; "
+                               "sibling may run (no fail_mixed)\n",
+                               __func__, group->request_id, need, cpu_u,
+                               kv_cache_manager->n_scratch_gpu_blocks());
+                ++it;
+                continue;
             }
         }
         bool success = kv_cache_manager->allocate(1, *group);
@@ -1263,8 +1296,10 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
                 max_need = need;
             }
         }
-        if (max_need > kv_cache_manager->n_scratch_gpu_blocks()) {
-            evict_held_prefix();
+        while (max_need > kv_cache_manager->n_scratch_gpu_blocks()) {
+            if (!evict_held_prefix()) {
+                break;
+            }
         }
         llama_sequence_group_raw_list fitted;
         fitted.reserve(candidates.size());
@@ -1273,7 +1308,7 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         for (auto * g : candidates) {
             const uint32_t need = kv_cache_manager->count_cpu_unique(*g);
             if (need > 0 && need > scratch_cap) {
-                fail_mixed_remap_once(g);
+                requeue_mixed_overflow(g);
                 continue;
             }
             if (need > 0 && scratch_acc + need > scratch_cap) {
@@ -1543,10 +1578,9 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
 
         // Kernel sees all-GPU ids. Stored table may stay mixed.
         llama_block_ids kernel_table;
-        if (!kv_cache_manager->prepare_mixed_decode(*group, kernel_table)) {
-            evict_held_prefix();
-            if (!kv_cache_manager->prepare_mixed_decode(*group, kernel_table)) {
-                fail_mixed_remap_once(group);
+        while (!kv_cache_manager->prepare_mixed_decode(*group, kernel_table)) {
+            if (!evict_held_prefix()) {
+                requeue_mixed_overflow(group);
                 llama_batch_free(batch);
                 batch.n_tokens = 0;
                 return;
