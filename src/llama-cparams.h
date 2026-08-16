@@ -7,10 +7,11 @@
 
 #define LLAMA_MAX_SEQ 256
 
-// Paged Qwen-class hybrid: a few live RS cells so two/three mid-work
-// children can COW. Not LLAMA_MAX_SEQ (that is ~37 GiB on Qwen3.8).
-// Sequential check-in still works with 1 cell. This is a slot wall.
-#define LLAMA_HYBRID_RS_CELLS_PAGED 4
+// Paged Qwen-class hybrid: live RS cells so mid-work occupancy can
+// pass the 3-live hold wall. Not LLAMA_MAX_SEQ (that is ~37 GiB on
+// Qwen3.8). Sequential check-in still reuses a freed child cell.
+// Last cell is the named-prefix hold (see server-context).
+#define LLAMA_HYBRID_RS_CELLS_PAGED 24
 
 inline uint32_t llama_hybrid_rs_size(uint32_t n_seq_max, bool kv_paged) {
     const uint32_t base = n_seq_max > 0 ? n_seq_max : 1u;
