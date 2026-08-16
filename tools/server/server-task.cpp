@@ -1786,7 +1786,8 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft,
+                                                       const std::string & session_id) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1817,6 +1818,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (len == (int) it->prompt.tokens.size()) {
+            // Same-session grow may replace a shorter pinned prefix.
+            // Other named/held prefixes stay.
+            if (it->pinned && (session_id.empty() || it->session_id != session_id)) {
+                ++it;
+                continue;
+            }
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1825,14 +1832,28 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    auto evict_oldest_unpinned = [&]() -> bool {
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->pinned) {
+                continue;
+            }
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    it->size() / (1024.0 * 1024.0));
+            server_kv_bank::instance().spill(*it);
+            states.erase(it);
+            return true;
+        }
+        return false;
+    };
+
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            server_kv_bank::instance().spill(states.front());
-            states.pop_front();
+            if (!evict_oldest_unpinned()) {
+                SRV_WRN(" - cannot evict pinned named/held prefix to make room (need %.3f MiB), skipping\n",
+                        state_size_new / (1024.0 * 1024.0));
+                return nullptr;
+            }
         }
     }
 
@@ -1865,6 +1886,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.drft =*/ std::move(state_data_dft),
         },
     });
+
+    if (!session_id.empty()) {
+        states.back().pinned     = true;
+        states.back().session_id = session_id;
+        SRV_TRC(" - pinned named/held prefix session '%s' (%d tokens)\n",
+                session_id.c_str(), (int) prompt.n_tokens());
+    }
 
     return &states.back();
 }
@@ -1954,43 +1982,66 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             SRV_TRC(" - reval load OK (loads=%llu)\n", (unsigned long long) n_reval_loads);
         }
 
-        {
-            auto & data = it_best->data.main;
+        const bool keep_pinned = it_best->pinned;
 
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+        {
+            std::vector<uint8_t> tmp;
+            const uint8_t * p = it_best->data.main.data();
+            size_t size = it_best->data.main.size();
+            if (keep_pinned) {
+                tmp = it_best->data.main;
+                p = tmp.data();
+                size = tmp.size();
+            }
+
+            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, p, size, id_slot, 0);
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            if (!keep_pinned) {
+                it_best->data.main.clear();
+                it_best->data.main.shrink_to_fit();
+            }
         }
 
         {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
+            if (!it_best->data.drft.empty()) {
                 GGML_ASSERT(ctx_dft);
 
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
+                std::vector<uint8_t> tmp;
+                const uint8_t * p = it_best->data.drft.data();
+                size_t size = it_best->data.drft.size();
+                if (keep_pinned) {
+                    tmp = it_best->data.drft;
+                    p = tmp.data();
+                    size = tmp.size();
+                }
+
+                const size_t n = llama_state_seq_set_data_ext(ctx_dft, p, size, id_slot, 0);
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                if (!keep_pinned) {
+                    it_best->data.drft.clear();
+                    it_best->data.drft.shrink_to_fit();
+                }
             }
         }
 
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
+        if (keep_pinned) {
+            prompt = it_best->prompt.clone();
+            SRV_TRC(" - kept pinned named/held prefix session '%s'\n",
+                    it_best->session_id.c_str());
+        } else {
+            prompt = std::move(it_best->prompt);
+            states.erase(it_best);
+        }
 
         if (t_admit_start >= 0) {
             server_kv_bank::instance().note_restore(admit_bytes,
@@ -2002,12 +2053,26 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
+    auto evict_oldest_unpinned = [&](const char * why) -> bool {
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->pinned) {
+                continue;
+            }
+            SRV_WRN(" - %s, removing oldest entry (size = %.3f MiB)\n",
+                    why, it->size() / (1024.0 * 1024.0));
+            server_kv_bank::instance().spill(*it);
+            states.erase(it);
+            return true;
+        }
+        SRV_WRN(" - %s, but only pinned named/held prefixes remain; keeping them\n", why);
+        return false;
+    };
+
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            server_kv_bank::instance().spill(states.front());
-            states.pop_front();
+            if (!evict_oldest_unpinned("cache size limit reached")) {
+                break;
+            }
         }
     }
 
@@ -2019,11 +2084,9 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-
-            server_kv_bank::instance().spill(states.front());
-            states.pop_front();
+            if (!evict_oldest_unpinned("cache token limit reached")) {
+                break;
+            }
         }
     }
 

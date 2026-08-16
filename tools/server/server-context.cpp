@@ -346,7 +346,14 @@ struct server_slot {
             }
         }
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        const std::string * sid = nullptr;
+        if (task && !task->params.session_id.empty()) {
+            sid = &task->params.session_id;
+        } else if (task_prev && !task_prev->params.session_id.empty()) {
+            sid = &task_prev->params.session_id;
+        }
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft,
+                                        sid ? *sid : std::string());
         if (cur == nullptr) {
             return false;
         }
