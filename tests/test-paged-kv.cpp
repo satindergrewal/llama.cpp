@@ -1180,7 +1180,14 @@ TEST(test_named_hold_overflow_queues_not_fail_mixed) {
         const llama_sequence_group * c = fixture.sched->get_group_from_id(id);
         EXPECT_TRUE(c != nullptr);
         EXPECT_TRUE(c->n_past == 64u);
-        EXPECT_TRUE(c->block_table.size() == 4u);
+        EXPECT_TRUE(c->block_table.size() >= 4u);
+        // First child is the would-be runner: unique still via allocate().
+        // Later waiters reserve unique on CPU at enqueue.
+        if (id == 1) {
+            EXPECT_TRUE(c->block_table.size() == 4u);
+        } else {
+            EXPECT_TRUE(fixture.kv->count_cpu_unique(*c) > 0);
+        }
     }
 
     bool child1_running = false;
@@ -1622,6 +1629,68 @@ TEST(test_eight_named_waiters_first_admitted_completes) {
     EXPECT_TRUE(fixture.sched->get_group_from_id(next_id) != nullptr);
 }
 
+TEST(test_waiter_unique_reserved_on_cpu_while_decode_live) {
+    // 2holdc hole: at n_seq_max_batch=1, process_waiting_list is skipped
+    // once a decode is live. The second forked child must reserve unique
+    // on CPU at enqueue so unique is stacked while the runner keeps GPU
+    // leftover. Do not steal GPU. Do not 500.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/16, /*n_cpu_blocks=*/8,
+                                /*n_seq_max_batch=*/1);
+    fixture.sched->set_hybrid(true);
+    fixture.sched->set_has_recurrent_state(true);
+    fixture.sched->set_supports_rs_rollback(true);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+
+    llama_sequence_group child1 = make_group(/*id=*/1, /*n_prompt=*/40);
+    for (size_t i = 32; i < child1.logical_seq.size(); ++i) {
+        child1.logical_seq[i] = 2;
+    }
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(std::move(child1), "master"));
+
+    bool runner_live = false;
+    for (int step = 0; step < 8 && !runner_live; ++step) {
+        EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+        const llama_sequence_group * r = fixture.sched->get_group_from_id(1);
+        EXPECT_TRUE(r != nullptr);
+        if (r->status == llama_sequence_group_status::RUNNING) {
+            runner_live = true;
+            break;
+        }
+        const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+        if (info && info->n_seq >= 1) {
+            std::vector<llama_token> toks((size_t) info->n_seq, 1);
+            std::vector<int8_t>      stop((size_t) info->n_seq, 0);
+            fixture.sched->update(batch, toks, stop.data(), nullptr);
+        }
+    }
+    EXPECT_TRUE(runner_live);
+    const llama_sequence_group * runner = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(runner != nullptr);
+    EXPECT_TRUE(runner->status == llama_sequence_group_status::RUNNING);
+    const uint32_t gpu_before = fixture.kv->n_scratch_gpu_blocks();
+
+    llama_sequence_group child2 = make_group(/*id=*/2, /*n_prompt=*/40);
+    for (size_t i = 32; i < child2.logical_seq.size(); ++i) {
+        child2.logical_seq[i] = 3;
+    }
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(std::move(child2), "master"));
+    const llama_sequence_group * w = fixture.sched->get_group_from_id(2);
+    EXPECT_TRUE(w != nullptr);
+    EXPECT_TRUE(w->status == llama_sequence_group_status::WAITING);
+    EXPECT_TRUE(w->n_past == 32u);
+    EXPECT_TRUE(fixture.kv->count_cpu_unique(*w) > 0);
+    EXPECT_TRUE(fixture.kv->n_scratch_gpu_blocks() == gpu_before);
+    runner = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(runner != nullptr);
+    EXPECT_TRUE(runner->status == llama_sequence_group_status::RUNNING);
+}
+
 TEST(test_unique_partial_block_grows_for_eighth_token) {
     // 8q2 measured: 137 unique (9 blocks) + n_predict=8 needs a 10th
     // block (145 > 9*16). n_predict=7 fits and returns. Same shape,
@@ -1804,6 +1873,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_two_named_children_batch_width_one);
     RUN(test_batch_width_cap_does_not_reject);
     RUN(test_eight_named_waiters_first_admitted_completes);
+    RUN(test_waiter_unique_reserved_on_cpu_while_decode_live);
     RUN(test_unique_partial_block_grows_for_eighth_token);
     RUN(test_hybrid_decode_attaches_paged_ctx);
 

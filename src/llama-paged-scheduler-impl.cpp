@@ -346,6 +346,21 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
         }
     }
 
+    // 2holdc hole: at -np 1, step() skips process_waiting_list once the
+    // decode cap is full, so allocate() never runs for a waiter and
+    // unique is not reserved until the runner RELEASE. If someone is
+    // already ahead (running or waiting), reserve this group's unique
+    // tail on CPU now. Do not take GPU leftover from the runner.
+    // If CPU leftover cannot hold it, stay waiting -- do not 500.
+    if (kv_cache_manager != nullptr && !group.block_table.empty() &&
+        (!running.empty() || !waiting.empty())) {
+        if (!kv_cache_manager->reserve_unique_cpu(group)) {
+            LLAMA_LOG_INFO("%s: DS4P-QUEUE request %d unique CPU leftover short; "
+                           "waiter stays live (no GPU steal)\n",
+                           __func__, group.request_id);
+        }
+    }
+
     auto group_ptr = std::make_unique<llama_sequence_group>(std::move(group));
 
     id_to_group[group_ptr->request_id] = group_ptr.get();

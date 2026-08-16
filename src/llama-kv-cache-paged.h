@@ -41,6 +41,10 @@ class llama_kv_cache_paged : public llama_memory_i {
               float          watermark);  // percentage
 
     bool allocate(int32_t num_tokens, llama_sequence_group & group);
+    // Waiter unique tail at enqueue: CPU only. Never GPU leftover
+    // (that belongs to the live decode at -np 1). true if nothing
+    // needed or reserved; false if CPU leftover cannot hold it.
+    bool reserve_unique_cpu(llama_sequence_group & group);
     void free_blocks(llama_sequence_group & group);
 
     // P1-6 COW fork: point dst at src's blocks for the shared prefix and take a reference

@@ -419,6 +419,39 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
     return false;
 }
 
+bool llama_kv_cache_paged::reserve_unique_cpu(llama_sequence_group & group) {
+    // Inherited prefix only. A cold empty table is not a unique tail --
+    // parking the whole prompt on CPU would force a full remap later.
+    if (group.block_table.empty() || block_size == 0) {
+        return true;
+    }
+    const uint32_t curr  = (uint32_t) group.block_table.size();
+    const uint32_t total = group.n_prompt + group.n_decoded + 1;
+    const uint32_t need_total = (uint32_t) std::ceil((float) total / (float) block_size);
+    if (curr >= need_total) {
+        return true;
+    }
+    const uint32_t need = need_total - curr;
+    const size_t   cpu_free_before = block_manager.n_free_cpu_blocks();
+    if (!block_manager.has_free_cpu_blocks(need)) {
+        return false;
+    }
+    llama_block_ids new_ids = block_manager.checkout_cpu_blocks(need);
+    if (new_ids.size() != (size_t) need) {
+        return false;
+    }
+    concat_block_ids(group.block_table, new_ids);
+    note_seq_blocks(group);
+    // Same ledger family as GPU checkout so a waiter unique is visible
+    // before the runner RELEASE. CPU free_before -- not GPU leftover.
+    LLAMA_LOG_ERROR("DS4P-CHECKOUT enqueue-cpu-unique n=%u free_before=%zu request=%d\n",
+                    need, cpu_free_before, group.request_id);
+    LLAMA_LOG_INFO("%s: reserved waiter unique on CPU: %u block(s) "
+                   "(prefix stays, no GPU steal, table=%zu)\n",
+                   __func__, need, group.block_table.size());
+    return true;
+}
+
 uint32_t llama_kv_cache_paged::count_cpu_unique(const llama_sequence_group & group) const {
     uint32_t n = 0;
     for (uint32_t id : group.block_table) {
