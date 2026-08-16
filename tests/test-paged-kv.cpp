@@ -959,7 +959,91 @@ TEST(test_mixed_table_child_admits_when_gpu_full) {
     }
 }
 
- TEST(test_mixed_remap_fail_once_does_not_spin) {
+ 
+TEST(test_named_hold_swap_unref_suffix_admits_child) {
+    // Cheap bookkeeping only -- not the Qwen 8k HTTP proof.
+    // Named hold parks 6 GPU blocks (96 tokens). Leftover GPU = 2.
+    // Child inherits 64 tokens / 4 blocks and needs 3 unique:
+    // leftover 2 < 3 <= leftover+tail 4, so swap must fire.
+    // Prefix GPU ids stay. Session is not shortened.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/8, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/96)));
+    llama_batch batch = {};
+    for (int i = 0; i < 4; ++i) {
+        const llama_sequence_group * m = fixture.sched->get_group_from_id(0);
+        if (!m || m->n_past >= 96) {
+            break;
+        }
+        prefill_one_chunk(fixture, batch);
+    }
+    const llama_sequence_group * master = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(master != nullptr);
+    EXPECT_TRUE(master->n_past >= 96);
+
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+    const int32_t hold_id = fixture.sched->session_request_id("master");
+    const size_t  N       = fixture.sched->held_prefix_n_blocks(hold_id);
+    EXPECT_TRUE(N == 6u);
+
+    const llama_block_ids * hold_bl = fixture.kv->get_sequence_blocks(hold_id);
+    EXPECT_TRUE(hold_bl != nullptr && hold_bl->size() == 6);
+    std::vector<uint32_t> prefix_before(hold_bl->begin(), hold_bl->begin() + 4);
+    for (uint32_t id : prefix_before) {
+        EXPECT_TRUE(fixture.kv->is_gpu_block(id));
+    }
+    EXPECT_TRUE(fixture.kv->is_gpu_block((*hold_bl)[4]));
+    EXPECT_TRUE(fixture.kv->is_gpu_block((*hold_bl)[5]));
+
+    llama_sequence_group child = make_group(/*id=*/1, /*n_prompt=*/96);
+    for (size_t i = 64; i < child.logical_seq.size(); ++i) {
+        child.logical_seq[i] = 2;
+    }
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(std::move(child), "master"));
+    const llama_sequence_group * c0 = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(c0 != nullptr);
+    EXPECT_TRUE(c0->n_past == 64u);
+    EXPECT_TRUE(c0->block_table.size() == 4u);
+
+    bool admitted = false;
+    for (int step = 0; step < 8; ++step) {
+        EXPECT_TRUE(fixture.sched->step(batch) != llama_scheduler_status::DEADLOCK);
+        EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+        EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
+        const llama_sequence_group * c = fixture.sched->get_group_from_id(1);
+        EXPECT_TRUE(c != nullptr);
+        EXPECT_TRUE(c->status != llama_sequence_group_status::SWAPPED);
+        if (c->status == llama_sequence_group_status::RUNNING) {
+            admitted = true;
+            break;
+        }
+        if (batch.n_tokens > 0) {
+            const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+            if (info && info->n_seq >= 1) {
+                std::vector<llama_token> toks((size_t) info->n_seq, 1);
+                std::vector<int8_t>      stop((size_t) info->n_seq, 0);
+                fixture.sched->update(batch, toks, stop.data(), nullptr);
+            }
+        }
+    }
+    EXPECT_TRUE(admitted);
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+    EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
+
+    hold_bl = fixture.kv->get_sequence_blocks(hold_id);
+    EXPECT_TRUE(hold_bl != nullptr && hold_bl->size() == 6);
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_TRUE((*hold_bl)[i] == prefix_before[i]);
+        EXPECT_TRUE(fixture.kv->is_gpu_block((*hold_bl)[i]));
+    }
+    EXPECT_TRUE(!fixture.kv->is_gpu_block((*hold_bl)[4]));
+    EXPECT_TRUE(!fixture.kv->is_gpu_block((*hold_bl)[5]));
+}
+
+TEST(test_mixed_remap_fail_once_does_not_spin) {
     // 4 GPU, watermark 0. Master prompt 48 fits (allocate wants 49 -> 4 blocks).
     // Park keeps 3 full GPU blocks. Child inherits 48 and needs 2 unique;
     // 1 leftover GPU is not enough so unique is CPU. Remap need=2 > scratch=1
@@ -1416,6 +1500,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_named_master_not_eviction_victim);
     RUN(test_named_master_full_gpu_children_wait_not_cpu_swap);
     RUN(test_mixed_table_child_admits_when_gpu_full);
+    RUN(test_named_hold_swap_unref_suffix_admits_child);
     RUN(test_mixed_remap_fail_once_does_not_spin);
     RUN(test_session_close_keeps_child_refs);
     RUN(test_session_omitted_is_noop);

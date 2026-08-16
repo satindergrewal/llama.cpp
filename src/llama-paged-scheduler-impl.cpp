@@ -937,7 +937,7 @@ bool llama_paged_scheduler_impl::evict() {
     if (best == running.end()) {
         LLAMA_LOG_DEBUG("%s: no unref-tail victim (master prefix stays).\n", __func__);
         // Non-session parked unique suffix next. Named session holds
-        // are skipped inside evict_held_prefix -- queue the child.
+        // swap their unref GPU suffix inside evict_held_prefix.
         return evict_held_prefix();
     }
 
@@ -1130,6 +1130,21 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
         // DELTA only: passing tokens_needed (= n_prompt+1) double-counted the prompt and
         // demanded ~2x the blocks -- admission serialized every fat request (running=1
         // always in the starved walls) and eviction/recompute became unreachable.
+        //
+        // Leftover GPU < this waiter's unique: swap the parked named hold's
+        // unref suffix first. Mixed allocate would succeed on CPU and then
+        // fail_mixed_remap when scratch < unique. Swap frees GPU without
+        // rewriting the master prefix or shortening the session.
+        {
+            const uint32_t curr  = (uint32_t) group->block_table.size();
+            const uint32_t total = group->n_prompt + group->n_decoded + 1;
+            const uint32_t need  = block_size
+                ? (uint32_t) std::ceil((float) total / (float) block_size) - curr
+                : 0;
+            if (need > kv_cache_manager->n_scratch_gpu_blocks()) {
+                evict_held_prefix();
+            }
+        }
         bool success = kv_cache_manager->allocate(1, *group);
         if (!success) {
             // vLLM PREEMPT: free an unref tail so this waiter can start. If the

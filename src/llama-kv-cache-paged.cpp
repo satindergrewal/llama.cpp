@@ -690,9 +690,9 @@ uint32_t llama_kv_cache_paged::swap_out_unref_suffix(llama_sequence_group & grou
     block_manager.release_gpu_blocks(gpu_src);
     note_seq_blocks(group);
 
-    LLAMA_LOG_INFO("%s: DS4P-SWAP unique-suffix GPU->CPU: %zu blocks "
-                   "(session not shortened, n_past=%u table=%zu)\n",
-                   __func__, gpu_src.size(), group.n_past, group.block_table.size());
+    LLAMA_LOG_ERROR("%s: DS4P-SWAP unique-suffix GPU->CPU: %zu blocks "
+                    "(session not shortened, n_past=%u table=%zu)\n",
+                    __func__, gpu_src.size(), group.n_past, group.block_table.size());
     return (uint32_t) gpu_src.size();
 }
 
