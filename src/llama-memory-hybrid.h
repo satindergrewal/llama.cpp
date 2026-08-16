@@ -96,6 +96,8 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    uint32_t n_rs_cells() const override { return mem_recr ? mem_recr->size : 0; }
+
 private:
     const llama_hparams & hparams;
 

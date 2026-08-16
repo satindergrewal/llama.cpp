@@ -120,6 +120,9 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // Recurrent-state cell count. 0 if this memory has no RS.
+    virtual uint32_t n_rs_cells() const { return 0; }
+
     //
     // ops
     //

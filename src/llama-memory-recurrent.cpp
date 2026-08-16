@@ -33,7 +33,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     used = 0;
 
     this->n_rs_seq = n_rs_seq;
-    rs_idx.assign(n_seq_max, 0);
+    rs_idx.assign(std::max(n_seq_max, mem_size), 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -554,15 +554,19 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     }
 #endif
 
-    // find next empty cell
-    uint32_t next_empty_cell = head;
+    auto find_empty = [&](uint32_t start) -> int32_t {
+        uint32_t i = start;
+        for (uint32_t n = 0; n < size; ++n) {
+            if (i >= size) { i -= size; }
+            if (cells[i].is_empty()) {
+                return (int32_t) i;
+            }
+            i += 1;
+        }
+        return -1;
+    };
 
-    for (uint32_t i = 0; i < size; ++i) {
-        if (next_empty_cell >= size) { next_empty_cell -= size; }
-        auto & cell = cells[next_empty_cell];
-        if (cell.is_empty()) { break; }
-        next_empty_cell += 1;
-    }
+    int32_t next_empty_cell = find_empty(head);
 
     // find usable cell range
     for (uint32_t s = 0; s < n_seqs; ++s) {
@@ -577,8 +581,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             if (cell.seq_id.size() == 1) { has_cell = true; }
         }
         if (!has_cell) {
+            if (next_empty_cell < 0) {
+                LLAMA_LOG_ERROR("%s: no empty RS cell for COW (rs_size=%u used=%u)\n",
+                                __func__, size, used);
+                return false;
+            }
             auto & empty_cell = cells[next_empty_cell];
-            GGML_ASSERT(empty_cell.is_empty());
             // copy old tail into the empty cell
             if (seq_meta.tail >= 0) {
                 auto & orig_cell = cells[seq_meta.tail];
@@ -589,14 +597,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
             }
             seq_meta.tail = next_empty_cell;
-            // find next empty cell
             if (s + 1 < n_seqs) {
-                for (uint32_t j = 0; j < size; ++j) {
-                    next_empty_cell += 1;
-                    if (next_empty_cell >= size) { next_empty_cell -= size; }
-                    auto & cell = cells[next_empty_cell];
-                    if (cell.is_empty()) { break; }
-                }
+                next_empty_cell = find_empty((uint32_t) next_empty_cell + 1);
             }
         }
         if (min > seq_meta.tail) { min = seq_meta.tail; }

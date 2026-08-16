@@ -3963,6 +3963,11 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
 }
 
+uint32_t llama_n_rs_size(const llama_context * ctx) {
+    llama_memory_i * mem = ctx->get_memory();
+    return mem ? mem->n_rs_cells() : 0;
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }

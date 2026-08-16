@@ -3,6 +3,7 @@
 #include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-paged.h"
 #include "llama-paged-scheduler-impl.h"
+#include "llama-cparams.h"
 
 #include <cassert>
 #include <cstdio>
@@ -993,6 +994,17 @@ TEST(test_named_fork_n_past_is_http_cache_n) {
     EXPECT_TRUE(!child->block_table.empty());
 }
 
+TEST(test_hybrid_rs_few_live_cells) {
+    // 4 cells, not 256. Sequential check-in reuses a freed cell.
+    // Two overlapping children need a prefix hold + two tails.
+    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/1, /*kv_paged=*/false), 1u);
+    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/1, /*kv_paged=*/true), 4u);
+    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/2, /*kv_paged=*/true), 4u);
+    EXPECT_EQ(llama_hybrid_rs_size(/*n_seq_max=*/8, /*kv_paged=*/true), 8u);
+    EXPECT_TRUE(LLAMA_HYBRID_RS_CELLS_PAGED == 4);
+    EXPECT_TRUE(LLAMA_HYBRID_RS_CELLS_PAGED < LLAMA_MAX_SEQ);
+}
+
 TEST(test_dsv4_bookkeeping_id_space) {
     // DSV4 cache cannot be constructed without weights. The helper is the
     // contract: n_seq_max is batch width; after grow_paged_slot, ids 0 and 1
@@ -1154,6 +1166,8 @@ TEST(test_hybrid_decode_attaches_paged_ctx) {
 }
 
 int main(int /*argc*/, char ** /*argv*/) {
+    fprintf(stderr, "test-paged-kv: hybrid RS few live cells\n");
+    RUN(test_hybrid_rs_few_live_cells);
     fprintf(stderr, "test-paged-kv: block_manager\n");
     RUN(test_block_manager_leak_simple);
     RUN(test_block_manager_leak_repeated);

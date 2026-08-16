@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <unordered_map>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -968,6 +969,10 @@ private:
     // params.kv_paged -- the static slot path is byte-untouched without it
     llama_paged_scheduler * paged_sched = nullptr;
 
+    // Few live hybrid RS cells: last cell is the named-prefix hold.
+    // Sequential check-in reuses a freed child cell. Not 256.
+    std::unordered_map<std::string, int> session_rs_src;
+    std::string hybrid_rs_hold_session;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1776,10 +1781,21 @@ private:
         // just wait for the live slot.
         if (ctx_tgt && id >= (int) llama_n_seq_max(ctx_tgt) &&
             ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
-            SRV_INF("paged: not growing slot id=%d past n_seq_max=%u "
-                    "(seq_rm_type=%d); deferring the waiter\n",
-                    id, llama_n_seq_max(ctx_tgt), (int) ctx_tgt_seq_rm_type);
-            return nullptr;
+            const uint32_t rs_cells = llama_n_rs_size(ctx_tgt);
+            // Reserve the last RS cell as the named-prefix hold so a child
+            // can COW without overwriting the master. Still a slot wall.
+            const int rs_slots = rs_cells > 1 ? (int) rs_cells - 1 : 0;
+            if (rs_slots > 0 && id < rs_slots) {
+                SRV_INF("paged: growing slot id=%d into few live RS cells "
+                        "(rs_size=%u hold=%d); -np stays batch width\n",
+                        id, rs_cells, (int) rs_cells - 1);
+            } else {
+                SRV_INF("paged: not growing slot id=%d past n_seq_max=%u "
+                        "(seq_rm_type=%d rs_size=%u); deferring the waiter\n",
+                        id, llama_n_seq_max(ctx_tgt), (int) ctx_tgt_seq_rm_type,
+                        rs_cells);
+                return nullptr;
+            }
         }
         slots.emplace_back();
         setup_slot(slots.back(), id);
@@ -1995,7 +2011,37 @@ private:
         // halves. This is the two-ledgers class again: the paged manager's bookkeeping and the context's
         // memory module are separate, and only one of them was being maintained.
         if (params_base.kv_paged) {
+            const uint32_t rs_cells = ctx_tgt ? llama_n_rs_size(ctx_tgt) : 0;
+            const bool named_fork = !task.params.parent_session_id.empty();
+            if (named_fork && rs_cells >= 2) {
+                const llama_seq_id hold = (llama_seq_id) (rs_cells - 1);
+                const std::string & psid = task.params.parent_session_id;
+                auto it = session_rs_src.find(psid);
+                // Unknown parent: do not touch the prefix hold. 400 later.
+                if (it != session_rs_src.end()) {
+                    const int src = it->second;
+                    if (hybrid_rs_hold_session != psid) {
+                        if (!hybrid_rs_hold_session.empty()) {
+                            slot.mem.seq_rm(hold, -1, -1);
+                        }
+                        if (src != hold) {
+                            slot.mem.seq_cp(src, hold, -1, -1);
+                        }
+                        hybrid_rs_hold_session = psid;
+                        SRV_INF("paged: froze hybrid RS prefix on hold seq %d "
+                                "from src %d for session %s (rs_size=%u)\n",
+                                (int) hold, src, psid.c_str(), rs_cells);
+                    }
+                }
+            }
             slot.prompt_clear();
+            if (named_fork && rs_cells >= 2 &&
+                hybrid_rs_hold_session == task.params.parent_session_id) {
+                const llama_seq_id hold = (llama_seq_id) (rs_cells - 1);
+                if (slot.id != hold) {
+                    slot.mem.seq_cp(hold, slot.id, -1, -1);
+                }
+            }
         }
 
         // process per-request lora adapters
@@ -2240,6 +2286,8 @@ private:
                                                         slot.id)) {
                     SLT_WRN(slot, "paged: session_id '%s' bind failed (request still queued)\n",
                             slot.task->params.session_id.c_str());
+                } else {
+                    session_rs_src[slot.task->params.session_id] = slot.id;
                 }
             }
             // the scheduler owns prefill, so the classic SLOT_STATE_STARTED site that
