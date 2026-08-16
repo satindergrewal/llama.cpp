@@ -140,6 +140,10 @@ class llama_paged_scheduler_impl {
     void set_waiting(llama_sequence_group_ptr group, bool prepend = false);
 
     void finish(llama_sequence_group & group);
+    // Mixed remap cannot get GPU without touching the master prefix:
+    // fail THIS child once (terminated_ids + FINISHED + finish).
+    // Do not GGML_ASSERT. Do not leave it RUNNING for the next tick.
+    void fail_mixed_remap_once(llama_sequence_group * group);
     // Keep the finished request's full-block prefix so later independent
     // arrivals can still SHARED-admit (vLLM APC). Not a radix tree.
     // A named session with n_past > 0 but n_full == 0 still parks a

@@ -482,6 +482,18 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
     }
 }
 
+
+void llama_paged_scheduler_impl::fail_mixed_remap_once(llama_sequence_group * group) {
+    if (!group || group->status == llama_sequence_group_status::FINISHED) {
+        return;
+    }
+    LLAMA_LOG_ERROR("%s: DS4P-MIXED remap needs more GPU than can be freed without touching the master prefix (request %d)\n",
+                    __func__, group->request_id);
+    terminated_ids.push_back(group->request_id);
+    group->status = llama_sequence_group_status::FINISHED;
+    finish(*group);
+}
+
 void llama_paged_scheduler_impl::park_finished_prefix(llama_sequence_group & group) {
     if (!kv_cache_manager) {
         return;
@@ -1231,6 +1243,10 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         const uint32_t scratch_cap = kv_cache_manager->n_scratch_gpu_blocks();
         for (auto * g : candidates) {
             const uint32_t need = kv_cache_manager->count_cpu_unique(*g);
+            if (need > 0 && need > scratch_cap) {
+                fail_mixed_remap_once(g);
+                continue;
+            }
             if (need > 0 && scratch_acc + need > scratch_cap) {
                 LLAMA_LOG_DEBUG("%s: request %d deferred (mixed unique %u, scratch left %u)\n",
                                 __func__, g->request_id, need,
@@ -1242,7 +1258,6 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         }
         candidates.swap(fitted);
         if (candidates.empty()) {
-            LLAMA_LOG_ERROR("%s: DS4P-MIXED remap needs more GPU than can be freed without touching the master prefix\n", __func__);
             batch.n_tokens = 0;
             return;
         }
@@ -1502,8 +1517,10 @@ void llama_paged_scheduler_impl::populate_batch_from(llama_sequence_group_raw_li
         if (!kv_cache_manager->prepare_mixed_decode(*group, kernel_table)) {
             evict_held_prefix();
             if (!kv_cache_manager->prepare_mixed_decode(*group, kernel_table)) {
-                LLAMA_LOG_ERROR("%s: DS4P-MIXED remap needs more GPU than can be freed without touching the master prefix\n", __func__);
-                GGML_ASSERT(false && "mixed-table remap needs more GPU than can be freed without touching the master prefix");
+                fail_mixed_remap_once(group);
+                llama_batch_free(batch);
+                batch.n_tokens = 0;
+                return;
             }
         }
 
