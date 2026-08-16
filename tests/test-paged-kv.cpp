@@ -693,6 +693,38 @@ TEST(test_named_session_grow_same_prefix) {
     EXPECT_TRUE(g->n_past > past_before);
 }
 
+TEST(test_named_session_grow_finish_stays_resolvable) {
+    // 8q3 hole: grow a named prefix, finish/RELEASE, session must still
+    // resolve. A child must inherit the parked prefix (not session-not-found).
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/64)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0)->n_past >= 64);
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/0));
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+    EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/1, /*n_prompt=*/80)));
+    EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/1));
+    prefill_one_chunk(fixture, batch);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(1) != nullptr);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(1)->n_past >= 64);
+    EXPECT_TRUE(fixture.sched->abort_request(1));
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+    EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
+
+    EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/2, /*n_prompt=*/72),
+                                                         "master"));
+    const llama_sequence_group * child = fixture.sched->get_group_from_id(2);
+    EXPECT_TRUE(child != nullptr);
+    EXPECT_TRUE(child->n_past >= 64);
+    EXPECT_TRUE(fixture.sched->has_session("master"));
+}
+
 TEST(test_named_master_not_eviction_victim) {
     // Named/held session prefix must not be shortened to admit a child.
     // Victim selection prefers unref child tails / non-session holds.
@@ -1751,6 +1783,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_finished_prefix_survives_for_children);
     RUN(test_session_fork_live_and_parked);
     RUN(test_named_session_grow_same_prefix);
+    RUN(test_named_session_grow_finish_stays_resolvable);
     RUN(test_named_master_not_eviction_victim);
     RUN(test_named_master_full_gpu_children_wait_not_cpu_swap);
     RUN(test_mixed_table_child_admits_when_gpu_full);

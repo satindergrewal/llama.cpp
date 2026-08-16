@@ -1902,9 +1902,11 @@ void llama_paged_scheduler_impl::rebind_session_after_finish(const llama_sequenc
 
     const uint32_t n_full = block_size ? (group.n_past / block_size) * block_size : 0;
     const uint32_t n_keep = std::min(group.n_past, (uint32_t) group.logical_seq.size());
-    const uint32_t n_cmp  = n_full > 0 ? n_full : n_keep;
-    int32_t        hold_id = 0;
-    if (n_cmp > 0 && group.logical_seq.size() >= n_cmp) {
+
+    auto find_hold = [&](uint32_t n_cmp) -> int32_t {
+        if (n_cmp == 0 || group.logical_seq.size() < n_cmp) {
+            return 0;
+        }
         for (const auto & h : held_prefixes) {
             if (!h || h->logical_seq.size() < n_cmp) {
                 continue;
@@ -1917,10 +1919,48 @@ void llama_paged_scheduler_impl::rebind_session_after_finish(const llama_sequenc
                 }
             }
             if (match) {
-                hold_id = h->request_id;
-                break;
+                return h->request_id;
             }
         }
+        return 0;
+    };
+
+    // Grow finish n_past may exceed the parked 8k hold. Prefer n_full, then
+    // n_keep, then the longest matching hold. Never erase a named session:
+    // that is the 8q3 400 (queue_forked_from_session not found after RELEASE).
+    int32_t hold_id = n_full > 0 ? find_hold(n_full) : 0;
+    if (hold_id == 0 && n_keep > 0) {
+        hold_id = find_hold(n_keep);
+    }
+    if (hold_id == 0 && n_keep > 0 && !group.logical_seq.empty()) {
+        size_t best = 0;
+        for (const auto & h : held_prefixes) {
+            if (!h || h->logical_seq.empty()) {
+                continue;
+            }
+            const size_t lim = std::min({h->logical_seq.size(), group.logical_seq.size(), (size_t) n_keep});
+            size_t n = 0;
+            while (n < lim && h->logical_seq[n] == group.logical_seq[n]) {
+                ++n;
+            }
+            if (n > best) {
+                best    = n;
+                hold_id = h->request_id;
+            }
+        }
+    }
+    if (hold_id == 0 && n_keep > 0) {
+        llama_sequence_group hold;
+        hold.request_id = next_hold_id--;
+        hold.status     = llama_sequence_group_status::FINISHED;
+        hold.logical_seq.assign(group.logical_seq.begin(),
+                                group.logical_seq.begin() + n_keep);
+        hold.n_past   = n_keep;
+        hold.n_prompt = n_keep;
+        hold_id = hold.request_id;
+        held_prefixes.push_back(std::make_unique<llama_sequence_group>(std::move(hold)));
+        LLAMA_LOG_INFO("%s: parked name-only %u-token hold so session '%s' stays resolvable after grow\n",
+                       __func__, n_keep, sid.c_str());
     }
     if (hold_id != 0) {
         sessions[sid] = hold_id;
@@ -1928,9 +1968,15 @@ void llama_paged_scheduler_impl::rebind_session_after_finish(const llama_sequenc
         LLAMA_LOG_INFO("%s: session '%s' now names held prefix %d\n",
                        __func__, sid.c_str(), hold_id);
     } else {
-        sessions.erase(sid);
-        LLAMA_LOG_INFO("%s: session '%s' dropped -- no prefix to keep\n",
-                       __func__, sid.c_str());
+        llama_sequence_group hold;
+        hold.request_id = next_hold_id--;
+        hold.status     = llama_sequence_group_status::FINISHED;
+        hold_id = hold.request_id;
+        held_prefixes.push_back(std::make_unique<llama_sequence_group>(std::move(hold)));
+        sessions[sid] = hold_id;
+        request_sessions[hold_id] = sid;
+        LLAMA_LOG_INFO("%s: session '%s' kept as empty name-only hold %d (no prefix tokens)\n",
+                       __func__, sid.c_str(), hold_id);
     }
 }
 
@@ -1946,7 +1992,19 @@ bool llama_paged_scheduler_impl::bind_session(const std::string & session_id, in
     }
     auto sit = sessions.find(session_id);
     if (sit != sessions.end() && sit->second != request_id) {
-        request_sessions.erase(sit->second);
+        const int32_t prev = sit->second;
+        bool prev_is_hold = false;
+        for (const auto & h : held_prefixes) {
+            if (h && h->request_id == prev) {
+                prev_is_hold = true;
+                break;
+            }
+        }
+        // Grow reuses the session name on a live request. Keep the parked
+        // hold named so it is not an LRU/evict victim before the grow parks.
+        if (!prev_is_hold) {
+            request_sessions.erase(prev);
+        }
     }
     auto rit = request_sessions.find(request_id);
     if (rit != request_sessions.end() && rit->second != session_id) {
