@@ -107,6 +107,9 @@ class llama_paged_scheduler_impl {
     // True only when the last queue_forked_* actually called fork_blocks.
     // Distinguishes a real fork from an APC share after a silent degrade.
     bool last_fork_used_blocks() const { return last_fork_used_blocks_; }
+    // Whole-block tokens the last queue_request inherited by refcount (0 if
+    // none). Stock /v1/chat/completions uses this as timings.cache_n.
+    uint32_t last_inherit_tokens() const { return last_inherit_tokens_; }
 
     // DEBUG accessor for the fork-residual checksum API
     const llama_kv_cache_paged * kv_cache() const { return kv_cache_manager; }
@@ -116,6 +119,7 @@ class llama_paged_scheduler_impl {
     bool supports_rs_rollback  = false;
     bool has_recurrent_state   = false;
     bool last_fork_used_blocks_ = false;
+    uint32_t last_inherit_tokens_ = 0;
 
     void insert_sorted_by_arrival_time(llama_sequence_group_ptr new_group, llama_sequence_group_list & list);
 

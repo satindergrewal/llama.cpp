@@ -356,6 +356,22 @@ static llama_sequence_group make_group(int32_t request_id, uint32_t n_prompt) {
     return group;
 }
 
+// Stock /v1/chat/completions shape: shared leading tokens, unique suffix.
+// No session_id, no parent_id -- admit is queue_request, not /fork.
+static llama_sequence_group make_chat_group(int32_t request_id, uint32_t n_prefix,
+                                            uint32_t n_suffix, llama_token pref,
+                                            llama_token suf) {
+    llama_sequence_group group;
+    group.request_id     = request_id;
+    group.n_prompt       = n_prefix + n_suffix;
+    group.n_decoded      = 0;
+    group.n_past         = 0;
+    group.t_arrival_time = request_id;
+    group.logical_seq.assign(n_prefix, pref);
+    group.logical_seq.insert(group.logical_seq.end(), n_suffix, suf);
+    return group;
+}
+
 TEST(test_init_zero_gpu_blocks_throws) {
     // ⚠ DESIGNED REFUSE, NOT GGML_ASSERT. common_fit_paged_kv_blocks sets
     // n_gpu_blocks=0 when the request will not fit; init used to abort 134.
@@ -456,6 +472,86 @@ TEST(test_prefix_share_keeps_full_prompt) {
     EXPECT_TRUE(!b->block_table.empty());
 
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+}
+
+TEST(test_chat_completions_auto_share_prefix) {
+    // Two sequential chat-shaped prompts with the same leading tokens.
+    // Stock path is queue_request (add_request), not /fork. After the first
+    // finishes, the parked prefix must be inherited by refcount. Unique
+    // suffix is not checked out at admit.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_chat_group(/*id=*/0, /*n_prefix=*/32,
+                                                            /*n_suffix=*/16, /*pref=*/7,
+                                                            /*suf=*/100)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    const llama_sequence_group * a = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(a != nullptr);
+    EXPECT_TRUE(a->n_past >= 32);
+
+    const llama_block_ids * a_blocks = fixture.kv->get_sequence_blocks(0);
+    EXPECT_TRUE(a_blocks != nullptr);
+    EXPECT_TRUE(a_blocks->size() >= 2u);
+    const uint32_t prefix0 = (*a_blocks)[0];
+    const uint32_t prefix1 = (*a_blocks)[1];
+    EXPECT_TRUE(fixture.kv->is_gpu_block(prefix0));
+    EXPECT_TRUE(fixture.kv->is_gpu_block(prefix1));
+
+    EXPECT_TRUE(fixture.sched->abort_request(0));
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) == nullptr);
+    EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_chat_group(/*id=*/1, /*n_prefix=*/32,
+                                                            /*n_suffix=*/16, /*pref=*/7,
+                                                            /*suf=*/200)));
+    EXPECT_TRUE(fixture.sched->last_inherit_tokens() == 32u);
+    const llama_sequence_group * b = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(b != nullptr);
+    EXPECT_TRUE(b->n_prompt == 48u);
+    EXPECT_TRUE(b->logical_seq.size() == 48u);
+    EXPECT_TRUE(b->n_past == 32u);
+    EXPECT_TRUE(b->block_table.size() == 2u);
+    EXPECT_TRUE(b->block_table[0] == prefix0);
+    EXPECT_TRUE(b->block_table[1] == prefix1);
+    EXPECT_TRUE(fixture.kv->get_block_ref_count(prefix0) >= 2u);
+    EXPECT_TRUE(fixture.kv->get_block_ref_count(prefix1) >= 2u);
+}
+
+TEST(test_chat_prefix_share_impossible_fails_loud) {
+    // Match exists (same leading tokens, source holds blocks) but the
+    // prefix is CPU-only, so fork_blocks cannot inherit. Must return
+    // false -- not silently admit a full prefill.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_chat_group(/*id=*/0, /*n_prefix=*/32,
+                                                            /*n_suffix=*/16, /*pref=*/7,
+                                                            /*suf=*/100)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    const llama_sequence_group * a = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(a != nullptr);
+    EXPECT_TRUE(a->n_past >= 32);
+
+    const llama_block_ids * bl = fixture.kv->get_sequence_blocks(0);
+    EXPECT_TRUE(bl != nullptr && !bl->empty());
+    llama_sequence_group view = *a;
+    view.block_table = *bl;
+    EXPECT_TRUE(fixture.kv->swap_out(view));
+    const llama_block_ids * swapped = fixture.kv->get_sequence_blocks(0);
+    EXPECT_TRUE(swapped != nullptr && !swapped->empty());
+    for (uint32_t id : *swapped) {
+        EXPECT_FALSE(fixture.kv->is_gpu_block(id));
+    }
+
+    EXPECT_FALSE(fixture.sched->queue_request(make_chat_group(/*id=*/1, /*n_prefix=*/32,
+                                                             /*n_suffix=*/16, /*pref=*/7,
+                                                             /*suf=*/200)));
+    EXPECT_TRUE(fixture.sched->last_inherit_tokens() == 0u);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(1) == nullptr);
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) != nullptr);
 }
 
 TEST(test_fork_does_not_reshare) {
@@ -1904,6 +2000,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_deadlock_oversize_waiting_request);
     RUN(test_scheduler_rejects_oversized_prompt);
     RUN(test_prefix_share_keeps_full_prompt);
+    RUN(test_chat_completions_auto_share_prefix);
+    RUN(test_chat_prefix_share_impossible_fails_loud);
     RUN(test_fork_does_not_reshare);
     RUN(test_pool_full_children_wait_master_stays);
     RUN(test_finished_prefix_survives_for_children);

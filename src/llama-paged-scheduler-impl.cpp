@@ -154,6 +154,7 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
 }
 
 bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint32_t n_warm) {
+    last_inherit_tokens_ = 0;
     // ★ ENTRY marker. Two requests register but only ONE runs the prefix-share scan, so the second
     // leaves before reaching it. Instrument the ENTRY before the branch -- the Gemma4 lesson.
     if (getenv("DS4P_DECODE_TRACE")) {
@@ -324,17 +325,27 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
                 const std::vector<llama_token> full_seq    = group.logical_seq;
                 const uint32_t                 full_prompt = group.n_prompt;
                 const uint32_t shared = kv_cache_manager->fork_blocks(src_view, group, best_n);
-                if (shared > 0) {
-                    group.logical_seq = full_seq;
-                    group.n_prompt    = full_prompt;
-                    group.n_past      = shared;
-                    LLAMA_LOG_INFO("%s: request %d admitted SHARED: %u of %u prompt tokens inherited "
-                                   "from %s %d (%zu blocks), %u left to prefill\n",
-                                   __func__, group.request_id, shared, group.n_prompt,
-                                   best_src->request_id < 0 ? "held prefix" : "live request",
-                                   best_src->request_id, group.block_table.size(),
-                                   group.n_prompt - shared);
+                if (shared == 0) {
+                    // Match exists. Sharing failed. Do NOT silently re-prefill
+                    // the shared prefix and call it done -- that is a lie.
+                    LLAMA_LOG_ERROR("%s: DS4P-INHERIT fail: matching prefix cache_n=%u from %s %d "
+                                    "but share-by-refcount returned 0; refusing silent re-prefill\n",
+                                    __func__, best_n,
+                                    best_src->request_id < 0 ? "held prefix" : "live request",
+                                    best_src->request_id);
+                    kv_cache_manager->discard_restored(group.request_id);
+                    return false;
                 }
+                group.logical_seq = full_seq;
+                group.n_prompt    = full_prompt;
+                group.n_past      = shared;
+                last_inherit_tokens_ = shared;
+                LLAMA_LOG_INFO("%s: DS4P-INHERIT cache_n=%u request %d from %s %d "
+                               "(%zu blocks), %u left to prefill\n",
+                               __func__, shared, group.request_id,
+                               best_src->request_id < 0 ? "held prefix" : "live request",
+                               best_src->request_id, group.block_table.size(),
+                               group.n_prompt - shared);
             }
 
             // cold request: nothing may be left parked under this id or it pins pool
