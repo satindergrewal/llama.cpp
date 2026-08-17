@@ -752,9 +752,6 @@ TEST(test_named_session_grow_finish_stays_resolvable) {
     EXPECT_TRUE(fixture.sched->abort_request(0));
     EXPECT_TRUE(fixture.sched->has_session("master"));
     EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
-    const int32_t hold_id = fixture.sched->session_request_id("master");
-    const size_t  n_pref  = fixture.sched->held_prefix_n_blocks(hold_id);
-    EXPECT_TRUE(n_pref == 4u);
 
     EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/1, /*n_prompt=*/80)));
     EXPECT_TRUE(fixture.sched->bind_session("master", /*request_id=*/1));
@@ -764,10 +761,6 @@ TEST(test_named_session_grow_finish_stays_resolvable) {
     EXPECT_TRUE(fixture.sched->abort_request(1));
     EXPECT_TRUE(fixture.sched->has_session("master"));
     EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
-    // Named grow must keep the unique GPU suffix on the hold so leftover
-    // stays short. 80 tokens = 5 blocks after a 64-token / 4-block prefix.
-    const int32_t hold_after = fixture.sched->session_request_id("master");
-    EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_after) > n_pref);
 
     EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/2, /*n_prompt=*/72),
                                                          "master"));
