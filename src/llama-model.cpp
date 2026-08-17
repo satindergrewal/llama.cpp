@@ -2368,9 +2368,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // (silent static). They still need DS4P_PAGED_HYBRID=1.
                     // SWA (DS4P_PAGED_SWA) and MSA (DS4P_PAGED_MSA) gates are untouched.
                     // DS4P_PAGED_HYBRID=0 keeps the loud refuse (no silent static).
-                    // The static attn child is still allocated (reserve/warmup). Warmup
-                    // STATIC on interval-4 full-attn layers (3,7,11,...) is that reserve
-                    // graph, not decode falling back to a full static slab.
+                    // When --kv-paged, full-attn layers (Qwen3.8: 3,7,...,63) consume the
+                    // paged pool. A static child at n_ctx is a second 1M KV slab on those
+                    // same layers -- the Metal OOM double bill. Keep a one-step stub only.
                     const char * paged_hybrid_env = getenv("DS4P_PAGED_HYBRID");
                     const bool paged_hybrid_env_on =
                         paged_hybrid_env != nullptr && atoi(paged_hybrid_env) != 0;
@@ -2381,6 +2381,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         !paged_hybrid_env_off &&
                         (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
                     const bool paged_hybrid_dev = paged_hybrid_env_on || paged_hybrid_qwen_default;
+                    // Stub, not n_ctx: paged mctx is the full-attn KV when --kv-paged.
+                    const uint32_t attn_kv_size = (cparams.kv_paged && paged_hybrid_dev)
+                        ? std::max(cparams.n_batch, cparams.n_ubatch)
+                        : cparams.n_ctx_seq;
+                    if (cparams.kv_paged && paged_hybrid_dev) {
+                        LLAMA_LOG_INFO("%s: paged hybrid: static attn child is a %u-token stub "
+                                "(not n_ctx=%u) so full-attn layers bind paged mctx only\n",
+                                __func__, attn_kv_size, cparams.n_ctx_seq);
+                    }
                     if (cparams.kv_paged && !paged_hybrid_dev) {
                         LLAMA_LOG_ERROR("%s: kv_paged is not yet supported for this hybrid architecture; "
                                 "the attention cache would be a full-context static allocation, not a paged one. "
@@ -2420,7 +2429,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_swa_full     */ params.swa_full,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
@@ -2486,7 +2495,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,

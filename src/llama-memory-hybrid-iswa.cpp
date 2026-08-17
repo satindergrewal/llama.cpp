@@ -119,6 +119,10 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
         }
 
         // prepare the attention cache (iswa version returns both base and swa slot infos)
+        if (mem_attn_paged) {
+            mem_attn->get_base()->clear(false);
+            mem_attn->get_swa()->clear(false);
+        }
         auto sinfos_base = mem_attn->get_base()->prepare(ubatches);
         if (sinfos_base.empty()) {
             LLAMA_LOG_ERROR("%s: failed to prepare attention base ubatches\n", __func__);
@@ -146,11 +150,13 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                            ubatches.size());
         }
 
-        // Same decode attach as llama_memory_hybrid::init_batch: not pending.
-        // Warmup STATIC on interval-4 full-attn layers is reserve (no batch
-        // info), not a static-slab decode.
-        if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
-            paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches); // copy: hybrid ctx owns the originals
+        // Twin of llama_memory_hybrid: bind paged mctx whenever the pool exists.
+        if (mem_attn_paged) {
+            if (mem_attn_paged->has_paged_batch_info()) {
+                paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches); // copy: hybrid ctx owns the originals
+            } else {
+                paged_ctx = mem_attn_paged->init_full();
+            }
         }
 
         auto ctx = std::make_unique<llama_memory_hybrid_iswa_context>(
@@ -267,6 +273,12 @@ llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_
     ctx_attn(mem->get_mem_attn()->init_full()),
     ctx_recr(mem->get_mem_recr()->init_full()),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    if (llama_kv_cache_paged * paged = mem->get_mem_attn_paged()) {
+        set_attn_paged_ctx(paged->init_full());
+        LLAMA_LOG_INFO("%s: DS4P-SET attn paged ctx=%p on hybrid_iswa init_full ctx=%p "
+                       "(full-attn layers consume paged mctx)\n",
+                       __func__, (const void *) ctx_attn_paged.get(), (const void *) this);
+    }
 }
 
 llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(

@@ -120,6 +120,11 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         }
 
         // prepare the attention cache
+        if (mem_attn_paged) {
+            // stub-sized static child: reset cells so this step fits. Full-attn
+            // layers consume paged mctx; the stub is not a 1M slab.
+            mem_attn->clear(false);
+        }
         auto heads_attn = mem_attn->prepare(ubatches);
         if (heads_attn.empty()) {
             LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
@@ -184,15 +189,16 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                            ubatches.size());
         }
 
-        // This attach IS the hybrid decode path, not a pending gate. When the
-        // pool exists and the scheduler has set batch info, the graph reads
-        // get_attn_paged() and build_attn_paged_or_null emits ggml_paged_attn
-        // (Metal: ggml_metal_op_paged_attn). No batch info (warmup/reserve)
-        // leaves paged_ctx null -- that is the STATIC print on interval-4
-        // full-attn layers (3,7,11,...), not decode using a static slab.
+        // Full-attn layers must bind paged mctx whenever the pool exists.
+        // Leaving paged_ctx null (no batch info / init_full) was the STATIC
+        // path on layers 3,7,...,63 -- paged pool AND a static 1M KV.
         llama_memory_context_ptr paged_ctx;
-        if (mem_attn_paged && mem_attn_paged->has_paged_batch_info()) {
-            paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches); // copy: hybrid ctx owns the originals
+        if (mem_attn_paged) {
+            if (mem_attn_paged->has_paged_batch_info()) {
+                paged_ctx = mem_attn_paged->init_batch_with_ubatches(ubatches); // copy: hybrid ctx owns the originals
+            } else {
+                paged_ctx = mem_attn_paged->init_full();
+            }
         }
 
         auto ctx = std::make_unique<llama_memory_hybrid_context>(
@@ -345,6 +351,15 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * m
     ctx_attn(mem->get_mem_attn()->init_full()),
     ctx_recr(mem->get_mem_recr()->init_full()),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    // Reserve/warmup used to leave get_attn_paged() null, so full-attn layers
+    // built a static graph against the attn child (1M KV + 1M masks). Bind the
+    // paged reserve context so those layers consume paged mctx.
+    if (llama_kv_cache_paged * paged = mem->get_mem_attn_paged()) {
+        set_attn_paged_ctx(paged->init_full());
+        LLAMA_LOG_INFO("%s: DS4P-SET attn paged ctx=%p on hybrid init_full ctx=%p "
+                       "(full-attn layers consume paged mctx)\n",
+                       __func__, (const void *) ctx_attn_paged.get(), (const void *) this);
+    }
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(
