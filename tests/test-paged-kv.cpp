@@ -872,7 +872,8 @@ TEST(test_named_master_full_gpu_children_wait_not_cpu_swap) {
     EXPECT_TRUE(fixture.sched->n_held_prefixes() >= 1u);
     const int32_t hold_id = fixture.sched->session_request_id("master");
     const size_t  N       = fixture.sched->held_prefix_n_blocks(hold_id);
-    EXPECT_TRUE(N == 7u);
+    // After 099fc807f the named hold parks the unique suffix too (8 blocks).
+    EXPECT_TRUE(N == 8u);
 
     for (int id = 1; id <= 3; ++id) {
         llama_sequence_group child = make_group(id, /*n_prompt=*/80);
@@ -957,7 +958,8 @@ TEST(test_mixed_table_child_admits_when_gpu_full) {
     EXPECT_TRUE(fixture.sched->has_session("master"));
     const int32_t hold_id = fixture.sched->session_request_id("master");
     const size_t  N       = fixture.sched->held_prefix_n_blocks(hold_id);
-    EXPECT_TRUE(N == 7u);
+    // After 099fc807f the named hold parks the unique suffix too (8 blocks).
+    EXPECT_TRUE(N == 8u);
 
     llama_sequence_group child = make_group(/*id=*/1, /*n_prompt=*/80);
     for (size_t i = 64; i < child.logical_seq.size(); ++i) {
@@ -1066,16 +1068,18 @@ TEST(test_named_hold_swap_unref_suffix_admits_child) {
     EXPECT_TRUE(fixture.sched->has_session("master"));
     const int32_t hold_id = fixture.sched->session_request_id("master");
     const size_t  N       = fixture.sched->held_prefix_n_blocks(hold_id);
-    EXPECT_TRUE(N == 6u);
+    // After 099fc807f the named hold parks the unique suffix too (7 blocks).
+    EXPECT_TRUE(N == 7u);
 
     const llama_block_ids * hold_bl = fixture.kv->get_sequence_blocks(hold_id);
-    EXPECT_TRUE(hold_bl != nullptr && hold_bl->size() == 6);
+    EXPECT_TRUE(hold_bl != nullptr && hold_bl->size() == 7);
     std::vector<uint32_t> prefix_before(hold_bl->begin(), hold_bl->begin() + 4);
     for (uint32_t id : prefix_before) {
         EXPECT_TRUE(fixture.kv->is_gpu_block(id));
     }
     EXPECT_TRUE(fixture.kv->is_gpu_block((*hold_bl)[4]));
     EXPECT_TRUE(fixture.kv->is_gpu_block((*hold_bl)[5]));
+    EXPECT_TRUE(fixture.kv->is_gpu_block((*hold_bl)[6]));
 
     llama_sequence_group child = make_group(/*id=*/1, /*n_prompt=*/96);
     for (size_t i = 64; i < child.logical_seq.size(); ++i) {
@@ -1113,13 +1117,14 @@ TEST(test_named_hold_swap_unref_suffix_admits_child) {
     EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
 
     hold_bl = fixture.kv->get_sequence_blocks(hold_id);
-    EXPECT_TRUE(hold_bl != nullptr && hold_bl->size() == 6);
+    EXPECT_TRUE(hold_bl != nullptr && hold_bl->size() == 7);
     for (size_t i = 0; i < 4; ++i) {
         EXPECT_TRUE((*hold_bl)[i] == prefix_before[i]);
         EXPECT_TRUE(fixture.kv->is_gpu_block((*hold_bl)[i]));
     }
     EXPECT_TRUE(!fixture.kv->is_gpu_block((*hold_bl)[4]));
     EXPECT_TRUE(!fixture.kv->is_gpu_block((*hold_bl)[5]));
+    EXPECT_TRUE(!fixture.kv->is_gpu_block((*hold_bl)[6]));
 }
 
 TEST(test_mixed_remap_fail_once_does_not_spin) {
@@ -1142,7 +1147,8 @@ TEST(test_mixed_remap_fail_once_does_not_spin) {
     EXPECT_TRUE(fixture.sched->abort_request(0));
     EXPECT_TRUE(fixture.sched->has_session("master"));
     const int32_t hold_id = fixture.sched->session_request_id("master");
-    EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == 3u);
+    // After 099fc807f the named hold parks the unique suffix too (4 blocks).
+    EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == 4u);
 
     llama_sequence_group child = make_group(/*id=*/1, /*n_prompt=*/64);
     for (size_t i = 48; i < child.logical_seq.size(); ++i) {
@@ -1176,12 +1182,13 @@ TEST(test_named_hold_overflow_queues_not_fail_mixed) {
     // leftover still short, waiter is queued (not fail_mixed / 500).
     // Later admit succeeds when a sibling RELEASES unique GPU.
     // n_gpu=10, watermark 0, batch width 1 (like -np 1).
-    // Master 112 tokens = 7 GPU. leftover=3. Children inherit 64 / 4 blocks.
-    // Hold unique suffix = 3. Child1 unique=3 admits on leftover.
-    // Child3 prompt 128: need=ceil(129/16)-4=5 unique. After one swap
-    // leftover=3 < 5 -> queued. Abort child1 RELEASES 3; leftover=6; admit.
+    // After 099fc807f master 112 tokens = 8 GPU. leftover=2. Children inherit 64 / 4.
+    // Hold unique suffix = 4. Child1 unique=3 > leftover; swap suffix then admit.
+    // n_cpu=12 so waiter CPU unique + 4-block suffix swap both fit.
+    // Child3 prompt 128: need=5 unique. leftover after child1 < 5 -> queued.
+    // Abort child1 RELEASES unique GPU; leftover enough; admit.
     auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
-                                /*n_gpu_blocks=*/10, /*n_cpu_blocks=*/8,
+                                /*n_gpu_blocks=*/10, /*n_cpu_blocks=*/12,
                                 /*n_seq_max_batch=*/1);
 
     EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/112)));
@@ -1202,7 +1209,8 @@ TEST(test_named_hold_overflow_queues_not_fail_mixed) {
     EXPECT_TRUE(fixture.sched->has_session("master"));
     const int32_t hold_id = fixture.sched->session_request_id("master");
     const size_t  N       = fixture.sched->held_prefix_n_blocks(hold_id);
-    EXPECT_TRUE(N == 7u);
+    // After 099fc807f the named hold parks the unique suffix too (8 blocks).
+    EXPECT_TRUE(N == 8u);
 
     const llama_block_ids * hold_bl = fixture.kv->get_sequence_blocks(hold_id);
     EXPECT_TRUE(hold_bl != nullptr && hold_bl->size() >= 4);
