@@ -958,6 +958,35 @@ llama_memory_context_ptr llama_kv_cache_paged::init_full() {
     ctx->set_n_tokens(n_ubatch);          // representative token count
     ctx->set_max_blocks(num_gpu_blocks);  // every block could theoretically belong to one seq
 
+    // init_full is also the hybrid warmup fallback when no scheduler has
+    // published batch info. It used to advertise sizes without allocating
+    // the host metadata, so set_input memmoved from nullptr the first time
+    // a layer actually took the paged path (bs*head_dim <= 8192; bs 16/32
+    // on Qwen3.8 hd=256). Dummy zeros are enough for reserve/warmup.
+    {
+        const int32_t ns = (int32_t) n_seq_max;
+        const int32_t nt = (int32_t) n_ubatch;
+        const int32_t nb = (int32_t) num_gpu_blocks;
+        const size_t n_bt = (size_t) std::max<int32_t>(ns, 0) * (size_t) std::max<int32_t>(nb, 0);
+        std::vector<int32_t> z_slots((size_t) std::max<int32_t>(nt, 0), 0);
+        std::vector<int32_t> z_seq((size_t) std::max<int32_t>(ns, 0), 0);
+        std::vector<int32_t> z_bt(n_bt, 0);
+        std::vector<int32_t> z_cl((size_t) std::max<int32_t>(ns, 0), 0);
+        std::vector<int32_t> z_off((size_t) std::max<int32_t>(ns, 0), 0);
+        std::vector<int32_t> z_len((size_t) std::max<int32_t>(ns, 0), 0);
+        llama_paged_batch_info dummy{};
+        dummy.n_seq            = ns;
+        dummy.n_tokens         = nt;
+        dummy.n_blocks_per_seq = nb;
+        dummy.write_slots      = z_slots.empty() ? nullptr : z_slots.data();
+        dummy.seq_ids          = z_seq.empty()   ? nullptr : z_seq.data();
+        dummy.block_table      = z_bt.empty()    ? nullptr : z_bt.data();
+        dummy.context_lens     = z_cl.empty()    ? nullptr : z_cl.data();
+        dummy.batch_offsets    = z_off.empty()   ? nullptr : z_off.data();
+        dummy.batch_lens       = z_len.empty()   ? nullptr : z_len.data();
+        ctx->set_batch_data(dummy);
+    }
+
     return ctx;
 }
 

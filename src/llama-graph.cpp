@@ -1254,21 +1254,21 @@ void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch* ubatch) {
         }
     }
 
+    // Unallocated host metadata (init_full before this cut) or an input the
+    // allocator skipped (no consumer) used to memmove from/to nullptr here.
+    auto set_host = [](ggml_tensor * t, const void * src) {
+        if (t == nullptr || t->buffer == nullptr || src == nullptr) {
+            return;
+        }
+        ggml_backend_tensor_set(t, src, 0, ggml_nbytes(t));
+    };
+    set_host(paged_write_slots,   slots_use);
+    set_host(paged_block_table,   mctx->get_block_table());
+    set_host(paged_context_lens,  mctx->get_context_lens());
+    set_host(paged_batch_offsets, offs_use);
+    set_host(paged_batch_lens,    lens_use);
     if (paged_write_slots) {
-        ggml_backend_tensor_set(paged_write_slots, slots_use, 0, ggml_nbytes(paged_write_slots));
         last_n_tokens = paged_write_slots->ne[0];
-    }
-    if (paged_block_table) {
-        ggml_backend_tensor_set(paged_block_table, mctx->get_block_table(), 0, ggml_nbytes(paged_block_table));
-    }
-    if (paged_context_lens) {
-        ggml_backend_tensor_set(paged_context_lens, mctx->get_context_lens(), 0, ggml_nbytes(paged_context_lens));
-    }
-    if (paged_batch_offsets) {
-        ggml_backend_tensor_set(paged_batch_offsets, offs_use, 0, ggml_nbytes(paged_batch_offsets));
-    }
-    if (paged_batch_lens) {
-        ggml_backend_tensor_set(paged_batch_lens, lens_use, 0, ggml_nbytes(paged_batch_lens));
     }
 
     // ★ DS4P_METADUMP -- the four small arrays, first N ubatches only.
