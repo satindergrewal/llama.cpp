@@ -2855,6 +2855,34 @@ static void map_developer_role_to_system(json & messages) {
     }
 }
 
+// Stock /v1/chat/completions (and CC) may send system/developer after user.
+// Qwen and similar templates require those roles at the beginning.
+static void hoist_system_and_developer_messages(json & messages) {
+    GGML_ASSERT(messages.is_array());
+    if (messages.size() < 2) {
+        return;
+    }
+
+    json prefix = json::array();
+    json rest   = json::array();
+    for (const auto & message : messages) {
+        const std::string role = message.value("role", "");
+        if (role == "system" || role == "developer") {
+            prefix.push_back(message);
+        } else {
+            rest.push_back(message);
+        }
+    }
+    if (prefix.empty()) {
+        return;
+    }
+
+    for (auto & message : rest) {
+        prefix.push_back(std::move(message));
+    }
+    messages = std::move(prefix);
+}
+
 
 // if first message is system and template does not support it, merge it with next message
 static void system_message_not_supported(json & messages) {
@@ -3543,6 +3571,8 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         // map developer to system for all models except for GPT-OSS
         workaround::map_developer_role_to_system(params.messages);
     }
+
+    workaround::hoist_system_and_developer_messages(params.messages);
 
     if (!tmpl.original_caps().supports_system_role) {
         workaround::system_message_not_supported(params.messages);
