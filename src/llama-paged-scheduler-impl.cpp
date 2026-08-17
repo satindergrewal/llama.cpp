@@ -612,6 +612,49 @@ void llama_paged_scheduler_impl::park_finished_prefix(llama_sequence_group & gro
                        __func__, n_keep, group.request_id);
     };
 
+    // Named grow HTTP 200: unique GPU leftover must stay on the named
+    // hold (refcount). park / fork_blocks otherwise keep only the shared
+    // prefix, free_blocks returns leftover, and the next /fork allocates
+    // instead of SWAP. Other-session /fork waiters still reserve CPU.
+    auto attach_named_unique = [&]() {
+        if (!named || group.block_table.empty()) {
+            return;
+        }
+        llama_sequence_group * best = nullptr;
+        size_t best_n = 0;
+        for (auto & h : held_prefixes) {
+            if (!h || h->logical_seq.empty() || group.logical_seq.empty()) {
+                continue;
+            }
+            if (h->block_table.empty()) {
+                if (const auto * bl = kv_cache_manager->get_sequence_blocks(h->request_id)) {
+                    h->block_table = *bl;
+                }
+            }
+            const size_t lim = std::min(h->logical_seq.size(), group.logical_seq.size());
+            size_t n = 0;
+            while (n < lim && h->logical_seq[n] == group.logical_seq[n]) {
+                ++n;
+            }
+            if (n > best_n) {
+                best_n = n;
+                best   = h.get();
+            }
+        }
+        if (best == nullptr || best_n == 0) {
+            return;
+        }
+        const uint32_t kept = kv_cache_manager->keep_unique_suffix(*best, group);
+        if (kept > 0) {
+            LLAMA_LOG_INFO("%s: named grow kept %u unique-suffix block(s) on hold %d "
+                           "(table=%zu n_past=%u) so leftover stays short\n",
+                           __func__, kept, best->request_id,
+                           best->block_table.size(), best->n_past);
+        }
+    };
+
+    attach_named_unique();
+
     if (n_full == 0 || group.block_table.empty() || group.logical_seq.size() < n_full) {
         park_name_only();
         return;
@@ -619,6 +662,7 @@ void llama_paged_scheduler_impl::park_finished_prefix(llama_sequence_group & gro
 
     // Already parked (a child finishing the same prefix, or a longer hold
     // that already covers these tokens). Do not take a second ref.
+    // Unique suffix was already attached above when this is a named grow.
     if (prefix_already_held(n_full)) {
         return;
     }
@@ -638,6 +682,8 @@ void llama_paged_scheduler_impl::park_finished_prefix(llama_sequence_group & gro
                    "(%zu blocks) for later share\n",
                    __func__, inherited, group.request_id,
                    held_prefixes.back()->block_table.size());
+    // New hold may have dropped a unique GPU suffix (shared-prefix inherit).
+    attach_named_unique();
 }
 
 bool llama_paged_scheduler_impl::is_named_session_id(int32_t request_id) const {

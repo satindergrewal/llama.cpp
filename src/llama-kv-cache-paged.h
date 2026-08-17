@@ -125,6 +125,13 @@ class llama_kv_cache_paged : public llama_memory_i {
     // onto GPU scratch so get_kv_tensor stays GPU-only.
     uint32_t swap_out_unref_suffix(llama_sequence_group & group);
 
+    // Named grow HTTP 200: keep the unique suffix (GPU leftover) referenced
+    // on the existing hold. fork_blocks / prefix_already_held only park the
+    // shared prefix, so free_blocks would return leftover and the next /fork
+    // would allocate instead of SWAP. hold.block_table must be a prefix of
+    // src.block_table. Returns how many extra blocks were shared onto hold.
+    uint32_t keep_unique_suffix(llama_sequence_group & hold, const llama_sequence_group & src);
+
     bool     is_gpu_block(uint32_t id) const { return block_manager.is_gpu(id); }
     uint32_t n_scratch_gpu_blocks() const;
     uint32_t count_cpu_unique(const llama_sequence_group & group) const;

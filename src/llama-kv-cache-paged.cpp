@@ -647,6 +647,41 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
     }
 }
 
+uint32_t llama_kv_cache_paged::keep_unique_suffix(llama_sequence_group & hold,
+                                                  const llama_sequence_group & src) {
+    if (src.block_table.size() <= hold.block_table.size()) {
+        return 0;
+    }
+    for (size_t i = 0; i < hold.block_table.size(); ++i) {
+        if (hold.block_table[i] != src.block_table[i]) {
+            return 0;  // not the same prefix -- do not append a foreign suffix
+        }
+    }
+    llama_block_ids extra;
+    extra.insert(extra.end(), src.block_table.begin() + hold.block_table.size(),
+                 src.block_table.end());
+    if (extra.empty()) {
+        return 0;
+    }
+    block_manager.share_blocks(extra);
+    hold.block_table.insert(hold.block_table.end(), extra.begin(), extra.end());
+    // Cover the suffix we just kept so rebind finds this hold and SWAP
+    // sees a trailing ref_cnt==1 run. Prefer src tokens; fall back to
+    // whole extra blocks if n_past still sits on the shared prefix.
+    const uint32_t table_tok = block_size ? (uint32_t) hold.block_table.size() * block_size : 0;
+    const uint32_t n_ext = std::min((uint32_t) src.logical_seq.size(),
+                                    std::max(src.n_past, table_tok));
+    if (n_ext > (uint32_t) hold.logical_seq.size()) {
+        hold.logical_seq.assign(src.logical_seq.begin(), src.logical_seq.begin() + n_ext);
+    }
+    if (n_ext > hold.n_past) {
+        hold.n_past = n_ext;
+    }
+    hold.n_prompt = hold.n_past;
+    note_seq_blocks(hold);
+    return (uint32_t) extra.size();
+}
+
 uint32_t llama_kv_cache_paged::release_unref_suffix(llama_sequence_group & group) {
     if (group.block_table.empty()) {
         return 0;
