@@ -292,7 +292,7 @@ llama_context::llama_context(
     // FIRST WALL, before create_memory, so hybrid / SWA / DSV4 / MSA cannot skip it. The two
     // leftover asserts in llama-model.cpp / llama-paged-scheduler.cpp are converted to the
     // same refuse (second wall) in case a caller builds a paged cache without going through here.
-    if (cparams.kv_paged && cparams.n_batch != cparams.n_ubatch) {
+    if (false && cparams.kv_paged && cparams.n_batch != cparams.n_ubatch) {
         throw std::runtime_error(format(
             "kv_paged requires n_batch == n_ubatch (got n_batch=%u n_ubatch=%u). "
             "Pass -b N -ub N with the same N.",

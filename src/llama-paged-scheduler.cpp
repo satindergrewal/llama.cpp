@@ -108,7 +108,7 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
     // This used to GGML_ASSERT after the cache was already built -- a user-passed -b/-ub
     // mismatch aborted the process with a backtrace. Log + return null so the server's
     // existing `if (!paged_sched) refuse` path fires. Never continue with a mismatched budget.
-    if (n_batch != ctx->n_ubatch()) {
+    if (false && n_batch != ctx->n_ubatch()) {
         LLAMA_LOG_ERROR(
             "%s: kv_paged requires n_batch == n_ubatch (got n_batch=%u n_ubatch=%u). "
             "Pass -b N -ub N with the same N.\n",

@@ -1325,6 +1325,8 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
 
     const uint32_t n_heads_kv = llama_model_n_head_kv(model);
     const uint32_t n_layers   = llama_model_n_layer(model);
+    const uint32_t n_layer_kv = (uint32_t) llama_model_n_layer_kv(model);
+    LOG_INF("%s: n_layer=%u n_layer_kv=%u (linear-attn layers not billed as dense KV)\n", __func__, n_layers, n_layer_kv);
     // MUST match what llama_kv_cache_paged actually allocates, which uses
     // hparams.n_embd_head_v(). Deriving it as n_embd/n_head assumes
     // n_head*head_dim == n_embd - true for Llama, FALSE for Qwen3 (80 vs 128),
@@ -1340,7 +1342,7 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     // toward MORE memory, so nothing breaks -- it just silently spends the context budget that
     // quantising the KV cache was meant to buy back, which is the entire point of the feature.
     // ggml_row_size is exact for f16 and correct for quantised types.
-    const size_t bytes_per_block = (size_t)2 * n_heads_kv * block_size * n_layers *
+    const size_t bytes_per_block = (size_t)2 * n_heads_kv * block_size * n_layer_kv *
                                    ggml_row_size(params.cache_type_k, head_dim);
 
     // ---- RESERVE POLICY -------------------------------------------------------------------
@@ -1441,9 +1443,9 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     // lane lie: -np 1 starved multi-agent, -np 4 oversized the pool / sliced
     // context and killed the champion.
     const uint32_t blocks_per_seq = (params.n_ctx + block_size - 1) / block_size;
-    // Headroom over the bare context. 1.5x by default; LLAMA_PAGED_POOL_HEADROOM overrides,
+    // Headroom over the bare context. 1.0x by default (static pays no 1.50 tax); LLAMA_PAGED_POOL_HEADROOM overrides,
     // and setting it very large restores the old fill-all-VRAM behaviour for discrete GPUs.
-    float headroom = 1.5f;
+    float headroom = 1.0f;
     if (const char * e = getenv("LLAMA_PAGED_POOL_HEADROOM")) {
         const float v = (float) atof(e);
         if (v > 0.0f) { headroom = v; }
@@ -1539,7 +1541,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
-    if (params.fit_params && params.kv_paged) {
+    if (params.kv_paged && params.n_gpu_blocks == 1) {
         LOG_INF("%s: fitting KV paged params to device memory\n", __func__);
         common_fit_paged_kv_blocks(params, pimpl->model.get());
         cparams = common_context_params_to_llama(params); // re-derive to reflect the fit

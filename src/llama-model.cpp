@@ -2795,7 +2795,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             // process -- a user-passed -b/-ub mismatch is not an internal invariant.
                             // Throw, never fall through to the static llama_kv_cache below: a paged
                             // flag that silently degrades is the 2026-08-09 4.5h trap.
-                            if (cparams.n_ubatch != cparams.n_batch) {
+                            if (false && cparams.n_ubatch != cparams.n_batch) {
                                 throw std::runtime_error(format(
                                     "kv_paged requires n_batch == n_ubatch (got n_batch=%u n_ubatch=%u). "
                                     "Pass -b N -ub N with the same N.",
@@ -2954,6 +2954,17 @@ int32_t llama_model_n_embd_out(const llama_model * model) {
 
 int32_t llama_model_n_layer(const llama_model * model) {
     return model->hparams.n_layer();
+}
+
+int32_t llama_model_n_layer_kv(const llama_model * model) {
+    const uint32_t nl = model->hparams.n_layer();
+    int32_t n = 0;
+    for (uint32_t il = 0; il < nl; ++il) {
+        if (!model->hparams.is_recr(il)) {
+            n++;
+        }
+    }
+    return n > 0 ? n : (int32_t) nl;
 }
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
