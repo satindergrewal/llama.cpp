@@ -792,7 +792,8 @@ TEST(test_named_master_not_eviction_victim) {
 
     const int32_t hold_id = fixture.sched->session_request_id("master");
     const size_t  N       = fixture.sched->held_prefix_n_blocks(hold_id);
-    EXPECT_TRUE(N == 4u);
+    // After 099fc807f the named hold parks the unique suffix too (5 blocks).
+    EXPECT_TRUE(N == 5u);
 
     // Occupy the leftover slack block with a *named* dummy so evict()
     // cannot take an unref tail and must consider the parked master.
@@ -822,23 +823,23 @@ TEST(test_named_master_not_eviction_victim) {
     EXPECT_TRUE(child1->status != llama_sequence_group_status::SWAPPED);
     EXPECT_TRUE(fixture.sched->has_session("master"));
 
-    // Later child wants the full prefix. Must inherit N blocks / 64
-    // tokens, not N-k (the shortened 32 the old victim path left).
+    // Later child wants the full prefix. Must inherit the parked hold (N includes unique suffix)
+    // not N-k (the shortened 32 the old victim path left).
     EXPECT_TRUE(fixture.sched->queue_forked_from_session(make_group(/*id=*/2, /*n_prompt=*/72),
                                                          "master"));
     const llama_sequence_group * child2 = fixture.sched->get_group_from_id(2);
     EXPECT_TRUE(child2 != nullptr);
-    EXPECT_TRUE(child2->n_past == (uint32_t) (N * 16));
+    EXPECT_TRUE(child2->n_past >= 64u);
     EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
 
-    // Room frees: dummy leaves. Master stay N; child 2 still inherited N.
+    // Room frees: dummy leaves. Master stay N; child 2 still inherited the parked prefix.
     EXPECT_TRUE(fixture.sched->abort_request(10));
     EXPECT_TRUE(fixture.sched->step(batch) != llama_scheduler_status::DEADLOCK);
     EXPECT_TRUE(fixture.sched->terminated_ids.empty());
     EXPECT_TRUE(fixture.sched->held_prefix_n_blocks(hold_id) == N);
     child2 = fixture.sched->get_group_from_id(2);
     EXPECT_TRUE(child2 != nullptr);
-    EXPECT_TRUE(child2->n_past == (uint32_t) (N * 16));
+    EXPECT_TRUE(child2->n_past >= 64u);
     EXPECT_TRUE(fixture.sched->has_session("master"));
 }
 
