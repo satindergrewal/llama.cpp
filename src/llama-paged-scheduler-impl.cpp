@@ -358,11 +358,14 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
     }
 
     // 2holdc hole: at -np 1, step() skips process_waiting_list once the
-    // decode cap is full, so allocate() never runs for a waiter and
-    // unique is not reserved until the runner RELEASE. If someone is
-    // already ahead (running or waiting), reserve this group's unique
-    // tail on CPU now. Do not take GPU leftover from the runner.
-    // If CPU leftover cannot hold it, stay waiting -- do not 500.
+    // decode cap is full, so unique is not reserved until the runner
+    // RELEASE. If someone is already ahead (running or waiting), reserve
+    // this group's unique now. Leftover-plenty: checkout GPU. Do not
+    // CPU-park / mixed-scratch a suffix GPU leftover can hold (34k CC
+    // on empty GPU was 1064 CPU blocks because a small request was
+    // still live). CPU-unique + mixed-decode stays only when leftover
+    // is actually short (starve / would steal a live runner's unique).
+    // If both leftovers are short, stay waiting -- do not 500.
     //
     // Finished groups are already held. They may still sit in `running`
     // until the next step() sweep. They are not live runners -- a
@@ -379,8 +382,9 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint3
     };
     if (kv_cache_manager != nullptr && !group.block_table.empty() &&
         (has_live_ahead(running) || has_live_ahead(waiting))) {
-        if (!kv_cache_manager->reserve_unique_cpu(group)) {
-            LLAMA_LOG_ERROR("%s: DS4P-QUEUE request %d unique CPU leftover short; "
+        if (!kv_cache_manager->allocate(1, group) &&
+            !kv_cache_manager->reserve_unique_cpu(group)) {
+            LLAMA_LOG_ERROR("%s: DS4P-QUEUE request %d unique leftover short; "
                            "waiter stays live (no GPU steal)\n",
                            __func__, group.request_id);
         }

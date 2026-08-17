@@ -495,6 +495,7 @@ bool llama_kv_cache_paged::prepare_mixed_decode(const llama_sequence_group & gro
         const size_t n_unique = cpu_ids.size();
         do_block_copy(cpu_ids, sc_ids, /*to_gpu=*/true);
         mixed_leases.push_back({std::move(cpu_ids), std::move(sc_ids)});
+        n_mixed_scratch_steps_++;
         LLAMA_LOG_INFO("%s: DS4P-MIXED remap unique suffix on CPU -> GPU scratch (%zu block(s))\n",
                        __func__, n_unique);
     }

@@ -140,6 +140,9 @@ class llama_kv_cache_paged : public llama_memory_i {
     // step. Prefix GPU ids never change. Stored table stays mixed.
     bool prepare_mixed_decode(const llama_sequence_group & group, llama_block_ids & out_gpu_table);
     void finish_mixed_decode();
+    // How many prepare_mixed_decode calls actually remapped CPU unique
+    // onto GPU scratch. Leftover-plenty unique must stay 0.
+    uint32_t n_mixed_scratch_steps() const { return n_mixed_scratch_steps_; }
 
     // DEBUG (fork-residual discriminator): additive checksum of the group's first
     // n_tokens of KV per layer, read back through its block table. Returns layers written.
@@ -348,6 +351,7 @@ class llama_kv_cache_paged : public llama_memory_i {
         llama_block_ids scratch_ids;
     };
     std::vector<mixed_lease> mixed_leases;
+    uint32_t n_mixed_scratch_steps_ = 0;
 };
 
 class llama_kv_cache_paged_context : public llama_memory_context_i {

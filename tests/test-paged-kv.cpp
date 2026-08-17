@@ -1782,12 +1782,12 @@ TEST(test_eight_named_waiters_first_admitted_completes) {
 }
 
 TEST(test_waiter_unique_reserved_on_cpu_while_decode_live) {
-    // 2holdc hole: at n_seq_max_batch=1, process_waiting_list is skipped
-    // once a decode is live. The second forked child must reserve unique
-    // on CPU at enqueue so unique is stacked while the runner keeps GPU
-    // leftover. Do not steal GPU. Do not 500.
+    // Starve / leftover-short: at n_seq_max_batch=1 a live decode owns
+    // the last GPU block (master 2 + runner unique 1 = 3). The second
+    // forked child must CPU-park unique so it stacks without stealing
+    // runner GPU. Do not 500. Leftover-plenty is the next test.
     auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
-                                /*n_gpu_blocks=*/16, /*n_cpu_blocks=*/8,
+                                /*n_gpu_blocks=*/3, /*n_cpu_blocks=*/8,
                                 /*n_seq_max_batch=*/1);
     fixture.sched->set_hybrid(true);
     fixture.sched->set_has_recurrent_state(true);
@@ -1841,6 +1841,121 @@ TEST(test_waiter_unique_reserved_on_cpu_while_decode_live) {
     runner = fixture.sched->get_group_from_id(1);
     EXPECT_TRUE(runner != nullptr);
     EXPECT_TRUE(runner->status == llama_sequence_group_status::RUNNING);
+}
+
+TEST(test_leftover_plenty_unique_stays_gpu) {
+    // Product hole: a small live request used to CPU-park the next
+    // stock /v1/chat/completions unique (enqueue-cpu-unique) even when
+    // GPU leftover could hold it. Every decode then mixed-scratched the
+    // whole suffix. Leftover-plenty unique stays GPU. No /fork.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/32, /*n_cpu_blocks=*/8,
+                                /*n_seq_max_batch=*/1);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_chat_group(/*id=*/0, /*n_prefix=*/32,
+                                                            /*n_suffix=*/16, /*pref=*/7,
+                                                            /*suf=*/100)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    const llama_sequence_group * a = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(a != nullptr);
+    EXPECT_TRUE(a->status == llama_sequence_group_status::RUNNING);
+    EXPECT_TRUE(a->n_past >= 32);
+    const llama_block_ids * a_blocks = fixture.kv->get_sequence_blocks(0);
+    EXPECT_TRUE(a_blocks != nullptr && a_blocks->size() >= 2u);
+    const uint32_t prefix0 = (*a_blocks)[0];
+    const uint32_t prefix1 = (*a_blocks)[1];
+    EXPECT_TRUE(fixture.kv->is_gpu_block(prefix0));
+    EXPECT_TRUE(fixture.kv->is_gpu_block(prefix1));
+    const uint32_t mixed_before = fixture.kv->n_mixed_scratch_steps();
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_chat_group(/*id=*/1, /*n_prefix=*/32,
+                                                            /*n_suffix=*/32, /*pref=*/7,
+                                                            /*suf=*/200)));
+    EXPECT_TRUE(fixture.sched->last_inherit_tokens() == 32u);
+    const llama_sequence_group * b = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(b != nullptr);
+    EXPECT_TRUE(b->n_past == 32u);
+    EXPECT_TRUE(b->block_table.size() >= 4u);
+    EXPECT_TRUE(b->block_table[0] == prefix0);
+    EXPECT_TRUE(b->block_table[1] == prefix1);
+    EXPECT_TRUE(fixture.kv->get_block_ref_count(prefix0) >= 2u);
+    EXPECT_TRUE(fixture.kv->get_block_ref_count(prefix1) >= 2u);
+    EXPECT_TRUE(fixture.kv->count_cpu_unique(*b) == 0);
+    for (uint32_t id : b->block_table) {
+        EXPECT_TRUE(fixture.kv->is_gpu_block(id));
+    }
+
+    // Finish the small runner so the second can decode. Unique is already GPU.
+    {
+        EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+        const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+        EXPECT_TRUE(info != nullptr && info->n_seq >= 1);
+        std::vector<llama_token> toks((size_t) info->n_seq, 1);
+        std::vector<int8_t>      stop((size_t) info->n_seq, 1);
+        fixture.sched->update(batch, toks, stop.data(), nullptr);
+    }
+    EXPECT_TRUE(fixture.sched->get_group_from_id(0) == nullptr);
+
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    b = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(b != nullptr);
+    EXPECT_TRUE(fixture.kv->count_cpu_unique(*b) == 0);
+    EXPECT_TRUE(fixture.kv->n_mixed_scratch_steps() == mixed_before);
+    {
+        const llama_paged_batch_info * info = fixture.sched->get_curr_batch_info();
+        EXPECT_TRUE(info != nullptr);
+        std::vector<llama_token> toks((size_t) info->n_seq, 1);
+        std::vector<int8_t>      stop((size_t) info->n_seq, 0);
+        fixture.sched->update(batch, toks, stop.data(), nullptr);
+    }
+    EXPECT_TRUE(fixture.kv->n_mixed_scratch_steps() == mixed_before);
+    EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+}
+
+TEST(test_leftover_starve_unique_cpu_parks) {
+    // GPU leftover short: unique CPU-parks. Do not 500.
+    // n_gpu=4: first 48 tokens take all 4 GPU. leftover=0. Second
+    // unique cannot take GPU. CPU-park. Prefix stays GPU. No /fork.
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/4, /*n_cpu_blocks=*/8,
+                                /*n_seq_max_batch=*/1);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_chat_group(/*id=*/0, /*n_prefix=*/32,
+                                                            /*n_suffix=*/16, /*pref=*/7,
+                                                            /*suf=*/100)));
+    llama_batch batch = {};
+    prefill_one_chunk(fixture, batch);
+    const llama_sequence_group * a = fixture.sched->get_group_from_id(0);
+    EXPECT_TRUE(a != nullptr);
+    EXPECT_TRUE(a->status == llama_sequence_group_status::RUNNING);
+    const llama_block_ids * a_blocks = fixture.kv->get_sequence_blocks(0);
+    EXPECT_TRUE(a_blocks != nullptr && a_blocks->size() >= 2u);
+    const uint32_t prefix0 = (*a_blocks)[0];
+    const uint32_t prefix1 = (*a_blocks)[1];
+    EXPECT_TRUE(fixture.kv->is_gpu_block(prefix0));
+    EXPECT_TRUE(fixture.kv->is_gpu_block(prefix1));
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_chat_group(/*id=*/1, /*n_prefix=*/32,
+                                                            /*n_suffix=*/32, /*pref=*/7,
+                                                            /*suf=*/200)));
+    EXPECT_TRUE(fixture.sched->last_inherit_tokens() == 32u);
+    const llama_sequence_group * b = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(b != nullptr);
+    EXPECT_TRUE(b->status == llama_sequence_group_status::WAITING);
+    EXPECT_TRUE(b->n_past == 32u);
+    EXPECT_TRUE(b->block_table[0] == prefix0);
+    EXPECT_TRUE(b->block_table[1] == prefix1);
+    EXPECT_TRUE(fixture.kv->is_gpu_block(b->block_table[0]));
+    EXPECT_TRUE(fixture.kv->is_gpu_block(b->block_table[1]));
+    EXPECT_TRUE(fixture.kv->count_cpu_unique(*b) > 0);
+    EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+    EXPECT_TRUE(fixture.sched->step(batch) != llama_scheduler_status::DEADLOCK);
+    EXPECT_TRUE(fixture.sched->terminated_ids.empty());
+    b = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(b != nullptr);
+    EXPECT_TRUE(b->status != llama_sequence_group_status::FINISHED);
+    EXPECT_TRUE(fixture.kv->count_cpu_unique(*b) > 0);
 }
 
 TEST(test_unique_partial_block_grows_for_eighth_token) {
@@ -2029,6 +2144,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_batch_width_cap_does_not_reject);
     RUN(test_eight_named_waiters_first_admitted_completes);
     RUN(test_waiter_unique_reserved_on_cpu_while_decode_live);
+    RUN(test_leftover_plenty_unique_stays_gpu);
+    RUN(test_leftover_starve_unique_cpu_parks);
     RUN(test_unique_partial_block_grows_for_eighth_token);
     RUN(test_hybrid_decode_attaches_paged_ctx);
 
