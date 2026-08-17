@@ -1450,7 +1450,35 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         const float v = (float) atof(e);
         if (v > 0.0f) { headroom = v; }
     }
-    const uint32_t blocks_needed  = (uint32_t)((float) blocks_per_seq * headroom);
+    // Deadlock compares n_prompt+1 against usable = pool - ceil(pool * watermark).
+    // A pool of exactly n_ctx/bs with the default 0.05 watermark can never admit
+    // a 1M master (usable ≈ 0.95 * n_ctx). Keep a real watermark; inflate the
+    // pool so usable still covers n_ctx + one ubatch/decode step.
+    const uint32_t n_ubatch_u    = params.n_ubatch > 0 ? (uint32_t) params.n_ubatch : block_size;
+    const uint32_t decode_blocks = (n_ubatch_u + block_size - 1) / block_size;
+    uint32_t usable_needed = (uint32_t) ((float) blocks_per_seq * headroom);
+    if (usable_needed < blocks_per_seq + decode_blocks) {
+        usable_needed = blocks_per_seq + decode_blocks;
+    }
+    float wm = params.kv_paged_watermark;
+    if (wm < 0.0f) {
+        wm = 0.0f;
+    }
+    if (wm >= 1.0f) {
+        wm = 0.05f;
+    }
+    uint32_t blocks_needed = usable_needed;
+    if (wm > 0.0f) {
+        blocks_needed = (uint32_t) std::ceil((double) usable_needed / (1.0 - (double) wm));
+        for (;;) {
+            const uint32_t reserved = (uint32_t) std::ceil((double) blocks_needed * (double) wm);
+            const uint32_t usable   = blocks_needed > reserved ? blocks_needed - reserved : 0;
+            if (usable >= usable_needed) {
+                break;
+            }
+            blocks_needed++;
+        }
+    }
 
     // ---- ELASTICITY: refuse or clamp, never silently fill the machine -------------------
     // Capping by n_ctx stops gratuitous over-allocation for SMALL contexts, but a LARGE
@@ -1503,10 +1531,12 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
 
     LOG_INF("%s: free_vram=%0.1f MiB, bytes_per_block=%ld, n_gpu_blocks=%d, n_cpu_blocks=%d\n",
             __func__, free_vram / 1024.0f / 1024.0f, bytes_per_block, n_gpu_blocks, n_cpu_blocks);
-    LOG_INF("%s: pool sized for n_ctx=%d (one master, %d blocks x %.2f headroom = %d); "
+    LOG_INF("%s: pool sized for n_ctx=%d (one master, %d blocks x %.2f headroom + %u decode; "
+            "watermark=%.2f inflates %u usable -> %u pool); "
             "n_parallel=%d is batch width, not a lane multiplier; "
             "VRAM would have allowed %d blocks (%.1f GiB)\n",
-            __func__, params.n_ctx, blocks_per_seq, headroom, blocks_needed,
+            __func__, params.n_ctx, blocks_per_seq, headroom, decode_blocks,
+            wm, usable_needed, blocks_needed,
             params.n_parallel,
             n_gpu_blocks_vram, (n_gpu_blocks_vram * (double) bytes_per_block) / (1024.0*1024.0*1024.0));
 
