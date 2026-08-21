@@ -812,8 +812,12 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
 #define PAGED_MMA_KV    32   // keys staged per round (64 measured worse: smem cost occupancy)
 #define PAGED_MMA_LDV   (PAGED_MMA_KV + 8)   // pad; multiple of 8 halves for ldmatrix
 
+// HD 256 needs o_frag[NC=16] = 128 accumulator registers + q_frag[16] = 64, which
+// does not fit the 128-reg budget of min-blocks 2. One block per SM gives 255 regs;
+// occupancy halves but each warp does 2x the FLOPs (wider head), so it is measured,
+// not assumed. 64/128 keep min-blocks 2 (their measured optimum, 8.05 below).
 template <int HD>
-__global__ __launch_bounds__(256, 2)   // 128 threads/5 blocks MEASURED WORSE (3,942): the re-profile
+__global__ __launch_bounds__(256, HD <= 128 ? 2 : 1)   // 128 threads/5 blocks MEASURED WORSE (3,942): the re-profile
                                       // says smem allows a 5th block and registers refuse it,
                                       // but forcing it spills more than the warps return.
                                       // Getting past 4 needs a STRUCTURAL register cut.
@@ -1236,7 +1240,7 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             const char * s = getenv("DS4P_PAGED_QTILE");
             return s ? atoi(s) : 3;
         }();
-        if (qtile_mode == 3 && n_tokens_total > n_seq && (head_dim == 64 || head_dim == 128)) {
+        if (qtile_mode == 3 && n_tokens_total > n_seq && (head_dim == 64 || head_dim == 128 || head_dim == 256)) {
             const int    rows_blk  = PAGED_MMA_WARPS * PAGED_MMA_M;
             const int    n_q_tiles = (n_tokens_total + rows_blk - 1) / rows_blk;
             const int    ld        = head_dim + 8;
@@ -1246,8 +1250,11 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                 if (head_dim == 64) {
                     CUDA_CHECK(cudaFuncSetAttribute(paged_attention_prefill_mma_kernel<64>,
                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_m));
-                } else {
+                } else if (head_dim == 128) {
                     CUDA_CHECK(cudaFuncSetAttribute(paged_attention_prefill_mma_kernel<128>,
+                                                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_m));
+                } else {
+                    CUDA_CHECK(cudaFuncSetAttribute(paged_attention_prefill_mma_kernel<256>,
                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_m));
                 }
             }
@@ -1304,7 +1311,9 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
                 (const int *) batch_lens->data, stride_token, stride_head, stride_block, n_heads_kv,  \
                 block_size, max_blocks, scale, rel ? (const float *) rel->data : nullptr, rel_extent, \
                 visibility_window, p_out, n_splits, p_m, p_l, cpa)
-            if (head_dim == 64) { DS4P_LAUNCH_MMA(64); } else { DS4P_LAUNCH_MMA(128); }
+            if (head_dim == 64) { DS4P_LAUNCH_MMA(64); }
+            else if (head_dim == 128) { DS4P_LAUNCH_MMA(128); }
+            else { DS4P_LAUNCH_MMA(256); }
 #undef DS4P_LAUNCH_MMA
 
             if (n_splits > 1) {
@@ -1314,11 +1323,10 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             return;
         }
 
-        // 256 default: the typed-mma kernel cannot hold o_frag[NC=16] under the
-        // __launch_bounds__ register budget, so the smem-accumulator wmma kernel IS the
-        // mode-3 default for 256 until the structural register cut exists. Its smem at
-        // 256 (~47.0 KB) fits the 48 KB default; smem_w already opts in above that.
-        if ((qtile_mode == 2 || (qtile_mode == 3 && head_dim == 256)) && n_tokens_total > n_seq) {
+        // 256: typed-mma is now the mode-3 default (launch_bounds relaxed to 1 block/SM
+        // for the o_frag[16] register budget; measured below). The wmma smem-accumulator
+        // kernel remains the explicit DS4P_PAGED_QTILE=2 fallback for 256.
+        if (qtile_mode == 2 && n_tokens_total > n_seq) {
             const int    n_q_tiles = (n_tokens_total + PAGED_WMMA_M - 1) / PAGED_WMMA_M;
             const int    ld        = head_dim + 8;
             // q_h + K + V + P (half) | 4 partial score tiles + o_acc + m + l + resc (f32)
