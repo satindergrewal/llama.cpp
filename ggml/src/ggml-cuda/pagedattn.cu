@@ -72,10 +72,10 @@ __global__ void paged_attention_write_kernel(const float * __restrict__ k_new,  
     }
 }
 
-// Reference kernel (kept for head_dim > 128): one block-wide reduction with barriers PER
+// Reference kernel (kept for head_dim outside {64,128,256}): one block-wide reduction with barriers PER
 // KV TOKEN, serial over the context. Correct but pathological at scale -- an 8K-context
 // decode step measured ~40 s/step on Blackwell (Q4 fork-cost gate, 2026-08-04). The
-// warp-parallel kernel below replaces it for head_dim 64/128.
+// warp-parallel kernel below replaces it for head_dim 64/128/256.
 __global__ void paged_attention_decode_kernel_ref(const float * __restrict__ q,
                                               const half * __restrict__ kv_cache,
                                               const int * __restrict__ block_table,
@@ -180,7 +180,8 @@ __global__ void paged_attention_decode_kernel_ref(const float * __restrict__ q,
 // shared memory. No __syncthreads inside the context loop -- the reference kernel's
 // per-token block barrier serialized the whole context and made big-context decode
 // unusable. Same visibility-window and rel-bias semantics as the reference.
-// Contract: blockDim.x == head_dim, head_dim in {64, 128} (acc slices fixed at <= 4).
+// Contract: blockDim.x == head_dim, head_dim in {64, 128, 256} (acc slices <= 8;
+// 256 added 2026-08-22 -- dpl = 8, 8 warps, smem 9.2 KB, merge loops dynamic).
 __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
                                               const half * __restrict__ kv_cache,
                                               const int * __restrict__ block_table,
@@ -251,7 +252,7 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
 
         float m_i = -FLT_MAX;
         float l_i = 0.0f;
-        float acc_i[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float acc_i[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 
         // M7 split-K: when the launcher splits the context across the grid, each block
         // owns a contiguous slice [split_lo, split_hi) and emits a PARTIAL (m, l, acc);
@@ -283,7 +284,7 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
 
             float part = 0.0f;
             #pragma unroll
-            for (int d = 0; d < 4; ++d) {
+            for (int d = 0; d < 8; ++d) {
                 if (d < dpl) {
                     const int dim = lane + (d << 5);
                     part += q_s[dim] * __half2float(kv_cache[k_base + dim]);
@@ -305,7 +306,7 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
             const float p     = __expf(qk - m_new);
             l_i = l_i * e_old + p;
             #pragma unroll
-            for (int d = 0; d < 4; ++d) {
+            for (int d = 0; d < 8; ++d) {
                 if (d < dpl) {
                     const int dim = lane + (d << 5);
                     acc_i[d] = acc_i[d] * e_old + p * __half2float(kv_cache[v_base + dim]);
@@ -319,7 +320,7 @@ __global__ void paged_attention_decode_kernel(const float * __restrict__ q,
             warp_l[warp_id] = l_i;
         }
         #pragma unroll
-        for (int d = 0; d < 4; ++d) {
+        for (int d = 0; d < 8; ++d) {
             if (d < dpl) {
                 warp_acc[warp_id * head_dim + lane + (d << 5)] = acc_i[d];
             }
@@ -532,12 +533,12 @@ __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ 
     const int ctx_len   = context_lens[seq_idx];
     const int first_pos = ctx_len - num_new_tokens;   // logical pos of query 0 of the batch
 
-    float m_i[PAGED_Q_TILE], l_i[PAGED_Q_TILE], acc_i[PAGED_Q_TILE][4];  // Q_TILE x dpl acc registers
+    float m_i[PAGED_Q_TILE], l_i[PAGED_Q_TILE], acc_i[PAGED_Q_TILE][8];  // Q_TILE x dpl acc registers
     #pragma unroll
     for (int i = 0; i < PAGED_Q_TILE; ++i) {
         m_i[i] = -FLT_MAX; l_i[i] = 0.0f;
         #pragma unroll
-        for (int d = 0; d < 4; ++d) { acc_i[i][d] = 0.0f; }
+        for (int d = 0; d < 8; ++d) { acc_i[i][d] = 0.0f; }
     }
 
     // the tile's queries span positions [first_pos+q_base, first_pos+q_base+q_cnt); the
@@ -555,9 +556,9 @@ __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ 
         const size_t v_base = base + (size_t) (n_heads_kv + kv_head_idx) * stride_head;
 
         // load this KV token's lane slice ONCE, reuse across all queries in the tile
-        float k_l[4], v_l[4];
+        float k_l[8], v_l[8];
         #pragma unroll
-        for (int d = 0; d < 4; ++d) {
+        for (int d = 0; d < 8; ++d) {
             if (d < dpl) {
                 const int dim = lane + (d << 5);
                 k_l[d] = __half2float(kv_cache[k_base + dim]);
@@ -573,7 +574,7 @@ __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ 
 
             float part = 0.0f;
             #pragma unroll
-            for (int d = 0; d < 4; ++d) {
+            for (int d = 0; d < 8; ++d) {
                 if (d < dpl) { part += q_s[i * head_dim + lane + (d << 5)] * k_l[d]; }
             }
             #pragma unroll
@@ -591,7 +592,7 @@ __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ 
             const float p     = __expf(qk - m_new);
             l_i[i] = l_i[i] * e_old + p;
             #pragma unroll
-            for (int d = 0; d < 4; ++d) {
+            for (int d = 0; d < 8; ++d) {
                 if (d < dpl) { acc_i[i][d] = acc_i[i][d] * e_old + p * v_l[d]; }
             }
             m_i[i] = m_new;
@@ -605,7 +606,7 @@ __global__ void paged_attention_prefill_tiled_kernel(const float * __restrict__ 
             warp_l[warp_id * PAGED_Q_TILE + i] = l_i[i];
         }
         #pragma unroll
-        for (int d = 0; d < 4; ++d) {
+        for (int d = 0; d < 8; ++d) {
             if (d < dpl) {
                 warp_acc[(warp_id * PAGED_Q_TILE + i) * head_dim + lane + (d << 5)] = acc_i[i][d];
             }
@@ -1179,16 +1180,16 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     // ⚠ THIS OUTER GUARD IS THE REAL HEAD_DIM GATE, and it gates far more than it looks:
     // EVERYTHING fast lives inside it -- the mma prefill, the split-K decode, the warp-
-    // parallel decode. A head_dim outside {64,128} therefore falls all the way through to
+    // parallel decode. A head_dim outside {64,128,256} therefore falls all the way through to
     // the generic scalar kernel for BOTH prefill and decode, not merely to a slower prefill.
     // (Measured 2026-08-04 with test-paged-vs-cpu: at head_dim 96 the CUDA output agrees
     // with the CPU reference to ~1 ULP (4.5e-08), whereas 64/128 sit at ~4e-05 because the
     // mma path carries f16 rounding. The error MAGNITUDE reports which kernel ran, and it
     // said "scalar" no matter what the inner dispatch claimed.)
-    // Widening this to head_dim % 32 == 0 is plausible -- the decode kernel's n_warps =
-    // head_dim/32 divides cleanly at 96/192 -- but it is a change to the DECODE path as
-    // well as prefill and needs its own gate. Not attempted here.
-    if (head_dim != 64 && head_dim != 128) {
+    // WIDENED TO 256 2026-08-22 (the Qwen3.8-27B gate): decode/tiled kernels take acc
+    // slices to 8 (dpl = 256/32); prefill 256 defaults to the wmma smem-acc kernel because
+    // the typed-mma shape would need o_frag[16] under a 128-register budget.
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -1199,7 +1200,7 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         }
     }
 
-    if (head_dim == 64 || head_dim == 128) {
+    if (head_dim == 64 || head_dim == 128 || head_dim == 256) {
         // warp-parallel kernel: q_s[head_dim] + warp_m/l[n_warps each] + warp_acc[n_warps*head_dim]
         const size_t n_warps    = (size_t) head_dim / 32;
         const size_t smem_bytes = (head_dim + 2 * n_warps + n_warps * head_dim) * sizeof(float);
@@ -1313,7 +1314,11 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             return;
         }
 
-        if (qtile_mode == 2 && n_tokens_total > n_seq) {
+        // 256 default: the typed-mma kernel cannot hold o_frag[NC=16] under the
+        // __launch_bounds__ register budget, so the smem-accumulator wmma kernel IS the
+        // mode-3 default for 256 until the structural register cut exists. Its smem at
+        // 256 (~47.0 KB) fits the 48 KB default; smem_w already opts in above that.
+        if ((qtile_mode == 2 || (qtile_mode == 3 && head_dim == 256)) && n_tokens_total > n_seq) {
             const int    n_q_tiles = (n_tokens_total + PAGED_WMMA_M - 1) / PAGED_WMMA_M;
             const int    ld        = head_dim + 8;
             // q_h + K + V + P (half) | 4 partial score tiles + o_acc + m + l + resc (f32)
