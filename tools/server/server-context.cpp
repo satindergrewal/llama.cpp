@@ -328,8 +328,8 @@ struct server_slot {
     int32_t n_gen_last = 0;
 
     void update_spec_stats(size_t n_accepted, int n_max) {
-        n_draft_accepted   += n_accepted;
-        n_draft_verif_steps += 1;
+        stats.n_draft_accepted   += n_accepted;
+        stats.n_draft_verif_steps += 1;
 
         if (n_accepted_per_pos.empty()) {
             n_accepted_per_pos.resize(n_max, 0);
