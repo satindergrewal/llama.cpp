@@ -416,9 +416,6 @@ struct qf_block {
     std::vector<clip_layer> qf_proj_layers;
 };
 
-struct inkling_hmlp_layer {
-    ggml_tensor * linear_w = nullptr;
-    ggml_tensor * norm_w   = nullptr;
 // pocket-tts SEANet stack, used in both directions:
 // encoder = conv_in -> per stage (residual unit, strided conv) -> conv_out
 // decoder = conv_in -> per stage (strided convtr, residual unit) -> conv_out
@@ -474,6 +471,11 @@ struct clip_flow_net {
     ggml_tensor * final_proj_b = nullptr;
     std::vector<time_embd> time;
     std::vector<block> blocks;
+};
+
+struct inkling_hmlp_layer {
+    ggml_tensor * linear_w = nullptr;
+    ggml_tensor * norm_w   = nullptr;
 };
 
 // qwen3tts code2wav: RVQ codes -> raw PCM
