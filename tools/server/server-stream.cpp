@@ -3,6 +3,7 @@
 #include "server-http.h"
 #include "server-queue.h"
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <utility>
