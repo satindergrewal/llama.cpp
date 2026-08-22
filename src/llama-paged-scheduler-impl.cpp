@@ -155,6 +155,10 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
 
 bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group, uint32_t n_warm) {
     last_inherit_tokens_ = 0;
+    // Arrival stamp at the impl ENTRY: the C wrappers stamp it too, but tests and
+    // any direct impl caller bypass them, and an unstamped group reads as
+    // "waited since boot" to DS4P-WAIT-TIMEOUT (caught by test-paged-kv 2026-08-22).
+    group.t_arrival_time = ggml_time_us();
     // ★ ENTRY marker. Two requests register but only ONE runs the prefix-share scan, so the second
     // leaves before reaching it. Instrument the ENTRY before the branch -- the Gemma4 lesson.
     if (getenv("DS4P_DECODE_TRACE")) {
@@ -1258,10 +1262,55 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
                 }
             }
             if (still_short()) {
-                LLAMA_LOG_ERROR("%s: DS4P-QUEUE request %d unique=%u cpu_u=%u scratch=%u; "
-                               "sibling may run (no fail_mixed)\n",
-                               __func__, group->request_id, need, cpu_u,
-                               kv_cache_manager->n_scratch_gpu_blocks());
+                // DS4P-WAIT-TIMEOUT: pinned named sessions are never eviction victims BY
+                // DESIGN (bar item 5), so a waiter whose demand exceeds the leftover can
+                // starve forever. Reproduced 2026-08-22: an orphaned client left a
+                // 993-block request queued behind ~930 blocks of held prefixes; it spun
+                // here every scheduler tick, flooded the log, and wedged SIGTERM drain.
+                // Terminate after DS4P_WAIT_TIMEOUT_S seconds (default 600; 0 disables)
+                // with a named kill the server reports, instead of spinning forever.
+                // SCOPE: only a request that FITS the pool alone -- an oversize request
+                // is check_deadlock's contract (named error + hint), never this timeout.
+                static const int64_t wait_to_us = []() {
+                    const char * s = getenv("DS4P_WAIT_TIMEOUT_S");
+                    return (s ? atoll(s) : 600) * 1000000LL;
+                }();
+                const uint32_t tokens_alone = group->n_past > 0 ? group->n_past + 1 : group->n_prompt + 1;
+                const uint32_t blocks_alone = (tokens_alone + block_size - 1) / block_size;
+                const int64_t now_us = ggml_time_us();
+                // t_arrival_time unset (tests construct groups directly) reads as
+                // "waited since boot"; sanitize so the timeout only fires on real waits.
+                const int64_t waited_us =
+                    (group->t_arrival_time > 0 && group->t_arrival_time <= now_us)
+                        ? now_us - group->t_arrival_time : 0;
+                // Full pool, NOT watermark-adjusted usable: a request between the two
+                // (e.g. 993 blocks vs 972 usable / 1024 full) is exactly the forever-starved
+                // class -- it passes n_ctx admission, never fits with the watermark reserve,
+                // and check_deadlock does not own it either.
+                if (wait_to_us > 0 && waited_us > wait_to_us &&
+                    blocks_alone <= kv_cache_manager->get_num_gpu_blocks()) {
+                    LLAMA_LOG_ERROR(
+                        "%s: DS4P-WAIT-TIMEOUT request %d waited %.1fs for %u blocks "
+                        "(cpu_u=%u scratch=%u) -- pinned sessions hold the pool; "
+                        "terminating instead of spinning (DS4P_WAIT_TIMEOUT_S to tune).\n",
+                        __func__, group->request_id, waited_us / 1e6, need, cpu_u,
+                        kv_cache_manager->n_scratch_gpu_blocks());
+                    terminated_ids.push_back(group->request_id);
+                    group->status = llama_sequence_group_status::FINISHED;
+                    finish(*group);
+                    it = waiting.erase(it);
+                    continue;
+                }
+                // rate-limit the queue line: it fires EVERY tick while blocked and
+                // once drowned the log during the 2026-08-22 wedge. One per 5 s.
+                static int64_t last_qlog_us = 0;
+                if (now_us - last_qlog_us > 5000000LL) {
+                    last_qlog_us = now_us;
+                    LLAMA_LOG_ERROR("%s: DS4P-QUEUE request %d unique=%u cpu_u=%u scratch=%u; "
+                                   "sibling may run (no fail_mixed)\n",
+                                   __func__, group->request_id, need, cpu_u,
+                                   kv_cache_manager->n_scratch_gpu_blocks());
+                }
                 ++it;
                 continue;
             }
@@ -2117,6 +2166,7 @@ bool llama_paged_scheduler_impl::bind_session(const std::string & session_id, in
 
 bool llama_paged_scheduler_impl::queue_forked_from_session(llama_sequence_group group,
                                                           const std::string & session_id) {
+    group.t_arrival_time = ggml_time_us();
     auto it = sessions.find(session_id);
     if (it == sessions.end()) {
         LLAMA_LOG_ERROR("%s: session '%s' not found\n",
