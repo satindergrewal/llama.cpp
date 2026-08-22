@@ -55,3 +55,24 @@ static __device__ __forceinline__ void cp_async_wait_all() {
     NO_DEVICE_CODE;
 #endif // CP_ASYNC_AVAILABLE
 }
+
+// Group API for double buffering: cp.async ops issued since the last commit
+// form a group; wait_group<N> returns once at most N groups are outstanding,
+// so N=1 keeps a prefetch for tile T+1 in flight while tile T completes.
+static __device__ __forceinline__ void cp_async_commit_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.commit_group;");
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+template <int N>
+static __device__ __forceinline__ void cp_async_wait_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.wait_group %0;" :: "n"(N));
+#else
+    GGML_UNUSED(N);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}

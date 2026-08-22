@@ -812,6 +812,40 @@ __global__ void paged_attention_prefill_wmma_kernel(const float * __restrict__ q
 #define PAGED_MMA_KV    32   // keys staged per round (64 measured worse: smem cost occupancy)
 #define PAGED_MMA_LDV   (PAGED_MMA_KV + 8)   // pad; multiple of 8 halves for ldmatrix
 
+// Stage one K/V tile (PAGED_MMA_KV tokens) into kdst via cp.async: K rows then
+// V rows, [2*KV][ld]. Zero-fills tokens past the context so the mma tiles never
+// read garbage. One call issues one commit-group's worth of copies per thread.
+// 8 halves (16 B) per instruction, straight global->shared with no register
+// round-trip; every offset is a multiple of 8 halves, so both ends are 16 B
+// aligned: ld = HD + 8, stride_head = HD, stride_token = 2*n_heads_kv*HD.
+template <int HD>
+__device__ __forceinline__ void paged_mma_stage_kv(half * __restrict__ kdst,
+                                                   const half * __restrict__ kv_cache,
+                                                   const int  * __restrict__ block_table,
+                                                   const int tok0, const int n_tok,
+                                                   const int seq_idx, const int max_blocks, const int block_size,
+                                                   const size_t stride_token, const size_t stride_head, const size_t stride_block,
+                                                   const int kv_head, const int n_heads_kv,
+                                                   const int ld, const int tid, const int nthr) {
+    for (int e = tid * 8; e < PAGED_MMA_KV * HD; e += nthr * 8) {
+        const int j = e / HD, d = e % HD;
+        const int tok = tok0 + j;
+        if (tok < n_tok) {
+            const int pb   = block_table[seq_idx * max_blocks + tok / block_size];
+            const size_t b = (size_t)(tok % block_size) * stride_token + (size_t) pb * stride_block;
+            cp_async_cg_16<128>(ggml_cuda_cvta_generic_to_shared(kdst + j * ld + d),
+                                kv_cache + b + (size_t) kv_head * stride_head + d);
+            cp_async_cg_16<128>(ggml_cuda_cvta_generic_to_shared(kdst + (PAGED_MMA_KV + j) * ld + d),
+                                kv_cache + b + (size_t)(n_heads_kv + kv_head) * stride_head + d);
+        } else {
+            for (int u = 0; u < 8; ++u) {
+                kdst[j * ld + d + u]                  = __float2half(0.0f);
+                kdst[(PAGED_MMA_KV + j) * ld + d + u] = __float2half(0.0f);
+            }
+        }
+    }
+}
+
 // HD 256 needs o_frag[NC=16] = 128 accumulator registers + q_frag[16] = 64, which
 // does not fit the 128-reg budget of min-blocks 2. One block per SM gives 255 regs;
 // occupancy halves but each warp does 2x the FLOPs (wider head), so it is measured,
@@ -851,11 +885,10 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
     constexpr int ld  = HD + 8;             // q/k row pitch in halves
 
     extern __shared__ char smem_raw[];
-    // q_h is dead once the Q fragments are in registers, so K/V OVERLAY it:
-    // smem = max(q, k+v) instead of q+k+v, which buys blocks per SM.
-    half * q_h = (half *) smem_raw;                        // [64][ld], live until q_frag loaded
-    half * k_h = (half *) smem_raw;                        // [PAGED_MMA_KV][ld]
-    half * v_h = k_h + PAGED_MMA_KV * ld;                  // [PAGED_MMA_KV][ld], transposed on LOAD
+    // q_h is dead once the Q fragments are in registers, so the KV buffers
+    // OVERLAY it: smem = max(q, 2*(k+v)) instead of q+k+v, which buys blocks
+    // per SM AND holds both double-buffer KV tiles (rows_blk = 4*KV exactly).
+    half * q_h = (half *) smem_raw;                        // [rows_blk][ld], live until q_frag loaded
 
     const int lane    = threadIdx.x;                 // mma.cuh indexes by threadIdx.x
     const int warp_id = threadIdx.y;
@@ -900,6 +933,10 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
         for (int l = 0; l < tile_acc::ne; ++l) { o_frag[c].x[l] = 0.0f; }
     }
 
+    // q_h is dead from here on: one barrier separates the ldmatrix reads above
+    // from the KV staging below that overwrites the same region.
+    __syncthreads();
+
     float m_r[2] = { -FLT_MAX, -FLT_MAX };
     float l_r[2] = { 0.0f, 0.0f };
 
@@ -922,30 +959,33 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
     const int kt_lo = (n_splits > 1) ? lo_blk + split_idx * span : lo_blk;
     const int kt_hi = (n_splits > 1) ? min(n_tok, kt_lo + span) : n_tok;
 
+    // Double-buffered KV staging (cp.async): tile T+1 prefetches into the idle
+    // buffer while the tensor cores compute tile T, hiding the HBM round-trip
+    // that the per-tile barrier used to expose. Both buffers fit the dead-Q
+    // region (rows_blk*ld == 4*KV*ld halves), so smem and registers are
+    // unchanged. DS4P_PAGED_CPASYNC=0 keeps the original synchronous staging.
+    half * kv_bufs[2] = { (half *) smem_raw, (half *) smem_raw + 2 * (size_t) PAGED_MMA_KV * ld };
+    int kv_flip = 0;
+    if (use_cp_async) {
+        paged_mma_stage_kv<HD>(kv_bufs[0], kv_cache, block_table, kt_lo, n_tok,
+                               seq_idx, max_blocks, block_size, stride_token, stride_head, stride_block,
+                               kv_head, n_heads_kv, ld, tid, nthr);
+        cp_async_commit_group();
+    }
+
     for (int kt0 = kt_lo; kt0 < kt_hi; kt0 += PAGED_MMA_KV) {
-        __syncthreads();
+        const bool has_next = kt0 + PAGED_MMA_KV < kt_hi;
         if (use_cp_async) {
-            // 8 halves (16 B) per instruction, straight global->shared with no register
-            // round-trip. Every offset here is a multiple of 8 halves, so both ends are
-            // 16 B aligned: ld = HD + 8, stride_head = HD, stride_token = 2*n_heads_kv*HD.
-            for (int e = tid * 8; e < PAGED_MMA_KV * HD; e += nthr * 8) {
-                const int j = e / HD, d = e % HD;
-                const int tok = kt0 + j;
-                if (tok < n_tok) {
-                    const int pb   = block_table[seq_idx * max_blocks + tok / block_size];
-                    const size_t b = (size_t)(tok % block_size) * stride_token + (size_t) pb * stride_block;
-                    cp_async_cg_16<128>(ggml_cuda_cvta_generic_to_shared(k_h + j * ld + d),
-                                        kv_cache + b + (size_t) kv_head * stride_head + d);
-                    cp_async_cg_16<128>(ggml_cuda_cvta_generic_to_shared(v_h + j * ld + d),
-                                        kv_cache + b + (size_t)(n_heads_kv + kv_head) * stride_head + d);
-                } else {
-                    for (int u = 0; u < 8; ++u) {
-                        k_h[j * ld + d + u] = __float2half(0.0f);
-                        v_h[j * ld + d + u] = __float2half(0.0f);
-                    }
-                }
+            if (has_next) {
+                paged_mma_stage_kv<HD>(kv_bufs[kv_flip ^ 1], kv_cache, block_table,
+                                       kt0 + PAGED_MMA_KV, n_tok,
+                                       seq_idx, max_blocks, block_size, stride_token, stride_head, stride_block,
+                                       kv_head, n_heads_kv, ld, tid, nthr);
+                cp_async_commit_group();
+                cp_async_wait_group<1>();   // current tile landed; the prefetch stays in flight
+            } else {
+                cp_async_wait_group<0>();
             }
-            cp_async_wait_all();
         } else {
             for (int e = tid; e < PAGED_MMA_KV * HD; e += nthr) {
                 const int j = e / HD, d = e % HD;
@@ -957,11 +997,14 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
                     kv_k = kv_cache[b + (size_t) kv_head * stride_head + d];
                     kv_v = kv_cache[b + (size_t)(n_heads_kv + kv_head) * stride_head + d];
                 }
-                k_h[j * ld + d] = kv_k;
-                v_h[j * ld + d] = kv_v;   // contiguous; ldmatrix.trans supplies the transpose
+                kv_bufs[0][j * ld + d] = kv_k;
+                kv_bufs[0][(PAGED_MMA_KV + j) * ld + d] = kv_v;   // contiguous; ldmatrix.trans supplies the transpose
             }
         }
         __syncthreads();
+
+        half * k_cur = kv_bufs[kv_flip];
+        half * v_cur = k_cur + PAGED_MMA_KV * ld;
 
         // sub-tiles run back to back with NO barriers: all state is in registers
         for (int sub = 0; sub < PAGED_MMA_KV / PAGED_MMA_N; ++sub) {
@@ -974,7 +1017,7 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
             tile_ab k_frag;
-            load_ldmatrix(k_frag, (const half2 *) (k_h + (size_t) sub * PAGED_MMA_N * ld + c * 16), ld / 2);
+            load_ldmatrix(k_frag, (const half2 *) (k_cur + (size_t) sub * PAGED_MMA_N * ld + c * 16), ld / 2);
             mma(s_frag, q_frag[c], k_frag);
         }
 
@@ -1045,10 +1088,14 @@ void paged_attention_prefill_mma_kernel(const float * __restrict__ q,
                 for (int l = 0; l < tile_acc::ne; ++l) { o_frag[c].x[l] *= resc[(l / 2) % 2]; }
             }
             tile_ab v_frag;
-            load_ldmatrix_trans(v_frag, (const half2 *) (v_h + (size_t) sub * PAGED_MMA_N * ld + c * 16), ld / 2);
+            load_ldmatrix_trans(v_frag, (const half2 *) (v_cur + (size_t) sub * PAGED_MMA_N * ld + c * 16), ld / 2);
             mma(o_frag[c], p_frag, v_frag);
         }
         }   // sub
+        // reuse barrier: every warp is done reading kv_bufs[kv_flip] before the
+        // next iteration issues its prefetch (which lands two buffers ahead)
+        __syncthreads();
+        kv_flip ^= 1;
     }
 
     if (n_splits > 1) {
@@ -1244,7 +1291,7 @@ void ggml_cuda_op_paged_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             const int    rows_blk  = PAGED_MMA_WARPS * PAGED_MMA_M;
             const int    n_q_tiles = (n_tokens_total + rows_blk - 1) / rows_blk;
             const int    ld        = head_dim + 8;
-            const size_t smem_m    = sizeof(half) * (size_t) std::max(rows_blk * ld, 2 * PAGED_MMA_KV * ld);
+            const size_t smem_m    = sizeof(half) * (size_t) std::max(rows_blk * ld, 4 * PAGED_MMA_KV * ld);   // 4*KV*ld: both double-buffer KV tiles
             if (smem_m > 48 * 1024) {
                 GGML_ASSERT(smem_m <= 96 * 1024 && "mma prefill smem exceeds 96KB");
                 if (head_dim == 64) {
