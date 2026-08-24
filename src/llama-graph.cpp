@@ -3531,6 +3531,8 @@ llm_graph_input_attn_kv_paged * llm_graph_context::build_attn_inp_kv_paged() con
     ggml_set_input(inp->paged_batch_lens);
 
     return (llm_graph_input_attn_kv_paged *) res->add_input(std::move(inp));
+}
+
 llm_graph_input_attn_k_dsa_iswa * llm_graph_context::build_attn_inp_k_dsa_iswa() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsa_iswa_context *>(mctx);
 
